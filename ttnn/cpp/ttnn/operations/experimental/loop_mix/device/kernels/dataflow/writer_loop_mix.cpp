@@ -17,10 +17,11 @@
 void kernel_main() {
     const uint32_t worker = get_arg_val<uint32_t>(0);
     const uint32_t start = get_arg_val<uint32_t>(1);
-    const uint32_t output_addr = get_arg_val<uint32_t>(2);
-    const uint32_t gather_x = get_arg_val<uint32_t>(3);
-    const uint32_t gather_y = get_arg_val<uint32_t>(4);
-    constexpr uint32_t rectangles_arg = 5;
+    const uint32_t gather_x = get_arg_val<uint32_t>(2);
+    const uint32_t gather_y = get_arg_val<uint32_t>(3);
+    constexpr uint32_t rectangles_arg = 4;
+    // Then the output addresses: [Q, T, W], or one [T, W] per destination.
+    constexpr uint32_t outputs_arg = 14;
 
     constexpr uint32_t cb_row1 = get_named_compile_time_arg_val("cb_row1");
     constexpr uint32_t cb_gather1 = get_named_compile_time_arg_val("cb_gather1");
@@ -36,6 +37,9 @@ void kernel_main() {
     constexpr uint32_t gather2_tiles = get_named_compile_time_arg_val("gather2_tiles");
     constexpr uint32_t written_sem = get_named_compile_time_arg_val("written_sem");
     constexpr uint32_t valid_sem = get_named_compile_time_arg_val("valid_sem");
+    constexpr uint32_t cb_row3 = get_named_compile_time_arg_val("cb_row3");
+    constexpr uint32_t cb_gather3 = get_named_compile_time_arg_val("cb_gather3");
+    constexpr bool has_norm = get_named_compile_time_arg_val("has_norm") != 0;
     constexpr auto output_args = TensorAccessorArgs<0>();
     constexpr uint32_t f32_tile = 4096, f32_face = 1024, f32_band = 256;
     constexpr uint32_t cnt = 2;
@@ -120,12 +124,30 @@ void kernel_main() {
         cb_push_back(cb_hidden, Q * Rt);
     }
 
-    // The output tiles (q, start + c), q-major.
-    const auto output = TensorAccessor(output_args, output_addr, f32_tile);
+    // Exchange 3 (with a norm): the outputs' sums of squares, multicast back raw.
+    if constexpr (has_norm) {
+        const uint32_t gather3 = get_write_ptr(cb_gather3);
+        cb_wait_front(cb_row3, 1);
+        send_slot(cb_row3, 0, gather3, worker / 8, worker % 8);
+        noc_async_write_barrier();
+        noc_semaphore_inc(get_noc_addr(gather_x, gather_y, written_addr), 1);
+        cb_pop_front(cb_row3, 1);
+        if (worker == 0) {
+            noc_semaphore_wait_min(written, 3 * num_cores);
+        }
+        distribute(cb_gather3, gather1_tiles, gather1_tiles * f32_tile);
+    }
+
+    // The output tiles, q-major: tile (q, start + c) of [Q, T, W], or tile
+    // start + c of output q.
+    const uint32_t tile_bytes = get_tile_size(cb_output);
     for (uint32_t q = 0; q < Q; ++q) {
+        const auto output = TensorAccessor(
+            output_args, get_arg_val<uint32_t>(outputs_arg + (has_norm ? q : 0)), tile_bytes);
         for (uint32_t c = 0; c < cnt; ++c) {
             cb_wait_front(cb_output, 1);
-            noc_async_write(get_read_ptr(cb_output), output.get_noc_addr(q * Wt + start + c), f32_tile);
+            noc_async_write(
+                get_read_ptr(cb_output), output.get_noc_addr((has_norm ? 0 : q * Wt) + start + c), tile_bytes);
             noc_async_write_barrier();
             cb_pop_front(cb_output, 1);
         }

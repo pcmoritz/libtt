@@ -28,6 +28,7 @@ namespace {
 
 struct LoopMixParams {
     float epsilon = 1e-6f;
+    float eps_norm = 0.0f;
 };
 
 struct LoopMixInputs {
@@ -36,13 +37,14 @@ struct LoopMixInputs {
     Tensor down;
     Tensor gain;
     Tensor forget;
+    std::optional<Tensor> norm_weight;
 };
 
 struct LoopMixOperation {
     using operation_attributes_t = LoopMixParams;
     using tensor_args_t = LoopMixInputs;
-    using spec_return_value_t = TensorSpec;
-    using tensor_return_value_t = Tensor;
+    using spec_return_value_t = std::vector<TensorSpec>;
+    using tensor_return_value_t = std::vector<Tensor>;
 
     static ProgramDescriptor create_descriptor(
         const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
@@ -112,6 +114,14 @@ std::optional<std::string> loop_mix_reason(const LoopMixInputs& in) {
             return fmt::format("gain and forget must be [{}, {}, {}], got {}", Q, R, W, s);
         }
     }
+    if (in.norm_weight.has_value()) {
+        const auto& w = *in.norm_weight;
+        if (w.storage_type() != StorageType::DEVICE || w.layout() != Layout::TILE ||
+            (w.dtype() != DataType::FLOAT32 && w.dtype() != DataType::BFLOAT16) || w.logical_shape().rank() != 2 ||
+            w.logical_shape()[0] != Q || w.logical_shape()[1] != W) {
+            return fmt::format("the norm weight must be tiled [{}, {}] FLOAT32 or BFLOAT16", Q, W);
+        }
+    }
     return std::nullopt;
 }
 
@@ -123,14 +133,23 @@ void LoopMixOperation::validate_on_program_cache_miss(const operation_attributes
 
 LoopMixOperation::spec_return_value_t LoopMixOperation::compute_output_specs(
     const operation_attributes_t&, const tensor_args_t& in) {
-    return TensorSpec(
-        in.messages.logical_shape(),
-        TensorLayout(DataType::FLOAT32, PageConfig(Layout::TILE), in.messages.memory_config()));
+    const auto& shape = in.messages.logical_shape();
+    if (!in.norm_weight.has_value()) {
+        return {TensorSpec(shape, TensorLayout(DataType::FLOAT32, PageConfig(Layout::TILE), in.messages.memory_config()))};
+    }
+    const TensorSpec row(
+        ttnn::Shape({shape[1], shape[2]}),
+        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), in.messages.memory_config()));
+    return spec_return_value_t(shape[0], row);
 }
 
 LoopMixOperation::tensor_return_value_t LoopMixOperation::create_output_tensors(
     const operation_attributes_t& params, const tensor_args_t& in) {
-    return create_device_tensor(compute_output_specs(params, in), in.messages.device());
+    tensor_return_value_t outputs;
+    for (const auto& spec : compute_output_specs(params, in)) {
+        outputs.push_back(create_device_tensor(spec, in.messages.device()));
+    }
+    return outputs;
 }
 
 ProgramDescriptor LoopMixOperation::create_descriptor(
@@ -140,7 +159,8 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
     const auto& down = in.down.mesh_tensor();
     const auto& gain = in.gain.mesh_tensor();
     const auto& forget = in.forget.mesh_tensor();
-    const auto& output = output_tensor.mesh_tensor();
+    const bool has_norm = in.norm_weight.has_value();
+    const auto& norm_weight = has_norm ? in.norm_weight->mesh_tensor() : messages;
     auto* device = &messages.mutable_device();
 
     const auto& shape = messages.logical_shape();
@@ -171,7 +191,8 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
     };
     constexpr uint32_t cb_dest = 0, cb_messages = 1, cb_down = 2, cb_gain = 3, cb_forget = 4, cb_row1 = 5,
                        cb_gather1 = 6, cb_normed = 7, cb_partial = 8, cb_gather2 = 9, cb_hidden = 10,
-                       cb_rstd = 11, cb_output = 16;
+                       cb_rstd = 11, cb_mixed = 12, cb_row3 = 13, cb_gather3 = 14, cb_norm_weight = 15,
+                       cb_output = 16;
     make_cb(cb_dest, Qd * cnt, DataType::FLOAT32);
     make_cb(cb_messages, Q * cnt, DataType::FLOAT32);
     make_cb(cb_down, Q * 2 * cnt * Rt, DataType::BFLOAT16);
@@ -184,7 +205,15 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
     make_cb(cb_gather2, gather2_tiles, DataType::FLOAT32);
     make_cb(cb_hidden, Q * Rt, DataType::BFLOAT16);
     make_cb(cb_rstd, 1, DataType::FLOAT32);
-    make_cb(cb_output, cnt, DataType::FLOAT32);
+    if (has_norm) {
+        make_cb(cb_mixed, Q * cnt, DataType::FLOAT32);
+        make_cb(cb_row3, 1, DataType::FLOAT32);
+        make_cb(cb_gather3, gather1_tiles, DataType::FLOAT32);
+        make_cb(cb_norm_weight, cnt, norm_weight.dtype());
+        make_cb(cb_output, Q * cnt, DataType::BFLOAT16);
+    } else {
+        make_cb(cb_output, cnt, DataType::FLOAT32);
+    }
 
     constexpr uint32_t written_sem = 0, valid_sem = 1;
     for (uint32_t id : {written_sem, valid_sem}) {
@@ -205,6 +234,12 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
         {"cb_hidden", cb_hidden},
         {"cb_output", cb_output},
         {"cb_rstd", cb_rstd},
+        {"cb_mixed", cb_mixed},
+        {"cb_row3", cb_row3},
+        {"cb_gather3", cb_gather3},
+        {"cb_norm_weight", cb_norm_weight},
+        {"has_norm", has_norm ? 1u : 0u},
+        {"eps_norm", std::bit_cast<uint32_t>(params.eps_norm)},
         {"num_queries", Q},
         {"num_dest", Qd},
         {"Rt", Rt},
@@ -221,7 +256,7 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/loop_mix/device/kernels/";
 
     std::vector<uint32_t> reader_args;
-    for (const auto* t : {&dest, &messages, &down, &gain, &forget}) {
+    for (const auto* t : {&dest, &messages, &down, &gain, &forget, &norm_weight}) {
         TensorAccessorArgs(*t).append_to(reader_args);
     }
     KernelDescriptor reader{
@@ -231,8 +266,9 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
         .named_compile_time_args = common_args,
         .config = DataMovementConfigDescriptor{
             .processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default}};
+    // Every output has the first one's layout.
     std::vector<uint32_t> writer_args;
-    TensorAccessorArgs(output).append_to(writer_args);
+    TensorAccessorArgs(output_tensor.at(0).mesh_tensor()).append_to(writer_args);
     // NOC 0, whose multicast rectangles run from the start to the end
     // coordinates.
     KernelDescriptor writer{
@@ -248,7 +284,10 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
         .dst_full_sync_en = true,
         .math_approx_mode = false};
     compute_config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
-    for (uint32_t cb : {cb_dest, cb_messages, cb_gather1, cb_gather2, cb_rstd}) {
+    if (norm_weight.dtype() == DataType::FLOAT32) {
+        compute_config.unpack_to_dest_mode[cb_norm_weight] = UnpackToDestMode::UnpackToDestFp32;
+    }
+    for (uint32_t cb : {cb_dest, cb_messages, cb_gather1, cb_gather2, cb_rstd, cb_mixed, cb_gather3}) {
         compute_config.unpack_to_dest_mode[cb] = UnpackToDestMode::UnpackToDestFp32;
     }
     KernelDescriptor compute{
@@ -278,11 +317,20 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
         const uint32_t start = i * cnt;
         reader.emplace_runtime_args(
             core_list[i],
-            {start, std::cref(dest), std::cref(messages), std::cref(down), std::cref(gain), std::cref(forget)});
-        std::vector<Arg> w = {
-            i, start, std::cref(output), static_cast<uint32_t>(gather.x), static_cast<uint32_t>(gather.y)};
+            {start,
+             std::cref(dest),
+             std::cref(messages),
+             std::cref(down),
+             std::cref(gain),
+             std::cref(forget),
+             std::cref(norm_weight)});
+        std::vector<Arg> w = {i, start, static_cast<uint32_t>(gather.x), static_cast<uint32_t>(gather.y)};
         for (uint32_t value : rectangles) {
             w.emplace_back(value);
+        }
+        // The output addresses: one, or one per destination.
+        for (const auto& out : output_tensor) {
+            w.emplace_back(std::cref(out.mesh_tensor()));
         }
         writer.emplace_runtime_args(core_list[i], w);
         compute.emplace_runtime_args(core_list[i], {i == 0 ? 1u : 0u});
@@ -310,17 +358,19 @@ std::optional<std::string> loop_mix_unsupported_reason(
         {.dest = dest, .messages = messages, .down = down, .gain = gain, .forget = forget});
 }
 
-ttnn::Tensor loop_mix(
+std::vector<ttnn::Tensor> loop_mix(
     const ttnn::Tensor& dest,
     const ttnn::Tensor& messages,
     const ttnn::Tensor& down,
     const ttnn::Tensor& gain,
     const ttnn::Tensor& forget,
-    float epsilon) {
+    float epsilon,
+    const std::optional<ttnn::Tensor>& norm_weight,
+    float eps_norm) {
     using Op = prim::LoopMixOperation;
     return device_operation::launch<Op>(
-        {.epsilon = epsilon},
-        {.dest = dest, .messages = messages, .down = down, .gain = gain, .forget = forget});
+        {.epsilon = epsilon, .eps_norm = eps_norm},
+        {.dest = dest, .messages = messages, .down = down, .gain = gain, .forget = forget, .norm_weight = norm_weight});
 }
 
 }  // namespace ttnn::experimental

@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/types.hpp"
@@ -25,17 +26,24 @@ namespace ttnn::experimental {
 // and round to BF16 as torch.bmm does; the rest is FP32. Tiled, interleaved
 // in DRAM, W a multiple of 64.
 //
+// With a norm weight ([Q, W]), the result is instead each destination's
+// next sub-layer input, Q tensors [T, W] BF16:
+//   out[q] * rsqrt(mean(out[q]^2) + eps_norm) * norm_weight[q].
+//
 // Each core takes two tile columns of W: its share of the RMS norms' sums of
 // squares (gathered by the first core and multicast back), its share of the
 // down projection's K (the first core sums the shares and multicasts
-// hidden), and then its output columns.
-ttnn::Tensor loop_mix(
+// hidden), and then its output columns (with a norm weight, a third
+// exchange for the outputs' sums of squares).
+std::vector<ttnn::Tensor> loop_mix(
     const ttnn::Tensor& dest,
     const ttnn::Tensor& messages,
     const ttnn::Tensor& down,
     const ttnn::Tensor& gain,
     const ttnn::Tensor& forget,
-    float epsilon);
+    float epsilon,
+    const std::optional<ttnn::Tensor>& norm_weight = std::nullopt,
+    float eps_norm = 0.0f);
 
 // Why loop_mix cannot run these operands, if it cannot.
 std::optional<std::string> loop_mix_unsupported_reason(

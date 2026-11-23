@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -54,7 +55,7 @@ protected:
         return ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
     }
 
-    size_t check(uint32_t Q, uint32_t Qd, uint32_t T, uint32_t W, uint32_t R, uint32_t seed) {
+    size_t check(uint32_t Q, uint32_t Qd, uint32_t T, uint32_t W, uint32_t R, uint32_t seed, bool norm = false) {
         std::mt19937 rng(seed);
         std::normal_distribution<float> normal(0.0f, 1.0f);
         std::vector<float> dest(Qd * T * W), msg(Q * T * W), down(Q * 2 * W * R), gain(Q * R * W), forget(Q * R * W);
@@ -75,15 +76,38 @@ protected:
             v = normal(rng) / std::sqrt(static_cast<float>(R));
         }
         constexpr float eps = 1e-6f;
-        const auto out = ttnn::experimental::loop_mix(
+        std::vector<float> norm_weight(Q * W);
+        for (float& v : norm_weight) {
+            v = 1.0f + 0.2f * normal(rng);
+        }
+        std::optional<ttnn::Tensor> norm_tensor;
+        if (norm) {
+            norm_tensor = device_tensor(norm_weight, ttnn::Shape({Q, W}), DataType::FLOAT32);
+        }
+        const auto outs = ttnn::experimental::loop_mix(
             device_tensor(dest, ttnn::Shape({Qd, T, W}), DataType::FLOAT32),
             device_tensor(msg, ttnn::Shape({Q, T, W}), DataType::FLOAT32),
             device_tensor(down, ttnn::Shape({Q, 2 * W, R}), DataType::BFLOAT16),
             device_tensor(gain, ttnn::Shape({Q, R, W}), DataType::BFLOAT16),
             device_tensor(forget, ttnn::Shape({Q, R, W}), DataType::BFLOAT16),
+            eps,
+            norm_tensor,
             eps);
-        EXPECT_EQ(out.logical_shape(), ttnn::Shape({Q, T, W}));
-        const auto got = out.cpu().to_vector<float>();
+        // [Q, T, W] FP32, or with a norm Q outputs [T, W] BF16, gathered here
+        // as one [Q, T, W].
+        std::vector<float> got;
+        if (norm) {
+            EXPECT_EQ(outs.size(), Q);
+            for (const auto& out : outs) {
+                EXPECT_EQ(out.logical_shape(), ttnn::Shape({T, W}));
+                const auto part = out.cpu().to_vector<float>();
+                got.insert(got.end(), part.begin(), part.end());
+            }
+        } else {
+            EXPECT_EQ(outs.size(), 1u);
+            EXPECT_EQ(outs.at(0).logical_shape(), ttnn::Shape({Q, T, W}));
+            got = outs.at(0).cpu().to_vector<float>();
+        }
 
         size_t wrong = 0, flips = 0;
         auto rms_bf16 = [&](const float* x) {
@@ -112,20 +136,37 @@ protected:
                     }
                     hidden[r] = bf16(h);
                 }
-                double scale = 0;
-                for (uint32_t c = 0; c < W; ++c) {
-                    scale = std::max(scale, std::fabs(double(d[c])) + std::fabs(double(m[c])));
-                }
+                std::vector<double> want_row(W);
                 for (uint32_t c = 0; c < W; ++c) {
                     double g = 0, f = 0;
                     for (uint32_t r = 0; r < R; ++r) {
                         g += hidden[r] * gain[(q * R + r) * W + c];
                         f += hidden[r] * forget[(q * R + r) * W + c];
                     }
-                    const double want = d[c] + (std::tanh(bf16(g)) * m[c] - std::tanh(bf16(f)) * d[c]);
+                    want_row[c] = d[c] + (std::tanh(bf16(g)) * m[c] - std::tanh(bf16(f)) * d[c]);
+                }
+                double scale = 0;
+                if (norm) {
+                    double sum = 0;
+                    for (double v : want_row) {
+                        sum += v * v;
+                    }
+                    const double rstd = 1.0 / std::sqrt(sum / W + eps);
+                    for (uint32_t c = 0; c < W; ++c) {
+                        want_row[c] *= rstd * norm_weight[q * W + c];
+                        scale = std::max(scale, std::fabs(want_row[c]));
+                    }
+                } else {
+                    for (uint32_t c = 0; c < W; ++c) {
+                        scale = std::max(scale, std::fabs(double(d[c])) + std::fabs(double(m[c])));
+                    }
+                }
+                for (uint32_t c = 0; c < W; ++c) {
+                    const double want = want_row[c];
                     const double value = got[(q * T + t) * W + c];
                     const double error = std::fabs(value - want);
-                    flips += error > 2e-3 * scale;
+                    // A BF16 output also rounds by up to 2^-8 of itself.
+                    flips += error > 2e-3 * scale + (norm ? std::ldexp(std::fabs(want), -7) : 0.0);
                     if (!(error <= 1e-2 * scale) && wrong++ < 8) {
                         ADD_FAILURE() << "Q " << Q << " Qd " << Qd << " T " << T << " [" << q << "][" << t << "]["
                                       << c << "] " << value << " != " << want;
@@ -148,6 +189,11 @@ TEST_F(LoopMixTest, MatchesReference) {
     EXPECT_EQ(check(3, 3, 1, 2304, 64, 2), 0u);
     EXPECT_EQ(check(1, 1, 1, 2304, 64, 3), 0u);
     EXPECT_EQ(check(3, 1, 4, 2304, 64, 4), 0u);
+    // With the norms that follow: per-destination BF16 outputs.
+    EXPECT_EQ(check(3, 1, 1, 2304, 64, 7, true), 0u);
+    EXPECT_EQ(check(1, 1, 1, 2304, 64, 8, true), 0u);
+    EXPECT_EQ(check(3, 3, 2, 2304, 64, 9, true), 0u);
+    EXPECT_EQ(check(2, 2, 2, 64, 32, 10, true), 0u);
 }
 
 }  // namespace

@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -2458,6 +2458,25 @@ def TTIR_RMSNormGatedOp : TTIR_NamedOp<"rms_norm_gated"> {
+@@ -2458,6 +2458,29 @@ def TTIR_RMSNormGatedOp : TTIR_NamedOp<"rms_norm_gated"> {
    let results = (outs AnyRankedTensor:$output);
  }
  
@@ -12,16 +12,20 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +    output = dest + (tanh(bf16(hidden @ gain)) * messages -
 +                     tanh(bf16(hidden @ forget)) * dest)
 +    per destination q: dest [Q or 1, T, W] and messages [Q, T, W] FP32, down
-+    [Q, 2W, R] and gain and forget [Q, R, W] BF16. libtt's tt.loop_mix custom
-+    call (sglang_tpu_kernels.py) forms it.
++    [Q, 2W, R] and gain and forget [Q, R, W] BF16; one result [Q, T, W] FP32.
++    With norm_weight [Q, W], instead Q results [T, W] BF16, each output's RMS
++    norm (eps_norm) times its weight row. libtt's tt.loop_mix custom call
++    (sglang_tpu_kernels.py) forms it.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$dest,
 +                       AnyRankedTensor:$messages,
 +                       AnyRankedTensor:$down,
 +                       AnyRankedTensor:$gain,
 +                       AnyRankedTensor:$forget,
-+                       F32Attr:$epsilon);
-+  let results = (outs AnyRankedTensor:$output);
++                       F32Attr:$epsilon,
++                       Optional<AnyRankedTensor>:$norm_weight,
++                       DefaultValuedAttr<F32Attr, "0.0">:$eps_norm);
++  let results = (outs Variadic<AnyRankedTensor>:$outputs);
 +}
 +
  def TTIR_L2ClipOp : TTIR_NamedOp<"l2_clip", [AttrSizedOperandSegments]> {
@@ -30,7 +34,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -2929,6 +2929,20 @@ def TTNN_RMSNormGatedOp : TTNN_Op<"rms_norm_gated", [OpModelExempt]> {
+@@ -2929,6 +2929,22 @@ def TTNN_RMSNormGatedOp : TTNN_Op<"rms_norm_gated", [OpModelExempt]> {
    let results = (outs AnyRankedTensor:$output);
  }
  
@@ -44,8 +48,10 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$down,
 +                       AnyRankedTensor:$gain,
 +                       AnyRankedTensor:$forget,
-+                       F32Attr:$epsilon);
-+  let results = (outs AnyRankedTensor:$output);
++                       F32Attr:$epsilon,
++                       Optional<AnyRankedTensor>:$norm_weight,
++                       DefaultValuedAttr<F32Attr, "0.0">:$eps_norm);
++  let results = (outs Variadic<AnyRankedTensor>:$outputs);
 +}
 +
  def TTNN_L2ClipOp : TTNN_Op<"l2_clip", [AttrSizedOperandSegments, OpModelExempt]> {
@@ -54,7 +60,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
 --- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
-@@ -61,6 +61,16 @@ table DitRMSNormUnaryFusedOp {
+@@ -61,6 +61,18 @@ table DitRMSNormUnaryFusedOp {
    out: tt.target.ttnn.TensorRef;
  }
  
@@ -65,7 +71,9 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 +  gain: tt.target.ttnn.TensorRef;
 +  forget: tt.target.ttnn.TensorRef;
 +  epsilon: float;
-+  out: tt.target.ttnn.TensorRef;
++  outs: [tt.target.ttnn.TensorRef];
++  norm_weight: tt.target.ttnn.TensorRef;
++  eps_norm: float;
 +}
 +
  table L2ClipOp {
@@ -85,7 +93,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -1311,6 +1311,21 @@ public:
+@@ -1311,6 +1311,26 @@ public:
    }
  };
  
@@ -96,10 +104,15 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +  LogicalResult
 +  matchAndRewrite(ttir::LoopMixOp op, OpAdaptor adaptor,
 +                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> types;
++    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                      types))) {
++      return failure();
++    }
 +    rewriter.replaceOpWithNewOp<ttnn::LoopMixOp>(
-+        op, this->getTypeConverter()->convertType(op.getType()),
-+        adaptor.getDest(), adaptor.getMessages(), adaptor.getDown(),
-+        adaptor.getGain(), adaptor.getForget(), op.getEpsilonAttr());
++        op, types, adaptor.getDest(), adaptor.getMessages(), adaptor.getDown(),
++        adaptor.getGain(), adaptor.getForget(), op.getEpsilonAttr(),
++        adaptor.getNormWeight(), op.getEpsNormAttr());
 +    return success();
 +  }
 +};
@@ -107,7 +120,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class L2ClipOpConversionPattern : public OpConversionPattern<ttir::L2ClipOp> {
  public:
    using OpConversionPattern<ttir::L2ClipOp>::OpConversionPattern;
-@@ -4401,6 +4416,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4402,6 +4422,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             RMSNormGatedOpConversionPattern,
             AttnResOpConversionPattern,
             L2ClipOpConversionPattern,
@@ -118,7 +131,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -2108,6 +2108,20 @@ createOp(FlatbufferObjectCache &cache, RMSNormGatedOp op) {
+@@ -2108,6 +2108,27 @@ createOp(FlatbufferObjectCache &cache, RMSNormGatedOp op) {
        static_cast<uint32_t>(op.getGateOffset()));
  }
  
@@ -128,18 +141,25 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +    return cache.at<::tt::target::ttnn::TensorRef>(
 +        getOperandThroughDPSOps(value));
 +  };
++  std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> outs;
++  for (Value output : op.getOutputs()) {
++    outs.push_back(cache.getOrCreateNoSharding(output, tensorValueToFlatbuffer,
++                                               std::nullopt));
++  }
++  auto outsOffset = cache.fbb->CreateVector(outs);
++  ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> normWeight =
++      op.getNormWeight() ? tensor(op.getNormWeight()) : 0;
 +  return ::tt::target::ttnn::CreateLoopMixOp(
 +      *cache.fbb, tensor(op.getDest()), tensor(op.getMessages()),
 +      tensor(op.getDown()), tensor(op.getGain()), tensor(op.getForget()),
-+      op.getEpsilon().convertToFloat(),
-+      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
-+                                  std::nullopt));
++      op.getEpsilon().convertToFloat(), outsOffset, normWeight,
++      op.getEpsNorm().convertToFloat());
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::L2ClipOp>
  createOp(FlatbufferObjectCache &cache, L2ClipOp op) {
    auto tensor = [&](Value value) {
-@@ -5836,6 +5850,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5839,6 +5860,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
                             locInfo);
    }

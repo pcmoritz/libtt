@@ -142,13 +142,13 @@ inline void make_row1() {
 
 // Phase B: slots `count` of the gather tile in DST tile 0, face 0 even
 // position, added to the stat row (which the first tile sets).
-template <bool first>
+template <bool first, uint32_t src = 0>
 inline void sum_stat_slots(uint32_t count) {
     _llk_math_eltwise_sfpu_start_(0);
     static_for<8>([&](auto ss) {
         constexpr uint32_t s = decltype(ss)::value;
         if (s < count) {
-            vFloat v = dst_reg[slot(0, s, 0)];
+            vFloat v = dst_reg[slot(src, s, 0)];
             if (first && s == 0) {
                 dst_reg[stat_row()] = v;
             } else {
@@ -248,6 +248,65 @@ inline void combine() {
     _llk_math_eltwise_sfpu_done_();
 }
 
+// Phase D1: the outputs' sums of squares (tiles q * cnt + c) per token,
+// destination q in column q of the exchange row (tile 7).
+template <uint32_t Q, uint32_t T>
+inline void make_row3() {
+    _llk_math_eltwise_sfpu_start_(0);
+    static_for<4>([](auto xx) { dst_reg[pos(7, decltype(xx)::value)] = vFloat(0.0f); });
+    static_for<Q>([](auto qq) {
+        constexpr uint32_t q = decltype(qq)::value;
+        vFloat sum = 0.0f;
+        sum = vFloat(dst_reg[pos(2 * q, 0)]) * vFloat(dst_reg[pos(2 * q, 0)]);
+        sum += vFloat(dst_reg[pos(2 * q, 1)]) * vFloat(dst_reg[pos(2 * q, 1)]);
+        sum += vFloat(dst_reg[pos(2 * q, 2)]) * vFloat(dst_reg[pos(2 * q, 2)]);
+        sum += vFloat(dst_reg[pos(2 * q, 3)]) * vFloat(dst_reg[pos(2 * q, 3)]);
+        sum += vFloat(dst_reg[pos(2 * q + 1, 0)]) * vFloat(dst_reg[pos(2 * q + 1, 0)]);
+        sum += vFloat(dst_reg[pos(2 * q + 1, 1)]) * vFloat(dst_reg[pos(2 * q + 1, 1)]);
+        sum += vFloat(dst_reg[pos(2 * q + 1, 2)]) * vFloat(dst_reg[pos(2 * q + 1, 2)]);
+        sum += vFloat(dst_reg[pos(2 * q + 1, 3)]) * vFloat(dst_reg[pos(2 * q + 1, 3)]);
+        sum = sum_lanes8(sum);
+        vFloat out = dst_reg[pos(7, 0)];
+        v_if(lane_col2() == static_cast<int>(2 * q)) { out = sum; }
+        v_endif;
+        dst_reg[pos(7, 0)] = out;
+    });
+    if constexpr (T < 4) {
+        vFloat out = dst_reg[pos(7, 0)];
+        v_if(lane_row16() >= static_cast<int>(16 * T)) { out = 0.0f; }
+        v_endif;
+        dst_reg[pos(7, 0)] = out;
+    }
+    _llk_math_eltwise_sfpu_done_();
+}
+
+// Phase D2, column c: the norm weight tile (DST 6, rows q) broadcast, and
+// each destination's tile q * 2 + c times its rstd and weight row.
+template <uint32_t Q, uint32_t c>
+inline void normalize_outputs() {
+    _llk_math_eltwise_sfpu_start_(0);
+    static_for<4>([](auto xx) {
+        constexpr uint32_t x = decltype(xx)::value;
+        vFloat a = dst_reg[pos(6, x)];
+        vFloat b = a;
+        vFloat cc = a;
+        vFloat d = a;
+        sfpi::subvec_transp(a, b, cc, d);
+        dst_reg[6 * 32 + 16 + x] = a;
+        dst_reg[6 * 32 + 20 + x] = b;
+        dst_reg[6 * 32 + 24 + x] = cc;
+    });
+    static_for<Q>([](auto qq) {
+        constexpr uint32_t q = decltype(qq)::value;
+        static_for<4>([](auto xx) {
+            constexpr uint32_t x = decltype(xx)::value;
+            const vFloat y = vFloat(dst_reg[pos(2 * q + c, x)]) * vFloat(dst_reg[rstd_of(q)]);
+            dst_reg[pos(2 * q + c, x)] = y * vFloat(dst_reg[6 * 32 + 16 + 4 * q + x]);
+        });
+    });
+    _llk_math_eltwise_sfpu_done_();
+}
+
 }  // namespace
 #endif
 
@@ -289,6 +348,12 @@ void kernel_main() {
     constexpr uint32_t cb_hidden = get_named_compile_time_arg_val("cb_hidden");
     constexpr uint32_t cb_output = get_named_compile_time_arg_val("cb_output");
     constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
+    constexpr uint32_t cb_mixed = get_named_compile_time_arg_val("cb_mixed");
+    constexpr uint32_t cb_row3 = get_named_compile_time_arg_val("cb_row3");
+    constexpr uint32_t cb_gather3 = get_named_compile_time_arg_val("cb_gather3");
+    constexpr uint32_t cb_norm_weight = get_named_compile_time_arg_val("cb_norm_weight");
+    constexpr bool has_norm = get_named_compile_time_arg_val("has_norm") != 0;
+    constexpr uint32_t eps_norm = get_named_compile_time_arg_val("eps_norm");
     constexpr uint32_t Q = get_named_compile_time_arg_val("num_queries");
     constexpr uint32_t Qd = get_named_compile_time_arg_val("num_dest");
     constexpr uint32_t Rt = get_named_compile_time_arg_val("Rt");
@@ -454,12 +519,57 @@ void kernel_main() {
         MATH((combine<0>()));
         MATH((combine<1>()));
         tile_regs_commit();
-        cb_reserve_back(cb_output, cnt);
+        // With a norm the mixtures wait in cb_mixed for the outputs' rstd.
+        constexpr uint32_t cb_mix_out = has_norm ? cb_mixed : cb_output;
+        cb_reserve_back(cb_mix_out, cnt);
         tile_regs_wait();
-        pack_to(4, cb_output);
-        pack_to(5, cb_output);
+        pack_to(4, cb_mix_out);
+        pack_to(5, cb_mix_out);
         tile_regs_release();
-        cb_push_back(cb_output, cnt);
+        cb_push_back(cb_mix_out, cnt);
+    }
+    if constexpr (has_norm) {
+        // Phase D1: the outputs' partial sums of squares.
+        cb_wait_front(cb_mixed, Q * cnt);
+        tile_regs_acquire();
+        static_for<Q * cnt>([](auto tt) { copy_from(cb_mixed, decltype(tt)::value, decltype(tt)::value); });
+        sfpu_init();
+        MATH((make_row3<Q, T>()));
+        tile_regs_commit();
+        cb_reserve_back(cb_row3, 1);
+        tile_regs_wait();
+        pack_to(7, cb_row3);
+        tile_regs_release();
+        cb_push_back(cb_row3, 1);
+
+        // Phase D2: their rstd from every core's sums, then the normalized,
+        // weighted BF16 tiles in (q, c) order.
+        cb_wait_front(cb_gather3, G1);
+        cb_wait_front(cb_norm_weight, cnt);
+        tile_regs_acquire();
+        static_for<G1>([&](auto gg) {
+            constexpr uint32_t g = decltype(gg)::value;
+            copy_from(cb_gather3, g, 6);
+            sfpu_init();
+            MATH((sum_stat_slots<g == 0, 6>(K - 8 * g < 8 ? K - 8 * g : 8)));
+        });
+        MATH((stream_rstd<Q>(inv_width, eps_norm)));
+        static_for<Q * cnt>([](auto tt) { copy_from(cb_mixed, decltype(tt)::value, decltype(tt)::value); });
+        static_for<cnt>([](auto cc) {
+            constexpr uint32_t c = decltype(cc)::value;
+            copy_from(cb_norm_weight, c, 6);
+            sfpu_init();
+            MATH((normalize_outputs<Q, c>()));
+        });
+        tile_regs_commit();
+        cb_reserve_back(cb_output, Q * cnt);
+        tile_regs_wait();
+        static_for<Q * cnt>([](auto tt) { pack_to(decltype(tt)::value, cb_output); });
+        tile_regs_release();
+        cb_push_back(cb_output, Q * cnt);
+        cb_pop_front(cb_mixed, Q * cnt);
+        cb_pop_front(cb_gather3, G1);
+        cb_pop_front(cb_norm_weight, cnt);
     }
     cb_pop_front(cb_hidden, QR);
     cb_pop_front(cb_gain, Q * Rt * cnt);

@@ -14,6 +14,7 @@ void kernel_main() {
     const uint32_t down_addr = get_arg_val<uint32_t>(3);
     const uint32_t gain_addr = get_arg_val<uint32_t>(4);
     const uint32_t forget_addr = get_arg_val<uint32_t>(5);
+    const uint32_t norm_weight_addr = get_arg_val<uint32_t>(6);
 
     constexpr uint32_t cb_dest = get_named_compile_time_arg_val("cb_dest");
     constexpr uint32_t cb_messages = get_named_compile_time_arg_val("cb_messages");
@@ -25,11 +26,14 @@ void kernel_main() {
     constexpr uint32_t Rt = get_named_compile_time_arg_val("Rt");
     constexpr uint32_t Wt = get_named_compile_time_arg_val("Wt");
     constexpr uint32_t cnt = 2;
+    constexpr uint32_t cb_norm_weight = get_named_compile_time_arg_val("cb_norm_weight");
+    constexpr bool has_norm = get_named_compile_time_arg_val("has_norm") != 0;
     constexpr auto dest_args = TensorAccessorArgs<0>();
     constexpr auto messages_args = TensorAccessorArgs<dest_args.next_compile_time_args_offset()>();
     constexpr auto down_args = TensorAccessorArgs<messages_args.next_compile_time_args_offset()>();
     constexpr auto gain_args = TensorAccessorArgs<down_args.next_compile_time_args_offset()>();
     constexpr auto forget_args = TensorAccessorArgs<gain_args.next_compile_time_args_offset()>();
+    constexpr auto norm_weight_args = TensorAccessorArgs<forget_args.next_compile_time_args_offset()>();
     const uint32_t f32_tile = get_tile_size(cb_dest);
     const uint32_t bf16_tile = get_tile_size(cb_down);
     const auto dest = TensorAccessor(dest_args, dest_addr, f32_tile);
@@ -87,4 +91,16 @@ void kernel_main() {
     cb_push_back(cb_down, Q * 2 * cnt * Rt);
     cb_push_back(cb_gain, Q * Rt * cnt);
     cb_push_back(cb_forget, Q * Rt * cnt);
+    if constexpr (has_norm) {
+        // The norm weight [Q, W]: tile c of its one tile row holds every
+        // destination's row.
+        const uint32_t tile = get_tile_size(cb_norm_weight);
+        const auto weight = TensorAccessor(norm_weight_args, norm_weight_addr, tile);
+        cb_reserve_back(cb_norm_weight, cnt);
+        for (uint32_t c = 0; c < cnt; ++c) {
+            noc_async_read(weight.get_noc_addr(start + c), get_write_ptr(cb_norm_weight) + c * tile, tile);
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_norm_weight, cnt);
+    }
 }

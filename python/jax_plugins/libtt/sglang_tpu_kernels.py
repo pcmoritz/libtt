@@ -1135,6 +1135,26 @@ def patch_inkling2_attn_res(module):
     def supports_loop_mix(tokens: int, num_queries: int) -> bool:
         return tokens <= max_tokens and num_queries <= 3
 
+    def loop_mix_call(dest, messages, down, gain, forget, norm_weight, eps, eps_norm):
+        operands = [
+            dest.astype(jnp.float32),
+            messages.astype(jnp.float32),
+            down.astype(jnp.bfloat16),
+            gain.astype(jnp.bfloat16),
+            forget.astype(jnp.bfloat16),
+        ]
+        if norm_weight is None:
+            results = jax.ShapeDtypeStruct(messages.shape, jnp.float32)
+        else:
+            operands.append(norm_weight.astype(jnp.float32))
+            results = tuple(jax.ShapeDtypeStruct(messages.shape[1:], jnp.bfloat16) for _ in range(messages.shape[0]))
+        return jax.ffi.ffi_call("tt.loop_mix", results)(
+            *operands,
+            epsilon=np.float32(eps),
+            has_norm=norm_weight is not None,
+            eps_norm=np.float32(eps_norm),
+        )
+
     @functools.cache
     def loop_mix_op():
         from torch_tpu._internal import pallas
@@ -1142,14 +1162,7 @@ def patch_inkling2_attn_res(module):
         def _op(
             dest: jax.Array, messages: jax.Array, down: jax.Array, gain: jax.Array, forget: jax.Array, eps: float
         ) -> jax.Array:
-            return jax.ffi.ffi_call("tt.loop_mix", jax.ShapeDtypeStruct(messages.shape, jnp.float32))(
-                dest.astype(jnp.float32),
-                messages.astype(jnp.float32),
-                down.astype(jnp.bfloat16),
-                gain.astype(jnp.bfloat16),
-                forget.astype(jnp.bfloat16),
-                epsilon=np.float32(eps),
-            )
+            return loop_mix_call(dest, messages, down, gain, forget, None, eps, 0.0)
 
         op = pallas.jax_op("libtt::inkling2_loop_mix", _op)
 
@@ -1159,8 +1172,35 @@ def patch_inkling2_attn_res(module):
 
         return op
 
-    def loop_mix_tpu(dest, messages, down_t, gain_t, forget_t, *, eps):
-        return loop_mix_op()(dest, messages, down_t, gain_t, forget_t, float(eps))
+    @functools.cache
+    def loop_mix_normed_op(num_queries):
+        from torch_tpu._internal import pallas
+
+        def _op(
+            dest: jax.Array,
+            messages: jax.Array,
+            down: jax.Array,
+            gain: jax.Array,
+            forget: jax.Array,
+            norm_weight: jax.Array,
+            eps: float,
+            eps_norm: float,
+        ) -> tuple[jax.Array, ...]:
+            return tuple(loop_mix_call(dest, messages, down, gain, forget, norm_weight, eps, eps_norm))
+
+        op = pallas.jax_op(f"libtt::inkling2_loop_mix_normed_{num_queries}", _op)
+
+        @op.register_fake
+        def fake(dest, messages, down, gain, forget, norm_weight, eps, eps_norm):
+            return tuple(messages.new_empty(messages.shape[1:], dtype=torch.bfloat16) for _ in range(num_queries))
+
+        return op
+
+    def loop_mix_tpu(dest, messages, down_t, gain_t, forget_t, *, eps, norm_weight=None, eps_norm=None):
+        if norm_weight is None:
+            return loop_mix_op()(dest, messages, down_t, gain_t, forget_t, float(eps))
+        return loop_mix_normed_op(messages.shape[0])(
+            dest, messages, down_t, gain_t, forget_t, norm_weight, float(eps), float(eps_norm)
 
     module.supports_attn_res_norm = supports_attn_res_norm
     module.attn_res_norm_jax = attn_res_norm_jax
