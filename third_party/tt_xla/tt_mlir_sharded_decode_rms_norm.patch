@@ -12,7 +12,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
  #include "tt/runtime/detail/ttnn/operations/utils.h"
  #include "tt/runtime/detail/ttnn/utils.h"
  
-@@ -36,14 +40,57 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -36,14 +40,65 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -26,12 +26,20 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +  if (inputShape.rank() >= 2) {
 +    const uint32_t width = static_cast<uint32_t>(inputShape[-1]);
 +    const uint64_t rows = input.logical_volume() / width;
-+    constexpr uint32_t kShardCores = 16;
++    // The most cores, two rows of up to 8, that split the width into whole
++    // tiles: 16 for multiples of 512, 12 for 2304 (Inkling 2). Interleaved,
++    // a few rows run on one core per tile row.
++    uint32_t shardCores = 0;
++    for (uint32_t cores : {16u, 12u, 8u}) {
++      if (width % (cores * tt::constants::TILE_WIDTH) == 0) {
++        shardCores = cores;
++        break;
++      }
++    }
 +    useShardedRMSNorm =
 +        !input.is_sharded() && input.layout() == ::ttnn::Layout::TILE &&
 +        input.storage_type() == ::ttnn::StorageType::DEVICE &&
-+        width >= 2048 && rows <= 64 &&
-+        width % (kShardCores * tt::constants::TILE_WIDTH) == 0;
++        width >= 2048 && rows <= 64 && shardCores != 0;
 +    if (useShardedRMSNorm) {
 +      if (inputShape.rank() > 2) {
 +        rmsInput = ::ttnn::reshape(
@@ -39,14 +47,14 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +            input.memory_config());
 +      }
 +      const auto grid = ::tt::tt_metal::CoreRangeSet(
-+          {::tt::tt_metal::CoreRange({0, 0}, {7, 1})});
++          {::tt::tt_metal::CoreRange({0, 0}, {shardCores / 2 - 1, 1})});
 +      rmsMemoryConfig = ::ttnn::MemoryConfig(
 +          ::ttnn::TensorMemoryLayout::WIDTH_SHARDED, ::ttnn::BufferType::L1,
 +          ::tt::tt_metal::ShardSpec(
 +              grid,
 +              {static_cast<uint32_t>(
 +                   rmsInput.tensor_spec().physical_shape().height()),
-+               width / kShardCores},
++               width / shardCores},
 +              ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
 +      rmsInput = ::ttnn::to_memory_config(rmsInput, *rmsMemoryConfig);
 +      programConfig = ::ttnn::prim::create_layernorm_program_config(

@@ -583,7 +583,7 @@ def patch_inkling_sconv(module):
     torch_decode = backend._xla_sconv_decode
 
     @functools.cache
-    def conv_update_op():
+    def conv_update_op(out_dtype="float32"):
         import jax
         import jax.numpy as jnp
         from torch_tpu._internal import pallas
@@ -598,29 +598,42 @@ def patch_inkling_sconv(module):
                 rows = slice(start, start + sglang_tpu_gdn.MAX_ROWS)
                 state, out = jax.ffi.ffi_call(
                     "tt.causal_conv1d_update",
-                    (jax.ShapeDtypeStruct(state.shape, state.dtype), jax.ShapeDtypeStruct(x[rows].shape, jnp.float32)),
+                    (
+                        jax.ShapeDtypeStruct(state.shape, state.dtype),
+                        jax.ShapeDtypeStruct(x[rows].shape, jnp.dtype(out_dtype)),
+                    ),
                     input_output_aliases={0: 0},
                     vmap_method="sequential",
                 )(state, x[rows], weight, slots[rows], initial[rows], apply_silu=False)
                 outputs.append(out)
             return state, jnp.concatenate(outputs)
 
-        op = pallas.jax_op("libtt::inkling_conv_update", conv_update, donate_argnums=(0,))
+        op = pallas.jax_op(f"libtt::inkling_conv_update_{out_dtype}", conv_update, donate_argnums=(0,))
 
         @op.register_fake
         def fake(state, x, weight, slots, initial):
-            return torch.empty_like(state), x.new_empty(x.shape, dtype=torch.float32)
+            return torch.empty_like(state), x.new_empty(x.shape, dtype=getattr(torch, out_dtype))
 
         return op
 
-    def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual):
+    def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual, decode_weight=None):
         if dyn is not None or state.dim() != 3 or self._track_end is not None:
-            return torch_decode(self, x, state=state, weight=weight, dyn=dyn, use_residual=use_residual)
+            return torch_decode(
+                self, x, state=state, weight=weight, dyn=dyn, use_residual=use_residual, decode_weight=decode_weight
+            )
         num_seqs, dim = x.shape
         kernel_size = weight.shape[-1]
         # Padding rows (index -1) go to slot 0, which the kernel never writes.
         slots = torch.where(self._state_indices[:num_seqs] >= 0, self._state_indices[:num_seqs], 0)
         initial = (self._seq_lens[:num_seqs] > 1).to(torch.bfloat16)
+        if decode_weight is not None and use_residual:
+            # The model's weight with the residual tap and the scale folded in: the
+            # kernel's output is the result.
+            pool, conv = conv_update_op("bfloat16")(
+                state, x.to(torch.bfloat16), decode_weight.to(torch.bfloat16), slots.to(torch.int32), initial
+            )
+            state.copy_(pool)
+            return conv.to(x.dtype)
         pool, conv = conv_update_op()(
             state, x.to(torch.bfloat16), weight.reshape(dim, kernel_size), slots.to(torch.int32), initial
         )
