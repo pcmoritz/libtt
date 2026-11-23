@@ -1,18 +1,17 @@
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 --- a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
-@@ -3,6 +3,10 @@
+@@ -3,6 +3,9 @@
  // SPDX-License-Identifier: Apache-2.0
  
  #include "operations/normalization/rms_norm.h"
 +#include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
-+#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 +#include "ttnn/operations/normalization/layernorm/device/layernorm_common.hpp"
 +#include <tt-metalium/constants.hpp>
  #include "tt/runtime/detail/ttnn/operations/utils.h"
  #include "tt/runtime/detail/ttnn/utils.h"
  
-@@ -36,14 +40,66 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -36,14 +39,57 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -23,10 +22,13 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig;
 +  bool useShardedRMSNorm = false;
 +
-+  // Any rank: rows of the last dimension (a batch-1 step's norms are rank 1).
++  // Any rank (a batch-1 step's norms are rank 1): the shards take the tile
++  // rows as stored, padding rows of each batch dimension included (normalized
++  // and dropped), so a [Q, T, W] input with T below a tile needs no reshape,
++  // which would untilize and tilize it.
 +  if (inputShape.rank() >= 1) {
 +    const uint32_t width = static_cast<uint32_t>(inputShape[-1]);
-+    const uint64_t rows = input.logical_volume() / width;
++    const uint32_t physicalRows = input.tensor_spec().physical_shape().height();
 +    // The most cores, two rows of up to 8, that split the width into whole
 +    // tiles: 16 for multiples of 512, 12 for 2304 (Inkling 2). Interleaved,
 +    // a few rows run on one core per tile row.
@@ -40,22 +42,15 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +    useShardedRMSNorm =
 +        !input.is_sharded() && input.layout() == ::ttnn::Layout::TILE &&
 +        input.storage_type() == ::ttnn::StorageType::DEVICE &&
-+        width >= 2048 && rows <= 64 && shardCores != 0;
++        width >= 2048 && physicalRows <= 128 && shardCores != 0;
 +    if (useShardedRMSNorm) {
-+      if (inputShape.rank() != 2) {
-+        rmsInput = ::ttnn::reshape(
-+            input, ::ttnn::Shape({static_cast<uint32_t>(rows), width}),
-+            input.memory_config());
-+      }
 +      const auto grid = ::tt::tt_metal::CoreRangeSet(
 +          {::tt::tt_metal::CoreRange({0, 0}, {shardCores / 2 - 1, 1})});
 +      rmsMemoryConfig = ::ttnn::MemoryConfig(
 +          ::ttnn::TensorMemoryLayout::WIDTH_SHARDED, ::ttnn::BufferType::L1,
 +          ::tt::tt_metal::ShardSpec(
 +              grid,
-+              {static_cast<uint32_t>(
-+                   rmsInput.tensor_spec().physical_shape().height()),
-+               width / shardCores},
++              {physicalRows, width / shardCores},
 +              ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
 +      rmsInput = ::ttnn::to_memory_config(rmsInput, *rmsMemoryConfig);
 +      programConfig = ::ttnn::prim::create_layernorm_program_config(
@@ -75,13 +70,8 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +      /*residual_input_tensor=*/std::nullopt, rmsMemoryConfig, programConfig,
 +      computeConfig);
 +  if (useShardedRMSNorm) {
-+    const auto outMemCfg = memoryConfig.value_or(input.memory_config());
-+    if (inputShape.rank() != 2) {
-+      output = ::ttnn::to_memory_config(output, input.memory_config());
-+      output = ::ttnn::reshape(output, inputShape, outMemCfg);
-+    } else {
-+      output = ::ttnn::to_memory_config(output, outMemCfg);
-+    }
++    output = ::ttnn::to_memory_config(
++        output, memoryConfig.value_or(input.memory_config()));
 +  }
  
    tensorPool.insertTTNNTensorAndValidate(op->out(), output);
