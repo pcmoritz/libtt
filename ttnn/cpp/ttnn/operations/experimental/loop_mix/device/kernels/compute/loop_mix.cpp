@@ -16,8 +16,8 @@
 //      other rows zero); its share of the down projection,
 //      [dn | mn] @ down over its rows of K, packed for the second exchange.
 //   B3 (first core): the shares summed into hidden, rounded to BF16.
-//   C: per output tile (q, c): gate and forget = tanh(bf16(hidden @ gain or
-//      forget)), out = dest + (gate * message - forget * dest).
+//   C: per destination q, both columns: gate and forget = tanh(bf16(hidden @
+//      gain or forget)), out = dest + (gate * message - forget * dest).
 #include <cstdint>
 #include <type_traits>
 #include <utility>
@@ -231,17 +231,19 @@ inline void zero_padding_rows() {
     _llk_math_eltwise_sfpu_done_();
 }
 
-// Phase C: tiles 0 (gate pre-activation), 1 (forget), 2 (dest), 3 (message):
-// tile 2's token rows = d + (tanh(bf16(g)) * m - tanh(bf16(f)) * d).
+// Phase C, column c: tiles c (gate pre-activation), 2 + c (forget), 4 + c
+// (dest), 6 + c (message): tile 4 + c's token rows = d + (tanh(bf16(g)) * m
+// - tanh(bf16(f)) * d).
+template <uint32_t c>
 inline void combine() {
     _llk_math_eltwise_sfpu_start_(0);
     static_for<4>([](auto xx) {
         constexpr uint32_t x = decltype(xx)::value;
-        const vFloat g = ckernel::sfpu::_sfpu_tanh_fp32_accurate_(round_bf16(dst_reg[pos(0, x)]));
-        const vFloat f = ckernel::sfpu::_sfpu_tanh_fp32_accurate_(round_bf16(dst_reg[pos(1, x)]));
-        const vFloat d = dst_reg[pos(2, x)];
-        const vFloat m = dst_reg[pos(3, x)];
-        dst_reg[pos(2, x)] = d + (g * m - f * d);
+        const vFloat g = ckernel::sfpu::_sfpu_tanh_fp32_accurate_(round_bf16(dst_reg[pos(c, x)]));
+        const vFloat f = ckernel::sfpu::_sfpu_tanh_fp32_accurate_(round_bf16(dst_reg[pos(2 + c, x)]));
+        const vFloat d = dst_reg[pos(4 + c, x)];
+        const vFloat m = dst_reg[pos(6 + c, x)];
+        dst_reg[pos(4 + c, x)] = d + (g * m - f * d);
     });
     _llk_math_eltwise_sfpu_done_();
 }
@@ -286,6 +288,7 @@ void kernel_main() {
     constexpr uint32_t cb_gather2 = get_named_compile_time_arg_val("cb_gather2");
     constexpr uint32_t cb_hidden = get_named_compile_time_arg_val("cb_hidden");
     constexpr uint32_t cb_output = get_named_compile_time_arg_val("cb_output");
+    constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
     constexpr uint32_t Q = get_named_compile_time_arg_val("num_queries");
     constexpr uint32_t Qd = get_named_compile_time_arg_val("num_dest");
     constexpr uint32_t Rt = get_named_compile_time_arg_val("Rt");
@@ -325,19 +328,25 @@ void kernel_main() {
     cb_push_back(cb_row1, 1);
 
     // Phase B: rstd, the normalized BF16 tiles (stream-major, then column),
-    // in two DST rounds of S tiles each (column 0, then 1).
+    // in two DST rounds of S tiles each (column 0, then 1); the first keeps
+    // the rstd vectors (DST tile 7) in cb_rstd for the second.
     cb_wait_front(cb_gather1, G1);
     cb_reserve_back(cb_normed, S * cnt);
     static_for<cnt>([&](auto cc) {
         constexpr uint32_t c = decltype(cc)::value;
         tile_regs_acquire();
-        static_for<G1>([&](auto gg) {
-            constexpr uint32_t g = decltype(gg)::value;
-            copy_from(cb_gather1, g, 0);
-            sfpu_init();
-            MATH((sum_stat_slots<g == 0>(K - 8 * g < 8 ? K - 8 * g : 8)));
-        });
-        MATH((stream_rstd<S>(inv_width, eps)));
+        if constexpr (c == 0) {
+            static_for<G1>([&](auto gg) {
+                constexpr uint32_t g = decltype(gg)::value;
+                copy_from(cb_gather1, g, 0);
+                sfpu_init();
+                MATH((sum_stat_slots<g == 0>(K - 8 * g < 8 ? K - 8 * g : 8)));
+            });
+            MATH((stream_rstd<S>(inv_width, eps)));
+        } else {
+            cb_wait_front(cb_rstd, 1);
+            copy_from(cb_rstd, 0, 7);
+        }
         static_for<S>([&](auto ss) {
             constexpr uint32_t s = decltype(ss)::value;
             copy_from(stream_cb(s), stream_tile(s, c), s);
@@ -348,8 +357,16 @@ void kernel_main() {
         tile_regs_wait();
         // Packed in (c, s) order; the matmuls index normed tile c * S + s.
         static_for<S>([](auto ss) { pack_to(decltype(ss)::value, cb_normed); });
+        if constexpr (c == 0) {
+            cb_reserve_back(cb_rstd, 1);
+            pack_to(7, cb_rstd);
+        }
         tile_regs_release();
+        if constexpr (c == 0) {
+            cb_push_back(cb_rstd, 1);
+        }
     });
+    cb_pop_front(cb_rstd, 1);
     cb_push_back(cb_normed, S * cnt);
     cb_pop_front(cb_gather1, G1);
 
@@ -412,30 +429,37 @@ void kernel_main() {
     cb_wait_front(cb_hidden, QR);
     cb_wait_front(cb_gain, Q * Rt * cnt);
     cb_wait_front(cb_forget, Q * Rt * cnt);
+    // Both columns of a destination in one DST round.
     for (uint32_t q = 0; q < Q; ++q) {
         const uint32_t qd = Qd == 1 ? 0 : q;
+        tile_regs_acquire();
+        matmul_setup(cb_hidden, cb_gain);
         for (uint32_t c = 0; c < cnt; ++c) {
-            tile_regs_acquire();
-            matmul_setup(cb_hidden, cb_gain);
             for (uint32_t kt = 0; kt < Rt; ++kt) {
-                matmul_tiles(cb_hidden, cb_gain, q * Rt + kt, (q * Rt + kt) * cnt + c, 0);
+                matmul_tiles(cb_hidden, cb_gain, q * Rt + kt, (q * Rt + kt) * cnt + c, c);
             }
-            matmul_setup(cb_hidden, cb_forget);
-            for (uint32_t kt = 0; kt < Rt; ++kt) {
-                matmul_tiles(cb_hidden, cb_forget, q * Rt + kt, (q * Rt + kt) * cnt + c, 1);
-            }
-            copy_from(cb_dest, qd * cnt + c, 2);
-            copy_from(cb_messages, q * cnt + c, 3);
-            sfpu_init();
-            MATH((ckernel::sfpu::tanh_init<false, true>()));
-            MATH((combine()));
-            tile_regs_commit();
-            cb_reserve_back(cb_output, 1);
-            tile_regs_wait();
-            pack_to(2, cb_output);
-            tile_regs_release();
-            cb_push_back(cb_output, 1);
         }
+        matmul_setup(cb_hidden, cb_forget);
+        for (uint32_t c = 0; c < cnt; ++c) {
+            for (uint32_t kt = 0; kt < Rt; ++kt) {
+                matmul_tiles(cb_hidden, cb_forget, q * Rt + kt, (q * Rt + kt) * cnt + c, 2 + c);
+            }
+        }
+        for (uint32_t c = 0; c < cnt; ++c) {
+            copy_from(cb_dest, qd * cnt + c, 4 + c);
+            copy_from(cb_messages, q * cnt + c, 6 + c);
+        }
+        sfpu_init();
+        MATH((ckernel::sfpu::tanh_init<false, true>()));
+        MATH((combine<0>()));
+        MATH((combine<1>()));
+        tile_regs_commit();
+        cb_reserve_back(cb_output, cnt);
+        tile_regs_wait();
+        pack_to(4, cb_output);
+        pack_to(5, cb_output);
+        tile_regs_release();
+        cb_push_back(cb_output, cnt);
     }
     cb_pop_front(cb_hidden, QR);
     cb_pop_front(cb_gain, Q * Rt * cnt);

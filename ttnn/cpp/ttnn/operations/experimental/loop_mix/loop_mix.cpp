@@ -171,7 +171,7 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
     };
     constexpr uint32_t cb_dest = 0, cb_messages = 1, cb_down = 2, cb_gain = 3, cb_forget = 4, cb_row1 = 5,
                        cb_gather1 = 6, cb_normed = 7, cb_partial = 8, cb_gather2 = 9, cb_hidden = 10,
-                       cb_output = 16;
+                       cb_rstd = 11, cb_output = 16;
     make_cb(cb_dest, Qd * cnt, DataType::FLOAT32);
     make_cb(cb_messages, Q * cnt, DataType::FLOAT32);
     make_cb(cb_down, Q * 2 * cnt * Rt, DataType::BFLOAT16);
@@ -183,7 +183,8 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
     make_cb(cb_partial, Q * Rt, DataType::FLOAT32);
     make_cb(cb_gather2, gather2_tiles, DataType::FLOAT32);
     make_cb(cb_hidden, Q * Rt, DataType::BFLOAT16);
-    make_cb(cb_output, 1, DataType::FLOAT32);
+    make_cb(cb_rstd, 1, DataType::FLOAT32);
+    make_cb(cb_output, cnt, DataType::FLOAT32);
 
     constexpr uint32_t written_sem = 0, valid_sem = 1;
     for (uint32_t id : {written_sem, valid_sem}) {
@@ -203,6 +204,7 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
         {"cb_gather2", cb_gather2},
         {"cb_hidden", cb_hidden},
         {"cb_output", cb_output},
+        {"cb_rstd", cb_rstd},
         {"num_queries", Q},
         {"num_dest", Qd},
         {"Rt", Rt},
@@ -246,7 +248,7 @@ ProgramDescriptor LoopMixOperation::create_descriptor(
         .dst_full_sync_en = true,
         .math_approx_mode = false};
     compute_config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
-    for (uint32_t cb : {cb_dest, cb_messages, cb_gather1, cb_gather2}) {
+    for (uint32_t cb : {cb_dest, cb_messages, cb_gather1, cb_gather2, cb_rstd}) {
         compute_config.unpack_to_dest_mode[cb] = UnpackToDestMode::UnpackToDestFp32;
     }
     KernelDescriptor compute{
