@@ -22,7 +22,7 @@ diff --git a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h b/include/ttmlir/OpModel/
 diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 --- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 +++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
-@@ -4476,7 +4476,8 @@ llvm::Expected<op_model::OpConstraints> RMSNormOp::getOpConstraints(
+@@ -4496,7 +4496,8 @@ llvm::Expected<op_model::OpConstraints> RMSNormOp::getOpConstraints(
        *this, liveRecords, inputShape, inputs[0], optionalArgs.weightShape,
        optionalArgs.weightLayout, optionalArgs.biasShape,
        optionalArgs.biasLayout, getEpsilon(), opConfig.outputLayout,
@@ -32,7 +32,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
  }
  
  llvm::Expected<size_t>
-@@ -4495,7 +4496,8 @@ RMSNormOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
+@@ -4515,7 +4516,8 @@ RMSNormOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
        op_model::OpModel<RMSNormOp>::getOpRuntime, *this, inputShape, inputs[0],
        optionalArgs.weightShape, optionalArgs.weightLayout,
        optionalArgs.biasShape, optionalArgs.biasLayout, getEpsilon(),
@@ -235,7 +235,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
    }
  
    ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
-@@ -329,11 +489,100 @@ private:
+@@ -329,11 +489,137 @@ private:
        return {};
      }
  
@@ -334,15 +334,54 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +  }
 +};
 +
++// An add, subtract or multiply of an operand cast from BF16 to FP32 reads the
++// BF16 tensor itself while it still computes in FP32 DST, as binary_ng does
++// whenever its output or its other operand is FP32: its SFPU kernel unpacks
++// BF16 into FP32 DST exactly, so the result is the same without the typecast
++// program (Inkling 2's residual update, partial + attention + mlp in FP32,
++// casts three BF16 tensors every layer). Only for operands of the same shape
++// without fused activations: a broadcast BF16 operand takes other paths.
++template <typename BinaryOpTy>
++class TTNNBinaryOpOfUpcast : public mlir::OpRewritePattern<BinaryOpTy> {
++public:
++  using mlir::OpRewritePattern<BinaryOpTy>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(BinaryOpTy op, mlir::PatternRewriter &rewriter) const final {
++    if (!op.getActivations().empty() ||
++        !op.getInputTensorAActivations().empty() ||
++        !op.getInputTensorBActivations().empty() ||
++        op.getLhs().getType().getShape() != op.getRhs().getType().getShape()) {
++      return mlir::failure();
++    }
++    for (unsigned i = 0; i < 2; ++i) {
++      auto cast = op->getOperand(i).template getDefiningOp<TypecastOp>();
++      Value other = op->getOperand(1 - i);
++      if (!cast || !elementTypeOf(cast.getInput()).isBF16() ||
++          !elementTypeOf(cast.getResult()).isF32() ||
++          !(elementTypeOf(op.getResult()).isF32() ||
++            elementTypeOf(other).isF32())) {
++        continue;
++      }
++      rewriter.modifyOpInPlace(
++          op, [&]() { op->setOperand(i, cast.getInput()); });
++      return mlir::success();
++    }
++    return mlir::failure();
++  }
++};
++
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -705,8 +954,11 @@ public:
+@@ -705,8 +991,13 @@ public:
        firstPatterns.add<TTNNBinaryOpInputsActivation>(
            &getContext(), /*restrictToMatmulProducer=*/true);
      }
 +    patterns.add<TTNNRMSNormNarrowingOutput, TTNNMatmulOfUpcast<MatmulOp>,
 +                 TTNNMatmulOfUpcast<LinearOp>>(&getContext());
++    patterns.add<TTNNBinaryOpOfUpcast<AddOp>, TTNNBinaryOpOfUpcast<SubtractOp>,
++                 TTNNBinaryOpOfUpcast<MultiplyOp>>(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
 +    patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
@@ -352,7 +391,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 --- a/lib/OpModel/TTNN/TTNNOpModel.cpp
 +++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
-@@ -7603,6 +7603,7 @@ llvm::Expected<OpConstraints> OpModel<RMSNormOp>::getOpConstraints(
+@@ -7610,6 +7610,7 @@ llvm::Expected<OpConstraints> OpModel<RMSNormOp>::getOpConstraints(
      std::optional<TTNNLayoutAttr> biasLayout, llvm::APFloat epsilon,
      TTNNLayoutAttr outputLayout,
      std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig,
@@ -360,7 +399,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
      const MockAllocatorState *initialState) {
  #ifdef TTMLIR_ENABLE_OPMODEL
    ::tt::tt_metal::distributed::MeshDevice *device =
-@@ -7634,7 +7635,9 @@ llvm::Expected<OpConstraints> OpModel<RMSNormOp>::getOpConstraints(
+@@ -7641,7 +7642,9 @@ llvm::Expected<OpConstraints> OpModel<RMSNormOp>::getOpConstraints(
          ::ttnn::rms_norm, device, initialStateOpt, inputSpec,
          epsilon.convertToFloat(), weightSpec, biasSpec, residualInputSpec,
          detail::getNullableMemoryConfig(outputLayout),
@@ -371,7 +410,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    };
  
    return operation::getOpConstraintsWithState(inputLayout.getContext(),
-@@ -7651,7 +7654,8 @@ llvm::Expected<size_t> OpModel<RMSNormOp>::getOpRuntime(
+@@ -7658,7 +7661,8 @@ llvm::Expected<size_t> OpModel<RMSNormOp>::getOpRuntime(
      std::optional<llvm::ArrayRef<int64_t>> biasShape,
      std::optional<TTNNLayoutAttr> biasLayout, llvm::APFloat epsilon,
      TTNNLayoutAttr outputLayout,
@@ -381,7 +420,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
  #ifdef TTMLIR_ENABLE_OPMODEL
    ::tt::tt_metal::distributed::MeshDevice *device =
        SingletonDeviceContext::getInstance().getDevice();
-@@ -7678,7 +7682,9 @@ llvm::Expected<size_t> OpModel<RMSNormOp>::getOpRuntime(
+@@ -7685,7 +7689,9 @@ llvm::Expected<size_t> OpModel<RMSNormOp>::getOpRuntime(
          ::ttnn::rms_norm, device, inputSpec, epsilon.convertToFloat(),
          weightSpec, biasSpec, residualInputSpec,
          detail::getNullableMemoryConfig(outputLayout),
@@ -395,7 +434,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 --- a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
-@@ -78,10 +78,12 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -82,10 +82,12 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
      }
    }
  
@@ -407,5 +446,5 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 -      computeConfig);
 +      computeConfig, utils::getDataType(op->out()));
    if (useShardedRMSNorm) {
-     const auto outMemCfg = memoryConfig.value_or(input.memory_config());
-     if (inputShape.rank() > 2) {
+     output = ::ttnn::to_memory_config(
+         output, memoryConfig.value_or(input.memory_config()));
