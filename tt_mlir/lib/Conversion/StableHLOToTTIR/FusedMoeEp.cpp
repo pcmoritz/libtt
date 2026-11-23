@@ -54,12 +54,16 @@ namespace mlir::tt {
 namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
-// Matmul rings that run a device's experts side by side. BF16 experts stream
-// through one ring: a whole expert slice per ring core, which the rings replay
-// for every chunk, doesn't fit a core's L1 at two bytes per weight. At FP8's
-// one byte it does: 0.66 MB of the 0.79 MB at Qwen3-30B-A3B's shapes.
+// Matmul rings that run a device's experts side by side, replaying a whole
+// expert slice per ring core for every chunk, which must fit half a core's L1.
+// Experts stream through one ring when it doesn't: BF16 experts, at two bytes
+// per weight, and FP8 ones larger than about 640 KiB per ring core (8 cores):
+// Qwen3-30B-A3B's (2048 x 768, 0.66 MB stored) fit, Inkling-2-Mini's (2304 x
+// 1152, 1.1 MB on 12 cores) don't.
 constexpr uint32_t kRings = 3;
-constexpr uint32_t kBf16Rings = 0;
+constexpr uint32_t kStreamingRings = 0;
+constexpr int64_t kRingCores = 8;
+constexpr int64_t kReplaySliceBytes = 640 * 1024;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -191,6 +195,9 @@ public:
                                 std::multiplies<>());
     }
     const int64_t experts = localExperts * devices;
+    // An FP8 expert's three projections are 3 * hidden * intermediate bytes.
+    const bool replay = fp8Weights && 3 * hidden * intermediate / kRingCores <=
+                                          kReplaySliceBytes;
 
     Type bf16 = rewriter.getBF16Type();
     Type placementType = rewriter.getF32Type();
@@ -297,7 +304,7 @@ public:
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),
-          rewriter.getUI32IntegerAttr(bf16Weights ? kBf16Rings : kRings),
+          rewriter.getUI32IntegerAttr(replay ? kRings : kStreamingRings),
           fp8Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::Float8E4M3FN)
           : bf16Weights

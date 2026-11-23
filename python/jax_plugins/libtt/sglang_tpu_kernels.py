@@ -36,6 +36,7 @@ KV_POOL_MODULE = "sglang_tpu.kv_pool"
 FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
 GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
 MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
+MAMBA_STATE_ROWS_MODULE = "sglang_tpu.mamba_state_rows"
 KV_FUSED_ROPE_WRITE_MODULE = "sglang_tpu.kv_fused_rope_write"
 BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_worker"
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
@@ -458,6 +459,57 @@ def patch_gdn(module):
     module.fused_conv1d_gdn = sglang_tpu_gdn.fused_conv1d_gdn
 
 
+def patch_mamba_state_rows(module):
+    """Row reads and writes of a state pool (Inkling's short-convolution windows)
+    without Pallas: a gather of the rows, and TTNN's in-place state-pool update,
+    which writes whole slots and skips slot 0, SGLang's padding slot, where the
+    Pallas kernel skips the rows that aren't live."""
+    import functools
+
+    @functools.cache
+    def state_row_read_op():
+        import jax
+        import jax.numpy as jnp
+        import torch
+        from torch_tpu._internal import pallas
+
+        # torch_tpu's jax_op reads the signature's annotations.
+        def read_rows(pool: jax.Array, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+            flat = pool.reshape(pool.shape[0], -1)
+            return pool, jnp.take(flat, rows, axis=0).reshape(rows.shape[0], *pool.shape[1:])
+
+        op = pallas.jax_op("sglang::tpu_state_row_read", read_rows, donate_argnums=(0,))
+
+        @op.register_fake
+        def fake(pool, rows):
+            return torch.empty_like(pool), pool.new_empty((rows.shape[0], *pool.shape[1:]))
+
+        return op
+
+    @functools.cache
+    def state_row_write_op():
+        import jax
+        import jax.numpy as jnp
+        import torch
+        from torch_tpu._internal import pallas
+
+        from jax_plugins.libtt import sglang_tpu_gdn
+
+        def write_rows(pool: jax.Array, rows: jax.Array, live: jax.Array, new: jax.Array) -> jax.Array:
+            return sglang_tpu_gdn._write_rows(pool, jnp.where(live != 0, rows, 0), new)
+
+        op = pallas.jax_op("sglang::tpu_state_row_write", write_rows, donate_argnums=(0,))
+
+        @op.register_fake
+        def fake(pool, rows, live, new):
+            return torch.empty_like(pool)
+
+        return op
+
+    module.state_row_read_op = state_row_read_op
+    module.state_row_write_op = state_row_write_op
+
+
 def patch_mamba_pool(module):
     from jax_plugins.libtt import sglang_tpu_gdn
 
@@ -702,6 +754,7 @@ PATCHES = {
     FP8_LINEAR_SMALL_M_MODULE: patch_fp8_linear_small_m,
     GDN_MODULE: patch_gdn,
     MAMBA_POOL_MODULE: patch_mamba_pool,
+    MAMBA_STATE_ROWS_MODULE: patch_mamba_state_rows,
     KV_FUSED_ROPE_WRITE_MODULE: patch_kv_fused_rope_write,
     BLOCK_DRAFT_WORKER_MODULE: patch_block_draft_worker,
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
