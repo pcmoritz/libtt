@@ -80,7 +80,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
      if (restrictToMatmulProducer &&
          !unaryOp.getInput().getDefiningOp<MatmulOp>() &&
          !unaryOp.getInput().getDefiningOp<LinearOp>()) {
-@@ -290,6 +311,87 @@ private:
+@@ -290,6 +311,144 @@ private:
  };
  } // namespace
  
@@ -165,10 +165,67 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +};
 +} // namespace
 +
++namespace {
++// A matmul (or linear) of an operand cast from BF16 to FP32 reads the BF16
++// tensor itself: the matrix unit reads FP32 operands as TF32, which holds BF16
++// values exactly, so the products and FP32 sums are the same, without the cast
++// program or an FP32 copy of the operand (an FP32 LM head's whole weight, every
++// step). FP32-exact matmuls keep their own handling (TTNNSetComputeKernelConfig).
++template <typename MatmulOpType>
++class TTNNMatmulOfUpcast : public mlir::OpRewritePattern<MatmulOpType> {
++public:
++  using mlir::OpRewritePattern<MatmulOpType>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(MatmulOpType op, mlir::PatternRewriter &rewriter) const final {
++    if (op->hasAttr("ttcore.fp32_exact") ||
++        !elementTypeOf(op.getResult()).isF32()) {
++      return mlir::failure();
++    }
++    llvm::SmallVector<std::pair<mlir::OpOperand *, TypecastOp>> upcasts;
++    for (mlir::OpOperand *operand : {&op.getAMutable(), &op.getBMutable()}) {
++      auto cast = operand->get().template getDefiningOp<TypecastOp>();
++      if (cast && cast.getResult().hasOneUse() &&
++          elementTypeOf(cast.getInput()).isBF16() &&
++          elementTypeOf(cast.getResult()).isF32()) {
++        upcasts.emplace_back(operand, cast);
++      }
++    }
++    if (upcasts.empty()) {
++      return mlir::failure();
++    }
++    MLIRContext *context = op.getContext();
++    DeviceComputeKernelConfigAttr config = op.getComputeConfigAttr();
++    if (!config) {
++      config = DeviceComputeKernelConfigAttr::get(
++          context, MathFidelity::HiFi4, BoolAttr::get(context, false),
++          BoolAttr::get(context, true), /*packerL1Acc=*/nullptr,
++          /*dstFullSyncEn=*/nullptr);
++    } else {
++      // FP32 sums, as with FP32 operands.
++      config = config.withFp32DestAccEn(true);
++      if (!config.getMathFidelity()) {
++        config = config.withMathFidelity(MathFidelity::HiFi4);
++      }
++    }
++    rewriter.modifyOpInPlace(op, [&]() {
++      for (auto &[operand, cast] : upcasts) {
++        operand->set(cast.getInput());
++      }
++      op.setComputeConfigAttr(config);
++    });
++    for (auto &[operand, cast] : upcasts) {
++      rewriter.eraseOp(cast);
++    }
++    return mlir::success();
++  }
++};
++} // namespace
++
  namespace {
  class TTNNBinaryOpOutputActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseUnary> {
-@@ -320,7 +422,8 @@ public:
+@@ -320,7 +479,8 @@ public:
  
  private:
    bool isFusable(ElementwiseUnary unaryOp) const {
@@ -178,7 +235,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
    }
  
    ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
-@@ -329,11 +432,100 @@ private:
+@@ -329,11 +489,100 @@ private:
        return {};
      }
  
@@ -280,11 +337,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -705,8 +897,10 @@ public:
+@@ -705,8 +954,11 @@ public:
        firstPatterns.add<TTNNBinaryOpInputsActivation>(
            &getContext(), /*restrictToMatmulProducer=*/true);
      }
-+    patterns.add<TTNNRMSNormNarrowingOutput>(&getContext());
++    patterns.add<TTNNRMSNormNarrowingOutput, TTNNMatmulOfUpcast<MatmulOp>,
++                 TTNNMatmulOfUpcast<LinearOp>>(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
 +    patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());

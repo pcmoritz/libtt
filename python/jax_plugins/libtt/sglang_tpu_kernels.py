@@ -366,7 +366,7 @@ def _paged_decode(
     sink = None
     if token_sink is not None:
         # [users, 1, heads, 32] with each sink in column 0, as TTNN's per-head sink tile.
-        sink = (token_sink.astype(jnp.float32) / sm_scale).astype(jnp.bfloat16)
+        sink = token_sink.astype(jnp.bfloat16) * jnp.bfloat16(1 / sm_scale)
         sink = jnp.pad(sink[:, None, :, None], ((0, 0), (0, 0), (0, 0), (0, 31)))
     outputs = []
     for start in range(0, tokens, MAX_DECODE_USERS):
