@@ -626,12 +626,13 @@ def patch_mamba_state_rows(module):
 
 
 def patch_inkling_sconv(module):
-    """Inkling's short convolutions: a decode step with static weights runs on
-    TTNN's causal conv update, without its SiLU, which reads and updates each
-    request's window in the pool in place (`[slots, channels, 3]`, see
-    `sglang_tpu_gdn.patch_mamba_pool`); the residual and the scale follow in
-    FP32. The rest (extends, verifies and the dynamic weights of global layers'
-    K and V) convolve in torch, as in SGLang-TorchTPU."""
+    """Inkling's short convolutions: a decode step runs on TTNN's causal conv
+    update, without its SiLU, which reads and updates each request's window in
+    the pool in place (`[slots, channels, 3]`, see
+    `sglang_tpu_gdn.patch_mamba_pool`). With the model's decode weight the
+    residual and the scale are folded in; global layers' K and V add each row's
+    dynamic taps (per head) in the kernel, which scales the result. The rest
+    (extends and verifies) convolve in torch, as in SGLang-TorchTPU."""
     import functools
 
     import torch
@@ -673,16 +674,90 @@ def patch_inkling_sconv(module):
 
         return op
 
+    @functools.cache
+    def dynamic_conv_update_op(head_dim, kernel_size):
+        """conv_update_op's BF16 form with each row's dynamic taps ([rows, heads * kernel_size], lag order) added to
+        the weight's and the result scaled by (2 * kernel_size + 1)^-0.5, the model's scale with dynamic weights."""
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from torch_tpu._internal import pallas
+
+        from jax_plugins.libtt import sglang_tpu_gdn
+
+        output_scale = (2 * kernel_size + 1) ** -0.5
+
+        def conv_update(
+            state: jax.Array, x: jax.Array, weight: jax.Array, slots: jax.Array, initial: jax.Array, dyn: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            outputs = []
+            for start in range(0, x.shape[0], sglang_tpu_gdn.MAX_ROWS):
+                rows = slice(start, start + sglang_tpu_gdn.MAX_ROWS)
+                state, out = jax.ffi.ffi_call(
+                    "tt.causal_conv1d_update",
+                    (
+                        jax.ShapeDtypeStruct(state.shape, state.dtype),
+                        jax.ShapeDtypeStruct(x[rows].shape, jnp.bfloat16),
+                    ),
+                    input_output_aliases={0: 0},
+                    vmap_method="sequential",
+                )(
+                    state,
+                    x[rows],
+                    weight,
+                    slots[rows],
+                    initial[rows],
+                    dyn[rows],
+                    apply_silu=False,
+                    has_dynamic_weight=True,
+                    head_dim=np.int64(head_dim),
+                    output_scale=np.float32(output_scale),
+                )
+                outputs.append(out)
+            return state, jnp.concatenate(outputs)
+
+        op = pallas.jax_op(
+            f"libtt::inkling_dynamic_conv_update_{head_dim}_{kernel_size}", conv_update, donate_argnums=(0,)
+        )
+
+        @op.register_fake
+        def fake(state, x, weight, slots, initial, dyn):
+            return torch.empty_like(state), x.new_empty(x.shape, dtype=torch.bfloat16)
+
+        return op
+
     def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual, decode_weight=None):
-        if dyn is not None or state.dim() != 3 or self._track_end is not None:
+        # Dynamic taps need the model's decode weight (static taps in tap order with the residual), at most 8 heads
+        # of whole tiles.
+        dynamic_ok = (
+            dyn is not None
+            and decode_weight is not None
+            and use_residual
+            and dyn.shape[1] * dyn.shape[2] <= 32
+            and dyn.shape[2] == 4
+            and (x.shape[1] // dyn.shape[1]) % 32 == 0
+        )
+        if (dyn is not None and not dynamic_ok) or state.dim() != 3 or self._track_end is not None:
             return torch_decode(
                 self, x, state=state, weight=weight, dyn=dyn, use_residual=use_residual, decode_weight=decode_weight
             )
         num_seqs, dim = x.shape
-        kernel_size = weight.shape[-1]
         # Padding rows (index -1) go to slot 0, which the kernel never writes.
         slots = torch.where(self._state_indices[:num_seqs] >= 0, self._state_indices[:num_seqs], 0)
         initial = (self._seq_lens[:num_seqs] > 1).to(torch.bfloat16)
+        if dyn is not None:
+            heads, kernel_size = dyn.shape[1], dyn.shape[2]
+            pool, conv = dynamic_conv_update_op(dim // heads, kernel_size)(
+                state,
+                x.to(torch.bfloat16),
+                decode_weight.to(torch.bfloat16),
+                slots.to(torch.int32),
+                initial,
+                dyn.reshape(num_seqs, heads * kernel_size).to(torch.bfloat16),
+            )
+            state.copy_(pool)
+            return conv.to(x.dtype)
+        kernel_size = weight.shape[-1]
         if decode_weight is not None and use_residual:
             # The model's weight with the residual tap and the scale folded in: the
             # kernel's output is the result.
@@ -700,6 +775,7 @@ def patch_inkling_sconv(module):
 
     backend._xla_sconv_decode = _xla_sconv_decode
     module.libtt_conv_update_op = conv_update_op  # for tests
+    module.libtt_dynamic_conv_update_op = dynamic_conv_update_op
 
 
 def patch_mamba_pool(module):
