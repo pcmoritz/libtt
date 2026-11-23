@@ -155,14 +155,21 @@ def _ragged_paged_attention(module):
             and causal
             and soft_cap is None
             and attention_sink is None
-            and rel_proj is None
-            and token_sink is None
+            and (rel_proj is None) == (rel_r is None)
             and q_scale is None
             and k_scale is None
             and v_scale is None
         ):
             out = _paged_decode(
-                queries, cache, user_pages, user_positions, sm_scale, sliding_window
+                queries,
+                cache,
+                user_pages,
+                user_positions,
+                sm_scale,
+                sliding_window,
+                rel_r=rel_r,
+                rel_proj=rel_proj,
+                token_sink=token_sink,
             )
             return out.astype(out_dtype or queries.dtype), cache
         # Otherwise each sequence is a user of TTNN's chunked paged attention,
@@ -328,8 +335,23 @@ def _paged_prefill(queries, cache, table, q_starts, prefixes, seq, positions, li
     return out[:, :, cache_head_dim : cache_head_dim + head_dim]
 
 
-def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_window):
-    """Each token as a TTNN decode user, attending to its sequence up to its position."""
+def _paged_decode(
+    queries,
+    cache,
+    page_table,
+    positions,
+    sm_scale,
+    sliding_window,
+    rel_r=None,
+    rel_proj=None,
+    token_sink=None,
+):
+    """Each token as a TTNN decode user, attending to its sequence up to its position.
+
+    A learned relative-position bias (rel_r . rel_proj[:, distance]) goes to the kernel as its causal window bias,
+    and per-token sinks as its sink per user and head. The kernel scales scores inside its exponent, the bias and
+    sinks with them, where these are added to scaled scores: both are divided by sm_scale.
+    """
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -340,28 +362,61 @@ def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_windo
     cache_head_dim = cache.shape[-1] // 2
     q = jnp.pad(queries, ((0, 0), (0, 0), (0, cache_head_dim - head_dim))).astype(cache.dtype)
     window = {} if sliding_window is None else {"sliding_window_size": np.int32(sliding_window)}
+    bias = None if rel_proj is None else _decode_window_bias(rel_r, rel_proj, positions, sm_scale)
+    sink = None
+    if token_sink is not None:
+        # [users, 1, heads, 32] with each sink in column 0, as TTNN's per-head sink tile.
+        sink = (token_sink.astype(jnp.float32) / sm_scale).astype(jnp.bfloat16)
+        sink = jnp.pad(sink[:, None, :, None], ((0, 0), (0, 0), (0, 0), (0, 31)))
     outputs = []
     for start in range(0, tokens, MAX_DECODE_USERS):
         users = q[None, start : start + MAX_DECODE_USERS]
+        operands = [users, cache, cache, page_table[start : start + MAX_DECODE_USERS]]
+        if bias is not None:
+            operands.append(bias[start : start + MAX_DECODE_USERS])
+        operands.append(positions[start : start + MAX_DECODE_USERS])
+        if sink is not None:
+            operands.append(sink[start : start + MAX_DECODE_USERS])
         outputs.append(
             jax.ffi.ffi_call(
                 "tt.paged_scaled_dot_product_attention_decode",
                 jax.ShapeDtypeStruct(users.shape, users.dtype),
             )(
-                users,
-                cache,
-                cache,
-                page_table[start : start + MAX_DECODE_USERS],
-                positions[start : start + MAX_DECODE_USERS],
+                *operands,
                 is_causal=True,
-                has_attention_mask=False,
+                has_attention_mask=bias is not None,
                 has_cur_pos_tensor=True,
-                has_attention_sink=False,
+                has_attention_sink=sink is not None,
                 scale=np.float32(sm_scale),
                 **window,
             )
         )
     return jnp.concatenate(outputs, axis=1)[0, :, :, :head_dim]
+
+
+def _decode_window_bias(rel_r, rel_proj, positions, sm_scale):
+    """[tokens, 1, q_heads, width] BF16 window bias of TTNN's causal decode.
+
+    The kernel's window is width / 32 key tiles ending at the tile of each user's position p: column j is the key at
+    first + j, first = 32 * max(0, p // 32 + 1 - width / 32), whose bias is rel_r . rel_proj[:, p - first - j] for
+    distances in [0, extent). width covers the extent behind any position in a tile. Each (token, column) gathers its
+    column of rel_proj as a row of rel_proj.T, which has a row of zeros appended for the other columns, and a matmul
+    per token takes the products. The kernel scales the bias with the scores, so it is divided by sm_scale.
+    """
+    import jax.numpy as jnp
+
+    extent = rel_proj.shape[1]
+    window_tiles = -(-extent // 32) + 1
+    width = 32 * window_tiles
+    first = 32 * jnp.maximum(positions // 32 + 1 - window_tiles, 0)
+    distance = (positions - first)[:, None] - jnp.arange(width, dtype=jnp.int32)[None, :]
+    rows = jnp.where((distance >= 0) & (distance < extent), distance, extent)
+    table = jnp.pad(rel_proj.astype(jnp.float32).T / sm_scale, ((0, 1), (0, 0)))
+    columns = table.at[rows].get(mode="promise_in_bounds")
+    bias = jnp.einsum(
+        "thf,twf->thw", rel_r.astype(jnp.float32), columns, preferred_element_type=jnp.float32
+    )
+    return bias.astype(jnp.bfloat16)[:, None]
 
 
 def patch_rpa_v3(module):

@@ -1,0 +1,280 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
+@@ -81,6 +81,8 @@ void kernel_main() {
+     // [B*Tg] cur_pos vector (group base = cur_batch*Tg). 0 = off.
+     constexpr uint32_t spec_multi_pos_T = get_compile_time_arg_val(27);
+     constexpr bool spec_multi_pos = spec_multi_pos_T > 0;
++    // Causal mode's window bias: one block of bias tiles per chunk, from the reader.
++    constexpr bool use_window_bias = get_compile_time_arg_val(28) == 1;
+ 
+     // get_workload_for_core assigns at most one chunk per participating core when
+     // the fixed non-causal chunk count does not exceed num_cores_per_head. Its
+@@ -99,6 +101,7 @@ void kernel_main() {
+     constexpr uint32_t cb_sliding_window_mask_in = tt::CBIndex::c_13;  // Separate buffer for sliding window mask
+     constexpr uint32_t cb_block_pad_mask = tt::CBIndex::c_14;          // Block padding mask (block_size < TILE_HEIGHT)
+     constexpr uint32_t cb_attention_sink = tt::CBIndex::c_4;
++    constexpr uint32_t cb_bias_in = tt::CBIndex::c_32;
+     constexpr uint32_t cb_identity_scale_in = tt::CBIndex::c_5;
+     constexpr uint32_t cb_m_in = tt::CBIndex::c_6;
+     constexpr uint32_t cb_l_in = tt::CBIndex::c_7;
+@@ -470,6 +473,10 @@ void kernel_main() {
+                         add_block_inplace<false>(cb_qk_im, cb_sliding_window_mask_in, qk_chunk_tiles_dynamic);
+                     }
+                 }
++                if constexpr (use_window_bias) {
++                    reconfig_data_format(cb_qk_im, cb_bias_in);
++                    add_block_inplace<true>(cb_qk_im, cb_bias_in, qk_chunk_tiles_dynamic);
++                }
+ 
+                 /**
+                  * OPTIMIZATION
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
+@@ -211,6 +211,55 @@ uint32_t read_mask_chunk(
+     return mask_start_tile_id;
+ }
+ 
++/**
++ * One chunk of causal mode's window bias: for each of the PNHt head tiles, Sk_chunk_t tiles for key tiles
++ * k_tile_start.. of a [Bmask, PNHt, window_t] tile grid whose tile t is key tile first_tile + t. Key tiles outside
++ * the window take zeros.
++ */
++template <uint32_t cb_bias_in, uint32_t window_t, uint32_t barrier_threshold, uint32_t PNHt, typename BiasReaderType>
++void read_window_bias_chunk(
++    uint32_t batch_offset,
++    uint32_t first_tile,
++    uint32_t k_tile_start,
++    uint32_t Sk_chunk_t,
++    const BiasReaderType& bias_reader) {
++    Noc noc;
++    constexpr uint32_t tile_bytes = get_tile_size(cb_bias_in);
++    CircularBuffer cb_bias(cb_bias_in);
++    const uint32_t chunk_tiles = PNHt * Sk_chunk_t;
++    cb_bias.reserve_back(chunk_tiles);
++    uint32_t write_ptr = cb_bias.get_write_ptr();
++    uint32_t barrier_count = 0;
++    bool zeroed = false;
++    for (uint32_t row = 0; row < PNHt; ++row) {
++        for (uint32_t col = 0; col < Sk_chunk_t; ++col) {
++            const uint32_t k_tile = k_tile_start + col;
++            if (k_tile >= first_tile && k_tile - first_tile < window_t) {
++                // An explicit size: the CB may hold half tiles (16x32) of the bias's full DRAM tiles.
++                noc.async_read(
++                    bias_reader,
++                    CoreLocalMem<uint32_t>(write_ptr),
++                    tile_bytes,
++                    {.page_id = batch_offset + row * window_t + k_tile - first_tile},
++                    {});
++                if (++barrier_count == barrier_threshold) {
++                    noc.async_read_barrier();
++                    barrier_count = 0;
++                }
++            } else {
++                noc.async_write_zeros(cb_bias, tile_bytes, {.offset_bytes = write_ptr - cb_bias.get_write_ptr()});
++                zeroed = true;
++            }
++            write_ptr += tile_bytes;
++        }
++    }
++    noc.async_read_barrier();
++    if (zeroed) {
++        noc.write_zeros_l1_barrier();
++    }
++    cb_bias.push_back(chunk_tiles);
++}
++
+ template <uint32_t cb_mask_in, uint32_t PNHt>
+ void generate_mask(uint32_t /*k_num_chunks*/, uint32_t Sk_chunk_t, uint32_t cur_pos) {
+     Noc noc;
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
+@@ -70,8 +70,12 @@ void kernel_main() {
+     constexpr uint32_t k_row_t = get_compile_time_arg_val(36);
+     constexpr uint32_t v_row_t = get_compile_time_arg_val(37);
+     constexpr uint32_t v_col_t = get_compile_time_arg_val(38);
++    // Causal mode's window bias (the attn_mask): its width in key tiles, 0 without one.
++    constexpr uint32_t bias_window_t = get_compile_time_arg_val(39);
++    // An attention sink per user and head ([B, 1, PNH, 32]) rather than per head.
++    constexpr bool sink_per_user = get_compile_time_arg_val(40) == 1;
+ 
+-    constexpr auto q_args = TensorAccessorArgs<39>();
++    constexpr auto q_args = TensorAccessorArgs<41>();
+     constexpr auto k_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
+     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
+     constexpr auto mask_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
+@@ -84,6 +88,7 @@ void kernel_main() {
+     constexpr uint32_t cb_v_in = tt::CBIndex::c_2;
+     constexpr uint32_t cb_mask_in = tt::CBIndex::c_3;
+     constexpr uint32_t cb_attention_sink = tt::CBIndex::c_4;
++    constexpr uint32_t cb_bias_in = tt::CBIndex::c_32;
+     // #44366: cur_pos is consumed by both the writer (c_8) and compute (c_15).
+     // Using one shared CB races — whichever consumer pops first drains the
+     // count and the other hangs waiting for tiles. Each consumer gets its own CB.
+@@ -255,6 +260,7 @@ void kernel_main() {
+         CircularBuffer cb_sink(cb_attention_sink);
+         cb_sink.reserve_back(PNHt);
+         uint32_t attention_sink_write_ptr = cb_sink.get_write_ptr();
++        const uint32_t sink_first_tile = sink_per_user ? (cur_batch / q_heads_parallel_factor) * PNHt : 0;
+ 
+         for (uint32_t tile = 0; tile < PNHt; ++tile) {
+             // Use noc.async_read with explicit size instead of noc.async_read_page because
+@@ -264,7 +270,7 @@ void kernel_main() {
+                 attention_sink_reader,
+                 CoreLocalMem<uint32_t>(attention_sink_write_ptr),
+                 attention_sink_tile_bytes,
+-                {.page_id = tile},
++                {.page_id = sink_first_tile + tile},
+                 {});
+             attention_sink_write_ptr += attention_sink_tile_bytes;
+         }
+@@ -303,6 +309,13 @@ void kernel_main() {
+          cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
+          ++cur_head) {
+         const uint32_t mask_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bmask) * PNHt * St;
++        // The window bias's tiles for this user, and the key tile its first column is: the window ends at
++        // cur_pos's tile.
++        const uint32_t bias_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bmask) * PNHt * bias_window_t;
++        const uint32_t bias_first_tile =
++            cur_pos / tt::constants::TILE_HEIGHT + 1 > bias_window_t
++                ? cur_pos / tt::constants::TILE_HEIGHT + 1 - bias_window_t
++                : 0;
+         const uint32_t mask_chunk_offset = k_chunk_start * Sk_chunk_t_dynamic;
+         uint32_t mask_start_tile_id = mask_batch_offset + mask_chunk_offset;
+         // Setup multicast parameters for K streaming (vertical multicast)
+@@ -345,6 +358,10 @@ void kernel_main() {
+                     mask_start_tile_id = read_mask_chunk<cb_mask_in, mask_tile_bytes, barrier_threshold, PNHt>(
+                         PSt, Sk_chunk_t_dynamic, mask_chunk_tiles, mask_start_tile_id, mask_reader);
+                 }
++                if constexpr (bias_window_t > 0) {
++                    read_window_bias_chunk<cb_bias_in, bias_window_t, barrier_threshold, PNHt>(
++                        bias_batch_offset, bias_first_tile, k_chunk_start_row_num, Sk_chunk_t_dynamic, mask_reader);
++                }
+                 // Read V chunk - either from DRAM or from K's L1 buffer (transpose) when reuse_k is true
+                 read_v<
+                     cb_v_in,
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
+@@ -219,11 +219,22 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
+                 "Unsupported data type for mask tensor: {}.",
+                 mask_tensor.dtype());
+         }
+-    } else {
+-        // Causal: causality is applied from cur_pos on device, so an explicit mask is rejected
+-        TT_FATAL(
+-            not tensor_args.attn_mask.has_value(),
+-            "attn_mask must not be provided when is_causal=True. Pass is_causal=False to use an explicit mask.");
++    } else if (tensor_args.attn_mask.has_value()) {
++        // Causal: causality is applied from cur_pos on device. An explicit mask is an additive bias over a window of
++        // key tiles: [B, 1, padded heads, W] whose column t * 32 + c is the key at (w0 + t) * 32 + c, where w0 =
++        // max(0, cur_pos / 32 + 1 - W / 32) puts the window's last tile at cur_pos's tile. Keys before the window take
++        // no bias, so W covers a learned relative-position bias of extent up to W - 31 behind each query.
++        const auto& bias = tensor_args.attn_mask.value();
++        const auto bias_shape = bias.padded_shape();
++        TT_FATAL(operation_attributes.paged_attention, "A causal attn_mask (window bias) needs paged attention");
++        TT_FATAL(
++            bias_shape.rank() == 4 && bias_shape[1] == 1 && bias_shape[2] == q_shape[2] &&
++                bias_shape[3] % tt::constants::TILE_WIDTH == 0,
++            "A causal attn_mask must be [B, 1, padded heads {}, multiple of 32], got {}",
++            q_shape[2],
++            bias_shape);
++        TT_FATAL(bias.dtype() == DataType::BFLOAT16, "A causal attn_mask must be BF16, got {}", bias.dtype());
++        TT_FATAL(bias.layout() == Layout::TILE, "A causal attn_mask must be in TILE layout");
+     }
+ 
+     const auto& paged_geo = operation_attributes.paged_cache_geometry;
+@@ -568,15 +579,19 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
+         const auto& attention_sink = tensor_args.attention_sink.value();
+ 
+         const auto& sink_shape = attention_sink.padded_shape();
+-        TT_FATAL(sink_shape.size() == 2, "Attention sink must have 2 dimensions");
++        // [heads, 32] for every user, or [B, 1, heads, 32] (as the mask): one sink per user and head.
++        TT_FATAL(
++            sink_shape.size() == 2 || (sink_shape.size() == 4 && sink_shape[0] == q_shape[1] && sink_shape[1] == 1),
++            "Attention sink must be [heads, 32] or [B, 1, heads, 32], got {}",
++            sink_shape);
+         TT_FATAL(
+-            sink_shape[0] == q_shape[2],
++            sink_shape[-2] == q_shape[2],
+             "Attention sink must have the same padded num heads as Q but got {}",
+-            sink_shape[0]);
++            sink_shape[-2]);
+         TT_FATAL(
+-            sink_shape[1] == tt::constants::TILE_WIDTH,
++            sink_shape[-1] == tt::constants::TILE_WIDTH,
+             "Attention sink must be a single tile wide, but got {}",
+-            sink_shape[1]);
++            sink_shape[-1]);
+         TT_FATAL(
+             attention_sink.dtype() == DataType::BFLOAT16,
+             "Attention sink must by a BF16 tensor, but got {}",
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp
+@@ -80,11 +80,17 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+     const bool is_output_sharded = output_tensor.is_sharded();
+     const bool tilize_q = input_tensor_q.layout() == Layout::ROW_MAJOR;
+     const bool use_cur_pos_tensor = cur_pos_tensor.has_value();
+-    const bool use_attention_mask = attn_mask.has_value();
++    // A non-causal attn_mask masks the whole cache. A causal one is an additive bias over a window of
++    // bias_window_t key tiles ending at cur_pos's tile (see validate), read into its own CB for every chunk.
++    const bool use_attention_mask = attn_mask.has_value() && !is_causal;
++    const uint32_t bias_window_t =
++        attn_mask.has_value() && is_causal ? attn_mask->padded_shape()[3] / tt::constants::TILE_WIDTH : 0;
+     const bool use_attention_sink = attention_sink.has_value();
+     // ========== Tensor Shapes ==========
+     auto q_shape = input_tensor_q.padded_shape();
+     q_shape[2] = tt::round_up(q_shape[2], tt::constants::TILE_HEIGHT);
++    // A sink per user and head: [B, 1, padded heads, 32] rather than [padded heads, 32].
++    const bool sink_per_user = use_attention_sink && attention_sink->padded_shape().rank() == 4;
+     const auto& q_shape_unpadded = input_tensor_q.logical_shape();
+     const auto& k_shape = input_tensor_k.padded_shape();
+     const auto& v_shape = input_tensor_v.padded_shape();
+@@ -137,6 +143,7 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+         S = page_table_tensor.value().padded_shape()[-1] * block_size;
+         has_block_padding = original_block_size < TILE_HEIGHT;
+     }
++    TT_FATAL(bias_window_t == 0 || !has_block_padding, "A causal attn_mask needs pages of at least one tile");
+ 
+     // ========== Q Sharding & MLA Parallelization ==========
+     // Q is "locally available" when sharded for MLA with data replicated across all worker cores.
+@@ -647,6 +654,10 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+     add_cb(CBIndex::c_1, k_tiles * k_tile_size, k_df, k_tile_size);                        // K input
+     add_cb(CBIndex::c_2, v_tiles * v_tile_size, v_df, v_tile_size);                        // V input
+     add_cb(CBIndex::c_3, qk_tiles * mask_tile_size, mask_df, mask_tile_size, &mask_tile);  // attn_mask
++    if (bias_window_t > 0) {
++        // The window bias, BF16 like the causal mask: c_0..c_31 are all taken, and Blackhole has 64 CBs.
++        add_cb(CBIndex::c_32, qk_tiles * mask_tile_size, mask_df, mask_tile_size, &mask_tile);
++    }
+     if (use_attention_sink) {
+         add_cb(CBIndex::c_4, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+     }
+@@ -829,6 +840,8 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+         k_row_t,
+         v_row_t,
+         v_col_t,
++        bias_window_t,
++        static_cast<uint32_t>(sink_per_user),
+     };
+     tt_metal::TensorAccessorArgs(input_tensor_q.buffer()).append_to(reader_compile_time_args_common);
+     tt_metal::TensorAccessorArgs(input_tensor_k.buffer()).append_to(reader_compile_time_args_common);
+@@ -900,6 +913,7 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+         sliding_window_size,
+         original_block_size,
+         spec_multi_pos_tiles,
++        static_cast<uint32_t>(bias_window_t > 0),
+     };
+ 
+     // ========== Compute Defines ==========
+@@ -968,7 +982,7 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+     // emplace_runtime_args() emits as 0u with no binding — keeping the arg slot stable without
+     // invalidating the fast path.  cur_pos_buffer / page_table_buffer are already the right
+     // nullptr-when-absent Buffer* pointers computed above.
+-    Buffer* attn_mask_buffer = use_attention_mask ? attn_mask.value().buffer() : nullptr;
++    Buffer* attn_mask_buffer = attn_mask.has_value() ? attn_mask.value().buffer() : nullptr;
+     Buffer* attention_sink_buffer = use_attention_sink ? attention_sink.value().buffer() : nullptr;
+ 
+     // ========== Runtime Arguments ==========
