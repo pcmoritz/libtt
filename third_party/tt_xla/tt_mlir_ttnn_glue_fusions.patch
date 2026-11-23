@@ -45,7 +45,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -211,6 +211,24 @@ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
+@@ -208,6 +208,24 @@ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
    return false;
  }
  
@@ -70,7 +70,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  class TTNNBinaryOpInputsActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseBinaryActivations> {
  public:
-@@ -260,6 +278,9 @@ private:
+@@ -257,6 +275,9 @@ private:
      if (!unaryOp) {
        return {};
      }
@@ -80,7 +80,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
      if (restrictToMatmulProducer &&
          !unaryOp.getInput().getDefiningOp<MatmulOp>() &&
          !unaryOp.getInput().getDefiningOp<LinearOp>()) {
-@@ -293,6 +314,45 @@ private:
+@@ -290,6 +311,87 @@ private:
  };
  } // namespace
  
@@ -123,10 +123,52 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +};
 +} // namespace
 +
++namespace {
++// An FP32 RMS norm whose only use casts it to BF16, directly or through a
++// reshape, produces BF16 itself: the norm normalizes in FP32 DST and rounds
++// once as it packs the result, which saves the typecast program (as for binary
++// ops in TTNNBinaryOpNarrowingOutput).
++class TTNNRMSNormNarrowingOutput : public mlir::OpRewritePattern<TypecastOp> {
++public:
++  using mlir::OpRewritePattern<TypecastOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(TypecastOp cast, mlir::PatternRewriter &rewriter) const final {
++    if (!elementTypeOf(cast.getInput()).isF32() ||
++        !elementTypeOf(cast.getResult()).isBF16() ||
++        !cast.getInput().hasOneUse()) {
++      return mlir::failure();
++    }
++    auto reshape = cast.getInput().getDefiningOp<ReshapeOp>();
++    Value normResult = reshape ? reshape.getInput() : cast.getInput();
++    auto norm = normResult.getDefiningOp<RMSNormOp>();
++    if (!norm || !normResult.hasOneUse()) {
++      return mlir::failure();
++    }
++    // The cast's input takes the cast's type; a norm behind a reshape, its own
++    // shape in BF16.
++    rewriter.modifyOpInPlace(norm, [&]() {
++      norm.getResult().setType(
++          reshape ? ttnn::utils::RankedTensorTypeFactory::create(
++                        mlir::cast<RankedTensorType>(norm.getResult().getType()),
++                        ttcore::DataType::BFloat16)
++                  : cast.getResult().getType());
++    });
++    if (reshape) {
++      rewriter.modifyOpInPlace(reshape, [&]() {
++        reshape.getResult().setType(cast.getResult().getType());
++      });
++    }
++    rewriter.replaceOp(cast, cast.getInput());
++    return mlir::success();
++  }
++};
++} // namespace
++
  namespace {
  class TTNNBinaryOpOutputActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseUnary> {
-@@ -323,7 +383,8 @@ public:
+@@ -320,7 +422,8 @@ public:
  
  private:
    bool isFusable(ElementwiseUnary unaryOp) const {
@@ -136,7 +178,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
    }
  
    ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
-@@ -332,11 +393,100 @@ private:
+@@ -329,11 +432,100 @@ private:
        return {};
      }
  
@@ -238,8 +280,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -710,6 +860,7 @@ public:
+@@ -705,8 +897,10 @@ public:
+       firstPatterns.add<TTNNBinaryOpInputsActivation>(
+           &getContext(), /*restrictToMatmulProducer=*/true);
      }
++    patterns.add<TTNNRMSNormNarrowingOutput>(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
 +    patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
