@@ -1,0 +1,56 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
+@@ -73,8 +73,7 @@ void kernel_main() {
+     // slower: a credit lockstep at every expert boundary and forward-only reads serialized both rings on one dm0.)
+     constexpr uint32_t prefill_rings = get_named_compile_time_arg_val("prefill_rings");
+     constexpr uint32_t num_rings = prefill_rings < 2 ? 1u : prefill_rings;
+-    static_assert(
+-        num_rings == 1 || replay_slice, "several rings need the replay ring: one slice read per owned expert");
++    // Several streaming rings (slices too large to replay) read an owned expert's slice for every owned chunk.
+ 
+     constexpr auto w0_w1_args = TensorAccessorArgs<0>();
+     constexpr auto w2_args = TensorAccessorArgs<w0_w1_args.next_compile_time_args_offset()>();
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+@@ -969,7 +969,11 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+     // per expert and re-presents it for every further chunk; the capacity must equal the slice exactly (the pointers
+     // wrap to the base), and the slice differs between positions with an even and an odd column count, so the CB is
+     // created per group of positions with the same slice.
+-    const bool replay_slice = args.prefill_rings >= 1;  // several rings forward blocks by their place in the slice
++    // Rings that replay a whole expert slice per ring core need it to fit the replay CB budget (half the L1, below).
++    // Larger slices (Inkling 2's FP8 experts, about 1 MB per ring core) stream through the same rings instead: each
++    // ring core reads the slices of the experts it owns chunks of, for every owned chunk, through the streaming
++    // weight CB. At decode sizes, one chunk per expert, the rings still read and multiply different experts at once.
++    bool replay_slice = args.prefill_rings >= 1;  // several rings forward blocks by their place in the slice
+     // The replay CB holds exactly one slice per position; a TP-split shared expert has a shorter one (dm0 sizes the
+     // slice from w0_w1_prod_cols, the CB below from the stored columns), so the two must not meet.
+     TT_FATAL(
+@@ -991,6 +995,26 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+     TT_FATAL(!(fp8_weights && args.has_bias), "moe_compute: FP8 experts with a bias are not supported");
+     const uint32_t w0_w1_dram_tiles_h =
+         moe_ring::dram_tiles_h(hidden_tiles, args.has_bias, fp8_weights, weight_tiles_per_txn);
++    if (replay_slice) {
++        const uint32_t blocks_per_col =
++            tt::div_up(w0_w1_dram_tiles_h, moe_ring::block_tiles_h(weight_tiles_per_txn));
++        const uint32_t blocks_per_half_col =
++            tt::div_up(w0_w1_dram_tiles_h, moe_ring::half_block_tiles_h(weight_tiles_per_txn));
++        const uint32_t w2_blocks = moe_ring::w2_core_blocks_per_expert(
++            hidden_tiles,
++            moe_ring::dram_tiles_h(intermediate_tiles, args.has_bias, fp8_weights, weight_tiles_per_txn),
++            matmul_num_cores,
++            weight_tiles_per_txn);
++        for (uint32_t ring_pos = 0; ring_pos < matmul_num_cores && replay_slice; ++ring_pos) {
++            const uint32_t cols = moe_ring::w0_w1_stored_cols(intermediate_tiles, ring_pos, matmul_num_cores);
++            const uint32_t slice_blocks =
++                moe_ring::w0_w1_blocks_for_cols(cols, blocks_per_col, blocks_per_half_col) + w2_blocks;
++            replay_slice = slice_blocks * weight_tiles_per_block * weight_tile_size <= mesh_device->l1_size_per_core() / 2;
++        }
++        if (!replay_slice) {
++            log_debug(tt::LogOp, "moe_compute: {} rings stream expert slices that do not fit the replay CB", num_rings);
++        }
++    }
+     if (replay_slice) {
+         const uint32_t k_dram_tiles = w0_w1_dram_tiles_h;
+         const uint32_t blocks_per_col = tt::div_up(k_dram_tiles, moe_ring::block_tiles_h(weight_tiles_per_txn));

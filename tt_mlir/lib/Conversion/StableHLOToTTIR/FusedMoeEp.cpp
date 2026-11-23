@@ -54,16 +54,14 @@ namespace mlir::tt {
 namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
-// Matmul rings that run a device's experts side by side, replaying a whole
-// expert slice per ring core for every chunk, which must fit half a core's L1.
-// Experts stream through one ring when it doesn't: BF16 experts, at two bytes
-// per weight, and FP8 ones larger than about 640 KiB per ring core (8 cores):
-// Qwen3-30B-A3B's (2048 x 768, 0.66 MB stored) fit, Inkling-2-Mini's (2304 x
-// 1152, 1.1 MB on 12 cores) don't.
+// Matmul rings that run a device's FP8 experts side by side, replaying a whole
+// expert slice per ring core for every chunk where it fits half a core's L1
+// (Qwen3-30B-A3B's 2048 x 768, 0.66 MB stored), else streaming each owned
+// chunk's slice (Inkling-2-Mini's 2304 x 1152, about 1 MB per ring core): at
+// decode, the rings still read and multiply different experts at once. BF16
+// experts stream through one ring.
 constexpr uint32_t kRings = 3;
 constexpr uint32_t kStreamingRings = 0;
-constexpr int64_t kRingCores = 8;
-constexpr int64_t kReplaySliceBytes = 640 * 1024;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -195,9 +193,6 @@ public:
                                 std::multiplies<>());
     }
     const int64_t experts = localExperts * devices;
-    // An FP8 expert's three projections are 3 * hidden * intermediate bytes.
-    const bool replay = fp8Weights && 3 * hidden * intermediate / kRingCores <=
-                                          kReplaySliceBytes;
 
     Type bf16 = rewriter.getBF16Type();
     Type placementType = rewriter.getF32Type();
@@ -304,7 +299,7 @@ public:
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),
-          rewriter.getUI32IntegerAttr(replay ? kRings : kStreamingRings),
+          rewriter.getUI32IntegerAttr(fp8Weights ? kRings : kStreamingRings),
           fp8Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::Float8E4M3FN)
           : bf16Weights
