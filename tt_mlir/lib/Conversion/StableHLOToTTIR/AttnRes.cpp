@@ -4,7 +4,8 @@
 // tt.attn_res: Inkling 2's block attention residuals in one program
 // (ttir.attn_res, ttnn::experimental::attn_res), tt.l2_clip, its per-head
 // L2 clips (ttir.l2_clip), tt.loop_mix, its loop-message controller
-// (ttir.loop_mix), and tt.moe_route, its router's selection (ttir.moe_route).
+// (ttir.loop_mix), tt.moe_route, its router's selection (ttir.moe_route), and
+// tt.window_bias, its decode attention's window bias (ttir.window_bias).
 //
 //   out = tt.attn_res(s_0, .., s_{n-1}[, addend], queries[, weight])
 //
@@ -230,13 +231,57 @@ public:
   }
 };
 
+// tt.window_bias(rel_r, table, positions[, sink]) with backend_config heads,
+// sink_scale and has_sink: ttir.window_bias, results bias (and sink tiles).
+class WindowBiasConversionPattern
+    : public OpConversionPattern<stablehlo::CustomCallOp> {
+  using OpConversionPattern<stablehlo::CustomCallOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(stablehlo::CustomCallOp op,
+                  stablehlo::CustomCallOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getCallTargetName() != "tt.window_bias") {
+      return failure();
+    }
+    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
+    if (!config) {
+      config = dyn_cast_or_null<DictionaryAttr>(
+          op->getDiscardableAttr("mhlo.backend_config"));
+    }
+    auto heads = config ? config.getAs<IntegerAttr>("heads") : nullptr;
+    auto sinkScale = config ? config.getAs<FloatAttr>("sink_scale") : nullptr;
+    auto hasSink = config ? config.getAs<BoolAttr>("has_sink") : nullptr;
+    ValueRange operands = adaptor.getOperands();
+    if (!heads || !sinkScale || !hasSink ||
+        operands.size() != 3 + size_t{hasSink.getValue()} ||
+        op->getNumResults() != 1 + size_t{hasSink.getValue()}) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.window_bias takes rel_r, the table, the positions (and the "
+              "sink), heads, sink_scale and has_sink");
+    }
+    SmallVector<Type> types;
+    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), types))) {
+      return failure();
+    }
+    rewriter.replaceOpWithNewOp<ttir::WindowBiasOp>(
+        op, types, operands[0], operands[1], operands[2],
+        hasSink.getValue() ? operands[3] : Value(),
+        rewriter.getI64IntegerAttr(heads.getInt()),
+        rewriter.getF32FloatAttr(sinkScale.getValueAsDouble()));
+    return success();
+  }
+};
+
 } // namespace
 
 void populateAttnResToTTIRPatterns(MLIRContext *context,
                                    RewritePatternSet &patterns,
                                    TypeConverter &typeConverter) {
   patterns.add<AttnResConversionPattern, L2ClipConversionPattern,
-               LoopMixConversionPattern, MoeRouteConversionPattern>(
+               LoopMixConversionPattern, MoeRouteConversionPattern,
+               WindowBiasConversionPattern>(
       typeConverter, context);
 }
 

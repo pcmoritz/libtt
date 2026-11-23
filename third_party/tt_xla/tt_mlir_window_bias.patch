@@ -1,0 +1,186 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -2458,6 +2458,25 @@ def TTIR_RMSNormGatedOp : TTIR_NamedOp<"rms_norm_gated"> {
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
++def TTIR_WindowBiasOp : TTIR_NamedOp<"window_bias"> {
++  let summary = "The causal decode attention's relative-position window bias";
++  let description = [{
++    bias[t, 0, h, j] = rel_r[t, 16 h : 16 h + 16] . table[W - 1 - d] for the
++    distance d = p - first - j of column j of the window of W keys ending at
++    position p's key tile. rel_r [T, heads * 16] BF16, table [2W, 16] FP32,
++    positions [T] INT32; bias [T, 1, heads, W] BF16 and, with sink [T, heads],
++    the sink tiles [T, 1, heads, 32] (sink * sink_scale in column 0). libtt's
++    tt.window_bias custom call (sglang_tpu_kernels.py) forms it.
++  }];
++  let arguments = (ins AnyRankedTensor:$rel_r,
++                       AnyRankedTensor:$table,
++                       AnyRankedTensor:$positions,
++                       Optional<AnyRankedTensor>:$sink,
++                       I64Attr:$heads,
++                       F32Attr:$sink_scale);
++  let results = (outs Variadic<AnyRankedTensor>:$outputs);
++}
++
+ def TTIR_MoeRouteOp : TTIR_NamedOp<"moe_route"> {
+   let summary = "A mixture-of-experts router's top-k selection";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2929,6 +2929,20 @@ def TTNN_RMSNormGatedOp : TTNN_Op<"rms_norm_gated", [OpModelExempt]> {
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
++def TTNN_WindowBiasOp : TTNN_Op<"window_bias", [OpModelExempt]> {
++  let summary = "The causal decode attention's relative-position window bias";
++  let description = [{
++    ttnn::experimental::window_bias, see ttir.window_bias.
++  }];
++  let arguments = (ins AnyRankedTensor:$rel_r,
++                       AnyRankedTensor:$table,
++                       AnyRankedTensor:$positions,
++                       Optional<AnyRankedTensor>:$sink,
++                       I64Attr:$heads,
++                       F32Attr:$sink_scale);
++  let results = (outs Variadic<AnyRankedTensor>:$outputs);
++}
++
+ def TTNN_MoeRouteOp : TTNN_Op<"moe_route", [OpModelExempt]> {
+   let summary = "A mixture-of-experts router's top-k selection";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+--- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
++++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+@@ -61,6 +61,16 @@ table DitRMSNormUnaryFusedOp {
+   out: tt.target.ttnn.TensorRef;
+ }
+ 
++table WindowBiasOp {
++  rel_r: tt.target.ttnn.TensorRef;
++  table: tt.target.ttnn.TensorRef;
++  positions: tt.target.ttnn.TensorRef;
++  sink: tt.target.ttnn.TensorRef;
++  heads: uint32;
++  sink_scale: float;
++  outs: [tt.target.ttnn.TensorRef];
++}
++
+ table MoeRouteOp {
+   logits: tt.target.ttnn.TensorRef;
+   bias: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -159,6 +159,7 @@ union OpType {
+   AttnResOp,
+   L2ClipOp,
+   LoopMixOp,
++  WindowBiasOp,
+   MoeRouteOp,
+   ReshapeOp,
+   SamplingOp,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1311,6 +1311,27 @@ public:
+   }
+ };
+ 
++class WindowBiasOpConversionPattern
++    : public OpConversionPattern<ttir::WindowBiasOp> {
++public:
++  using OpConversionPattern<ttir::WindowBiasOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::WindowBiasOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> types;
++    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                      types))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttnn::WindowBiasOp>(
++        op, types, adaptor.getRelR(), adaptor.getTable(),
++        adaptor.getPositions(), adaptor.getSink(), op.getHeadsAttr(),
++        op.getSinkScaleAttr());
++    return success();
++  }
++};
++
+ class MoeRouteOpConversionPattern : public OpConversionPattern<ttir::MoeRouteOp> {
+ public:
+   using OpConversionPattern<ttir::MoeRouteOp>::OpConversionPattern;
+@@ -4442,6 +4463,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            AttnResOpConversionPattern,
+            L2ClipOpConversionPattern,
+            LoopMixOpConversionPattern,
++           WindowBiasOpConversionPattern,
+            MoeRouteOpConversionPattern,
+            DistributedRMSNormOpConversionPattern,
+            DistributedLayerNormOpConversionPattern,
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2108,6 +2108,26 @@ createOp(FlatbufferObjectCache &cache, RMSNormGatedOp op) {
+       static_cast<uint32_t>(op.getGateOffset()));
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::WindowBiasOp>
++createOp(FlatbufferObjectCache &cache, WindowBiasOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> sink =
++      op.getSink() ? tensor(op.getSink()) : 0;
++  std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> outs;
++  for (Value output : op.getOutputs()) {
++    outs.push_back(cache.getOrCreateNoSharding(output, tensorValueToFlatbuffer,
++                                               std::nullopt));
++  }
++  auto outsOffset = cache.fbb->CreateVector(outs);
++  return ::tt::target::ttnn::CreateWindowBiasOp(
++      *cache.fbb, tensor(op.getRelR()), tensor(op.getTable()),
++      tensor(op.getPositions()), sink, static_cast<uint32_t>(op.getHeads()),
++      op.getSinkScale().convertToFloat(), outsOffset);
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::MoeRouteOp>
+ createOp(FlatbufferObjectCache &cache, MoeRouteOp op) {
+   auto tensor = [&](Value value) {
+@@ -5880,6 +5900,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
+                            locInfo);
+   }
++  if (auto windowBiasOp = dyn_cast<WindowBiasOp>(op)) {
++    return createOperation(cache, createOp(cache, windowBiasOp), debugString,
++                           locInfo);
++  }
+   if (auto moeRouteOp = dyn_cast<MoeRouteOp>(op)) {
+     return createOperation(cache, createOp(cache, moeRouteOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -99,6 +99,7 @@
+ #include "operations/normalization/l2_clip.h"
+ #include "operations/normalization/loop_mix.h"
+ #include "operations/normalization/moe_route.h"
++#include "operations/normalization/window_bias.h"
+ #include "operations/normalization/rms_norm_gated.h"
+ #include "operations/normalization/rms_norm_residual.h"
+ #include "operations/normalization/rms_norm_pre_all_gather.h"
+@@ -543,6 +544,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::MoeRouteOp: {
+     return operations::moe_route::run(op->type_as_MoeRouteOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::WindowBiasOp: {
++    return operations::window_bias::run(op->type_as_WindowBiasOp(),
++                                        getContext());
++  }
+   case ::tt::target::ttnn::OpType::LoopMixOp: {
+     return operations::loop_mix::run(op->type_as_LoopMixOp(), getContext());
+   }

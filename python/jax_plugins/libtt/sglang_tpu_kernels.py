@@ -371,21 +371,31 @@ def _paged_decode(
     cache_head_dim = cache.shape[-1] // 2
     q = jnp.pad(queries, ((0, 0), (0, 0), (0, cache_head_dim - head_dim))).astype(cache.dtype)
     window = {} if sliding_window is None else {"sliding_window_size": np.int32(sliding_window)}
-    bias = None if rel_proj is None else _decode_window_bias(rel_r, rel_proj, positions, sm_scale)
+    # tt.window_bias forms each chunk's bias (and sink tiles) in one program from a table computed once.
+    fused_bias = rel_proj is not None and rel_proj.shape[0] == 16 and q_heads <= 32 and MAX_DECODE_USERS <= 32
+    table = _window_bias_table(rel_proj, sm_scale) if fused_bias else None
+    bias = None if rel_proj is None or fused_bias else _decode_window_bias(rel_r, rel_proj, positions, sm_scale)
     sink = None
-    if token_sink is not None:
+    if token_sink is not None and not fused_bias:
         # [users, 1, heads, 32] with each sink in column 0, as TTNN's per-head sink tile.
         sink = token_sink.astype(jnp.bfloat16) * jnp.bfloat16(1 / sm_scale)
         sink = jnp.pad(sink[:, None, :, None], ((0, 0), (0, 0), (0, 0), (0, 31)))
     outputs = []
     for start in range(0, tokens, MAX_DECODE_USERS):
-        users = q[None, start : start + MAX_DECODE_USERS]
-        operands = [users, cache, cache, page_table[start : start + MAX_DECODE_USERS]]
-        if bias is not None:
-            operands.append(bias[start : start + MAX_DECODE_USERS])
-        operands.append(positions[start : start + MAX_DECODE_USERS])
-        if sink is not None:
-            operands.append(sink[start : start + MAX_DECODE_USERS])
+        chunk = slice(start, start + MAX_DECODE_USERS)
+        users = q[None, chunk]
+        operands = [users, cache, cache, page_table[chunk]]
+        chunk_bias = None if bias is None else bias[chunk]
+        chunk_sink = None if sink is None else sink[chunk]
+        if fused_bias:
+            chunk_bias, chunk_sink = _window_bias_call(
+                rel_r[chunk], table, positions[chunk], None if token_sink is None else token_sink[chunk], sm_scale
+            )
+        if chunk_bias is not None:
+            operands.append(chunk_bias)
+        operands.append(positions[chunk])
+        if chunk_sink is not None:
+            operands.append(chunk_sink)
         outputs.append(
             jax.ffi.ffi_call(
                 "tt.paged_scaled_dot_product_attention_decode",
@@ -393,9 +403,9 @@ def _paged_decode(
             )(
                 *operands,
                 is_causal=True,
-                has_attention_mask=bias is not None,
+                has_attention_mask=chunk_bias is not None,
                 has_cur_pos_tensor=True,
-                has_attention_sink=sink is not None,
+                has_attention_sink=chunk_sink is not None,
                 scale=np.float32(sm_scale),
                 **window,
             )
@@ -428,6 +438,42 @@ def _decode_window_bias(rel_r, rel_proj, positions, sm_scale):
         "thf,twf->thw", rel_r.astype(jnp.float32), columns, preferred_element_type=jnp.float32
     )
     return bias.astype(jnp.bfloat16)[:, None]
+
+
+def _window_bias_table(rel_proj, sm_scale):
+    """[2W, rel_dim] FP32 for tt.window_bias: row W - 1 - d holds distance d's column of rel_proj / sm_scale, zero
+    where d is outside [0, extent). A key tile's 32 window columns are then 32 consecutive rows. W is
+    `_decode_window_bias`'s width; the table depends on the weight alone, so it is computed once."""
+    import jax.numpy as jnp
+
+    rel_proj = _mark_weight(rel_proj)
+    extent = rel_proj.shape[1]
+    width = 32 * (-(-extent // 32) + 1)
+    distance = width - 1 - jnp.arange(2 * width, dtype=jnp.int32)
+    valid = (distance >= 0) & (distance < extent)
+    rows = (rel_proj.astype(jnp.float32).T / sm_scale)[jnp.clip(distance, 0, extent - 1)]
+    return jnp.where(valid[:, None], rows, jnp.float32(0))
+
+
+def _window_bias_call(rel_r, table, positions, sink, sm_scale):
+    """tt.window_bias for up to 32 tokens: `_decode_window_bias`'s bias [tokens, 1, q_heads, W] from rel_r
+    [tokens, q_heads, 16] and `_window_bias_table`'s table and, with sink [tokens, q_heads], the kernel's sink tiles
+    [tokens, 1, q_heads, 32] (sink / sm_scale in column 0), in one program."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    tokens, heads, rel_dim = rel_r.shape
+    width = table.shape[0] // 2
+    results = [jax.ShapeDtypeStruct((tokens, 1, heads, width), jnp.bfloat16)]
+    operands = [rel_r.reshape(tokens, heads * rel_dim).astype(jnp.bfloat16), table, positions.astype(jnp.int32)]
+    if sink is not None:
+        operands.append(sink.astype(jnp.bfloat16))
+        results.append(jax.ShapeDtypeStruct((tokens, 1, heads, 32), jnp.bfloat16))
+    outs = jax.ffi.ffi_call("tt.window_bias", tuple(results))(
+        *operands, heads=np.int64(heads), sink_scale=np.float32(1 / sm_scale), has_sink=sink is not None
+    )
+    return outs[0], (outs[1] if sink is not None else None)
 
 
 def patch_rpa_v3(module):
@@ -1201,6 +1247,7 @@ def patch_inkling2_attn_res(module):
             return loop_mix_op()(dest, messages, down_t, gain_t, forget_t, float(eps))
         return loop_mix_normed_op(messages.shape[0])(
             dest, messages, down_t, gain_t, forget_t, norm_weight, float(eps), float(eps_norm)
+        )
 
     module.supports_attn_res_norm = supports_attn_res_norm
     module.attn_res_norm_jax = attn_res_norm_jax
