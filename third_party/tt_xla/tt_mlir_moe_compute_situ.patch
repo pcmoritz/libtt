@@ -1,0 +1,185 @@
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+@@ -262,12 +262,16 @@ def TTCore_Topology: I32EnumAttr<"Topology", "CCL Topology Type",
+ 
+ def TTCore_MoEActivationFunction_Silu   : I32EnumAttrCase<"Silu",   0, "silu">;
+ def TTCore_MoEActivationFunction_SwiGLU : I32EnumAttrCase<"SwiGLU", 1, "swiglu">;
++// beta * tanh(gate / beta) * sigmoid(gate) * limit * tanh(up / limit), with the
++// op's activation_beta and activation_limit.
++def TTCore_MoEActivationFunction_SiTU   : I32EnumAttrCase<"SiTU",   2, "situ">;
+ 
+ def TTCore_MoEActivationFunction : I32EnumAttr<"MoEActivationFunction",
+                                                "Activation function for the MoE expert FFN",
+                           [
+                            TTCore_MoEActivationFunction_Silu,
+                            TTCore_MoEActivationFunction_SwiGLU,
++                           TTCore_MoEActivationFunction_SiTU,
+                           ]> {
+   let genSpecializedAttr = 0;
+   let cppNamespace = "::mlir::tt::ttcore";
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -7353,7 +7353,9 @@ def TTIR_MoeComputeOp : TTIR_NamedOp<"moe_compute", [TTIR_CCL, AttrSizedOperandS
+                              "::mlir::tt::ttcore::MoEActivationFunction::Silu">:$activation_function,
+                          OptionalAttr<UI32Attr>:$cluster_axis,
+                          DefaultValuedAttr<UI32Attr, "0">:$rings,
+-                         OptionalAttr<TTCore_DataTypeAttr>:$weight_dtype);
++                         OptionalAttr<TTCore_DataTypeAttr>:$weight_dtype,
++                         OptionalAttr<F32Attr>:$activation_limit,
++                         OptionalAttr<F32Attr>:$activation_beta);
+ 
+     let results = (outs AnyRankedTensor:$combine_output);
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2224,7 +2224,9 @@ def TTNN_MoeComputeOp : TTNN_Op<"moe_compute",
+                          OptionalAttr<UI32Attr>:$num_links,
+                          OptionalAttr<TTCore_TopologyAttr>:$topology,
+                          TTNN_CoreRangeSetAttr:$mux_core_range_set,
+-                         DefaultValuedAttr<UI32Attr, "0">:$rings);
++                         DefaultValuedAttr<UI32Attr, "0">:$rings,
++                         OptionalAttr<F32Attr>:$activation_limit,
++                         OptionalAttr<F32Attr>:$activation_beta);
+ 
+     let results = (outs AnyRankedTensor:$combine_output);
+ 
+diff --git a/include/ttmlir/Target/Common/types.fbs b/include/ttmlir/Target/Common/types.fbs
+--- a/include/ttmlir/Target/Common/types.fbs
++++ b/include/ttmlir/Target/Common/types.fbs
+@@ -189,6 +189,7 @@ enum Topology: ushort {
+ enum MoEActivationFunction: ushort {
+   Silu,
+   SwiGLU,
++  SiTU,
+ }
+ 
+ enum NocIndex : ushort {
+diff --git a/include/ttmlir/Target/TTNN/operations/ccl.fbs b/include/ttmlir/Target/TTNN/operations/ccl.fbs
+--- a/include/ttmlir/Target/TTNN/operations/ccl.fbs
++++ b/include/ttmlir/Target/TTNN/operations/ccl.fbs
+@@ -216,4 +216,7 @@ table MoeComputeOp {
+   // Without a cluster axis: how many matmul rings run a chip's experts (0
+   // and 1: one; 2 and 3: experts side by side).
+   rings: uint32;
++  // SiTU's up and gate softcaps.
++  activation_limit: float = null;
++  activation_beta: float = null;
+ }
+diff --git a/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h b/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h
+--- a/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h
++++ b/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h
+@@ -1209,6 +1209,8 @@ toFlatbuffer(FlatbufferObjectCache &cache,
+     return ::tt::target::MoEActivationFunction::Silu;
+   case ttcore::MoEActivationFunction::SwiGLU:
+     return ::tt::target::MoEActivationFunction::SwiGLU;
++  case ttcore::MoEActivationFunction::SiTU:
++    return ::tt::target::MoEActivationFunction::SiTU;
+   }
+   llvm_unreachable("Unknown MoEActivationFunction");
+ }
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -12889,7 +12889,8 @@ public:
+         u32(**outputHeightShardDim), u32(w0Type.getShape().back()),
+         ttcore::MoEActivationFunctionAttr::get(getContext(), activation),
+         *clusterAxis ? u32(**clusterAxis) : IntegerAttr(), u32(**rings),
+-        /*weight_dtype=*/ttcore::DataTypeAttr());
++        /*weight_dtype=*/ttcore::DataTypeAttr(), /*activation_limit=*/FloatAttr(),
++        /*activation_beta=*/FloatAttr());
+     return success();
+   }
+ };
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -2009,7 +2009,8 @@ public:
+         op.getOutputHeightShardDimAttr(), op.getIntermediateSizeAttr(),
+         hasBiasAttr, op.getActivationFunctionAttr(), op.getClusterAxisAttr(),
+         /*num_links=*/mlir::IntegerAttr(), /*topology=*/ttcore::TopologyAttr(),
+-        muxCoreRangeSet, op.getRingsAttr());
++        muxCoreRangeSet, op.getRingsAttr(), op.getActivationLimitAttr(),
++        op.getActivationBetaAttr());
+     return success();
+   }
+ };
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -1560,6 +1560,14 @@ createOp(FlatbufferObjectCache &cache, MoeComputeOp op) {
+ 
+   auto muxCoreRangeSet = toFlatbuffer(cache, op.getMuxCoreRangeSetAttr());
+ 
++  auto optionalFloat = [](std::optional<llvm::APFloat> value)
++      -> ::flatbuffers::Optional<float> {
++    if (!value) {
++      return ::flatbuffers::nullopt;
++    }
++    return value->convertToFloat();
++  };
++
+   auto combineOutput = cache.getOrCreateNoSharding(
+       op.getCombineOutput(), tensorValueToFlatbuffer, std::nullopt);
+ 
+@@ -1568,7 +1576,8 @@ createOp(FlatbufferObjectCache &cache, MoeComputeOp op) {
+       w2, optionalOutput, crossDeviceSemaphore, deviceRef, op.getLayerId(),
+       op.getOutputHeightShardDim(), op.getIntermediateSize(), op.getHasBias(),
+       clusterAxis, activation, numLinks, topology, muxCoreRangeSet,
+-      combineOutput, op.getRings());
++      combineOutput, op.getRings(), optionalFloat(op.getActivationLimit()),
++      optionalFloat(op.getActivationBeta()));
+ }
+ 
+ // Convert ttcore::ReduceType to tt::target::ttnn::ScatterReduceType
+diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
+--- a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
++++ b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
+@@ -19,6 +19,10 @@ namespace tt::runtime::ttnn::operations::ccl {
+ 
+ namespace {
+ 
++std::optional<float> toOptional(::flatbuffers::Optional<float> value) {
++  return value.has_value() ? std::optional<float>(*value) : std::nullopt;
++}
++
+ ::ttnn::experimental::prim::detail::MoEActivationFunction
+ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+   switch (fb) {
+@@ -26,6 +30,8 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+     return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
+   case ::tt::target::MoEActivationFunction::SwiGLU:
+     return ::ttnn::experimental::prim::detail::MoEActivationFunction::SWIGLU;
++  case ::tt::target::MoEActivationFunction::SiTU:
++    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SITU;
+   }
+   LOG_FATAL("Unknown MoEActivationFunction enum value: ", static_cast<int>(fb));
+   return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
+@@ -148,9 +154,10 @@ void runLocal(const ::tt::target::ttnn::MoeComputeOp *op,
+       /*compute_only=*/false, /*num_shared_experts_per_device=*/std::nullopt,
+       /*local_combine=*/false, /*zero_fill_non_owned_rows=*/rings < 2,
+       /*prefill_rings=*/rings, /*enable_a2a_pipeline=*/false,
+-      /*activation_limit=*/std::nullopt,
++      /*activation_limit=*/toOptional(op->activation_limit()),
+       /*math_fidelity=*/mathFidelityFor(w0w1),
+-      /*fp32_dest_acc_en=*/true);
++      /*fp32_dest_acc_en=*/true,
++      /*activation_beta=*/toOptional(op->activation_beta()));
+ 
+   LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
+              " tensors; expected 6");
+@@ -227,9 +234,10 @@ void run(const ::tt::target::ttnn::MoeComputeOp *op, ProgramContext &context) {
+       /*compute_only=*/false, /*num_shared_experts_per_device=*/std::nullopt,
+       /*local_combine=*/false, /*zero_fill_non_owned_rows=*/false,
+       /*prefill_rings=*/std::nullopt, /*enable_a2a_pipeline=*/false,
+-      /*activation_limit=*/std::nullopt,
++      /*activation_limit=*/toOptional(op->activation_limit()),
+       /*math_fidelity=*/mathFidelityFor(w0w1),
+-      /*fp32_dest_acc_en=*/true);
++      /*fp32_dest_acc_en=*/true,
++      /*activation_beta=*/toOptional(op->activation_beta()));
+ 
+   LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
+              " tensors; expected 6");

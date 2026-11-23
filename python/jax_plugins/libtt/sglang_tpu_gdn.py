@@ -323,13 +323,18 @@ def fused_conv1d_gdn(
 def patch_mamba_pool(module):
     """Gives the recurrent-state pool's conv windows the BF16 `[slots, channels, 3]`
     layout of TTNN's causal conv update (SGLang-TorchTPU's: FP32 `[slots, 3, 1,
-    channels]`, which tiles pad 32-fold)."""
+    channels]`, which tiles pad 32-fold), for models with gated DeltaNet layers."""
     torch = module.torch
     pool = module.TpuMambaPool
     init = pool.__init__
 
     def __init__(self, **kwargs):
         init(self, **kwargs)
+        if not self.mamba_cache.temporal:
+            # A conv-only model (Inkling's short convolutions) has no gated
+            # DeltaNet layers, and its own ops read the windows in
+            # SGLang-TorchTPU's layout.
+            return
         conv = [
             [
                 torch.zeros(

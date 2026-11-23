@@ -1,0 +1,236 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/hostdevcommon/config.hpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/hostdevcommon/config.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/hostdevcommon/config.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/hostdevcommon/config.hpp
+@@ -9,6 +9,7 @@
+ namespace ttnn::experimental::prim::detail {
+ 
+ // Activation function types for MoE operations
+-enum class MoEActivationFunction : uint8_t { SILU = 0, SWIGLU = 1, GELU = 2, CLAMPED_SILU = 3 };
++// SITU: beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta) (Kimi-K3, Inkling 2).
++enum class MoEActivationFunction : uint8_t { SILU = 0, SWIGLU = 1, GELU = 2, CLAMPED_SILU = 3, SITU = 4 };
+ 
+ }  // namespace ttnn::experimental::prim::detail
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp
+@@ -25,6 +25,54 @@
+ #include "llk_math_eltwise_unary_sfpu_macros.h"
+ #include "llk_math_eltwise_binary_sfpu_macros.h"
+ #include "ckernel_sfpu_gelu.h"
++
++namespace ckernel::sfpu {
++
++// SiTU gating (Kimi-K3, Inkling 2): beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta),
++// a SiLU whose gate and up are softcapped. tanh(x) = 2 * sigmoid(2x) - 1 takes the SwiGLU header's sigmoid, whose
++// reciprocal is the only state it initializes: the accurate tanh and the other sigmoid each want the programmable
++// constants for themselves. With FP32 DEST, 2 * sigmoid - 1 near 0 loses only about 2^-24 of the softcap.
++template <bool is_fp32_dest_acc_en, int ITERATIONS, class Config>
++inline void calculate_situ(const uint gate_tile_idx, const uint up_tile_idx, const uint out_tile_idx) {
++    constexpr float beta = Config::beta;
++    constexpr float linear_beta = Config::linear_beta;
++    constexpr uint dst_tile_size = 32;  // 32 rows per tile in SFPU addressing
++
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vFloat gate = sfpi::dst_reg[gate_tile_idx * dst_tile_size];
++        sfpi::vFloat up = sfpi::dst_reg[up_tile_idx * dst_tile_size];
++
++        sfpi::vFloat gate_cap = _swiglu_sigmoid_<is_fp32_dest_acc_en>(gate * (2.0f / beta)) * (2.0f * beta) - beta;
++        sfpi::vFloat up_cap =
++            _swiglu_sigmoid_<is_fp32_dest_acc_en>(up * (2.0f / linear_beta)) * (2.0f * linear_beta) - linear_beta;
++        sfpi::vFloat result = gate_cap * _swiglu_sigmoid_<is_fp32_dest_acc_en>(gate) * up_cap;
++        if constexpr (!is_fp32_dest_acc_en) {
++            result = sfpi::convert<sfpi::vFloat16b>(result, sfpi::RoundMode::Nearest);
++        }
++
++        sfpi::dst_reg[out_tile_idx * dst_tile_size] = result;
++        sfpi::dst_reg++;
++    }
++}
++
++}  // namespace ckernel::sfpu
++
++namespace ckernel {
++
++template <bool is_fp32_dest_acc_en, class Config>
++inline void llk_math_eltwise_binary_sfpu_situ(uint gate_tile, uint32_t up_tile, uint32_t out_tile) {
++    SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_situ,
++        (is_fp32_dest_acc_en, 8 /*ITERATIONS*/, Config),
++        gate_tile,
++        up_tile,
++        out_tile,
++        VectorMode::RC);
++}
++
++}  // namespace ckernel
+ #endif
+ 
+ namespace detail {
+@@ -83,6 +131,12 @@ inline void pack_init_activation<ttnn::experimental::prim::detail::MoEActivation
+     PACK((llk_math_eltwise_binary_sfpu_swiglu_init()));
+ };
+ 
++// SiTU's sigmoids take the SwiGLU sigmoid's reciprocal state.
++template <>
++inline void pack_init_activation<ttnn::experimental::prim::detail::MoEActivationFunction::SITU>() {
++    PACK((llk_math_eltwise_binary_sfpu_swiglu_init()));
++};
++
+ template <>
+ inline void pack_init_activation<ttnn::experimental::prim::detail::MoEActivationFunction::SILU>() {
+     PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init, (true /*APPROXIMATE*/)));
+@@ -167,6 +221,23 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::C
+     }
+ };
+ 
++// beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta)
++struct SituConfig {
++    static constexpr float beta = __builtin_bit_cast(float, get_named_compile_time_arg_val("activation_beta_bits"));
++    static constexpr float linear_beta =
++        __builtin_bit_cast(float, get_named_compile_time_arg_val("activation_limit_bits"));
++};
++
++template <uint32_t kPairs>
++struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::SITU, kPairs> {
++    static inline void compute() {
++        PACK((llk_math_eltwise_binary_sfpu_situ<DST_ACCUM_MODE, SituConfig>(0, 1, 0)));
++        if constexpr (kPairs == 2) {
++            PACK((llk_math_eltwise_binary_sfpu_situ<DST_ACCUM_MODE, SituConfig>(2, 3, 2)));
++        }
++    }
++};
++
+ template <uint32_t kPairs>
+ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::GELU, kPairs> {
+     static inline void compute() {
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
+@@ -57,12 +57,20 @@ void MoEComputeDeviceOperation::validate_on_program_cache_hit(
+ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
+     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+     TT_FATAL(
+-        (args.activation_type == detail::MoEActivationFunction::CLAMPED_SILU) == args.activation_limit.has_value(),
+-        "activation_limit is required for CLAMPED_SILU and must be omitted for other activations");
++        (args.activation_type == detail::MoEActivationFunction::CLAMPED_SILU ||
++         args.activation_type == detail::MoEActivationFunction::SITU) == args.activation_limit.has_value(),
++        "activation_limit is required for CLAMPED_SILU and SITU and must be omitted for other activations");
+     TT_FATAL(
+         !args.activation_limit.has_value() || (std::isfinite(*args.activation_limit) && *args.activation_limit > 0.0f),
+         "activation_limit must be finite and positive, got {}",
+         args.activation_limit.value_or(0.0f));
++    TT_FATAL(
++        (args.activation_type == detail::MoEActivationFunction::SITU) == args.activation_beta.has_value(),
++        "activation_beta is required for SITU and must be omitted for other activations");
++    TT_FATAL(
++        !args.activation_beta.has_value() || (std::isfinite(*args.activation_beta) && *args.activation_beta > 0.0f),
++        "activation_beta must be finite and positive, got {}",
++        args.activation_beta.value_or(0.0f));
+ 
+     // Tilize
+     TT_FATAL(
+@@ -607,7 +615,8 @@ std::vector<ttnn::Tensor> moe_compute(
+     const bool enable_a2a_pipeline,
+     const std::optional<float>& activation_limit,
+     const tt::tt_metal::MathFidelity math_fidelity,
+-    const bool fp32_dest_acc_en) {
++    const bool fp32_dest_acc_en,
++    const std::optional<float>& activation_beta) {
+     using OperationType = ttnn::experimental::prim::MoEComputeDeviceOperation;
+     TT_FATAL(
+         !enable_a2a_pipeline || prefill_rings.value_or(0) == 0,
+@@ -858,6 +867,7 @@ std::vector<ttnn::Tensor> moe_compute(
+             .combine_params = combine_params,
+             .activation_type = activation_type.value_or(experimental::prim::detail::MoEActivationFunction::SILU),
+             .activation_limit = activation_limit,
++            .activation_beta = activation_beta,
+             .math_fidelity = math_fidelity,
+             .fp32_dest_acc_en = fp32_dest_acc_en,
+             .zero_fill_non_owned_rows = zero_fill_non_owned_rows,
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.hpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.hpp
+@@ -67,7 +67,8 @@ std::vector<Tensor> moe_compute(
+     bool enable_a2a_pipeline = false,
+     const std::optional<float>& activation_limit = std::nullopt,
+     tt::tt_metal::MathFidelity math_fidelity = tt::tt_metal::MathFidelity::LoFi,
+-    bool fp32_dest_acc_en = false);
++    bool fp32_dest_acc_en = false,
++    const std::optional<float>& activation_beta = std::nullopt);
+ 
+ using ttnn::experimental::prim::get_moe_combine_cores;
+ using ttnn::experimental::prim::get_moe_worker_mcast_bounding_box;
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation_types.hpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation_types.hpp
+@@ -64,9 +64,12 @@ struct MoEComputeParams {
+     ttnn::experimental::prim::detail::MoEActivationFunction activation_type =
+         ttnn::experimental::prim::detail::MoEActivationFunction::SILU;  // Default to SILU
+ 
+-    // CLAMPED_SILU only: silu(min(gate, limit)) * clamp(up, -limit, limit).
++    // CLAMPED_SILU: silu(min(gate, limit)) * clamp(up, -limit, limit). SITU: the up softcap linear_beta.
+     std::optional<float> activation_limit;
+ 
++    // SITU only: the gate softcap beta.
++    std::optional<float> activation_beta;
++
+     // Expert matmuls and activation. math_approx_mode and dst_full_sync_en stay fixed by the kernel.
+     tt::tt_metal::MathFidelity math_fidelity = tt::tt_metal::MathFidelity::LoFi;
+     bool fp32_dest_acc_en = false;
+@@ -106,6 +109,7 @@ struct MoEComputeParams {
+         attrs.emplace_back("combine_params", combine_params);
+         attrs.emplace_back("activation_type", static_cast<uint32_t>(activation_type));
+         attrs.emplace_back("activation_limit", activation_limit);
++        attrs.emplace_back("activation_beta", activation_beta);
+         attrs.emplace_back("math_fidelity", static_cast<uint32_t>(math_fidelity));
+         attrs.emplace_back("fp32_dest_acc_en", fp32_dest_acc_en);
+         attrs.emplace_back("zero_fill_non_owned_rows", zero_fill_non_owned_rows);
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+@@ -1726,6 +1726,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+         {"w2_pages_per_ring_core_total", w2_pages_per_ring_core_total},
+         {"activation_function", static_cast<uint32_t>(activation_type)},
+         {"activation_limit_bits", std::bit_cast<uint32_t>(args.activation_limit.value_or(0.0f))},
++        {"activation_beta_bits", std::bit_cast<uint32_t>(args.activation_beta.value_or(0.0f))},
+         {"metadata_ready_semaphore_id", metadata_ready_semaphore_id},
+         {"matmul_chunk_ready_semaphore_id", matmul_chunk_ready_semaphore_id},
+         {"chunk_halves", chunk_halves},
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.cpp
+@@ -55,7 +55,8 @@ std::vector<ttnn::Tensor> moe_compute(
+     const bool enable_a2a_pipeline,
+     const std::optional<float>& activation_limit,
+     const tt::tt_metal::MathFidelity math_fidelity,
+-    const bool fp32_dest_acc_en) {
++    const bool fp32_dest_acc_en,
++    const std::optional<float>& activation_beta) {
+     // bh_ring_size is intentionally not exposed on the public API; it remains a tunable knob on
+     // the ttnn::prim::moe_compute entry point. The matmul ring is auto-detected from the live
+     // DRAM-bank count (12 on WH, 7/8 on BH).
+@@ -88,7 +89,8 @@ std::vector<ttnn::Tensor> moe_compute(
+         enable_a2a_pipeline,
+         activation_limit,
+         math_fidelity,
+-        fp32_dest_acc_en);
++        fp32_dest_acc_en,
++        activation_beta);
+ }
+ 
+ std::vector<ttnn::CoreCoord> get_moe_combine_cores(
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp
+@@ -43,7 +43,8 @@ std::vector<ttnn::Tensor> moe_compute(
+     bool enable_a2a_pipeline = false,
+     const std::optional<float>& activation_limit = std::nullopt,
+     tt::tt_metal::MathFidelity math_fidelity = tt::tt_metal::MathFidelity::LoFi,
+-    bool fp32_dest_acc_en = false);
++    bool fp32_dest_acc_en = false,
++    const std::optional<float>& activation_beta = std::nullopt);
+ 
+ std::vector<ttnn::CoreCoord> get_moe_combine_cores(
+     ttnn::MeshDevice* mesh_device,

@@ -60,6 +60,9 @@ def _ragged_paged_attention(module):
         distribution,  # i32[3]: decode, prefill and mixed sequence ranges
         custom_mask,
         attention_sink=None,
+        rel_r=None,  # [tokens, q_heads, rel_dim]
+        rel_proj=None,  # [rel_dim, extent]
+        token_sink=None,  # [tokens, q_heads]
         *,
         causal=1,
         sm_scale=1.0,
@@ -150,6 +153,8 @@ def _ragged_paged_attention(module):
             and causal
             and soft_cap is None
             and attention_sink is None
+            and rel_proj is None
+            and token_sink is None
             and q_scale is None
             and k_scale is None
             and v_scale is None
@@ -167,6 +172,8 @@ def _ragged_paged_attention(module):
             and causal
             and soft_cap is None
             and attention_sink is None
+            and rel_proj is None
+            and token_sink is None
             and sliding_window is None
             and q_scale is None
             and k_scale is None
@@ -219,8 +226,15 @@ def _ragged_paged_attention(module):
         if sliding_window is not None:
             allowed = allowed & (position[:, None] - key_pos[None, :] < sliding_window)
         scores = scores.reshape(kv_heads, group, tokens, -1)
+        if rel_proj is not None:
+            scores = scores + _relative_bias(rel_r, rel_proj, position, key_pos).reshape(
+                kv_heads, group, tokens, -1
+            )
         scores = jnp.where(allowed[None, None], scores, mask_value)
-        if attention_sink is not None:
+        if token_sink is not None:
+            sink = token_sink.astype(jnp.float32).T.reshape(kv_heads, group, tokens, 1)
+            probs = jax.nn.softmax(jnp.concatenate([sink, scores], axis=-1), axis=-1)[..., 1:]
+        elif attention_sink is not None:
             sink = jnp.broadcast_to(
                 jnp.asarray(attention_sink, jnp.float32).reshape(kv_heads, group, 1, 1),
                 (kv_heads, group, tokens, 1),
@@ -235,6 +249,30 @@ def _ragged_paged_attention(module):
         return out, cache
 
     return ragged_paged_attention
+
+
+def _relative_bias(rel_r, rel_proj, positions, key_positions):
+    """[q_heads, tokens, keys] learned relative-position logits.
+
+    A token at position p and a key at position j get rel_r[token] .
+    rel_proj[:, p - j] while 0 <= p - j < extent, and nothing beyond it. Each
+    (token, key) pair gathers its column of rel_proj as a row of rel_proj.T, an
+    embedding lookup, and a batched matmul over the tokens takes the products.
+    """
+    import jax.numpy as jnp
+
+    extent = rel_proj.shape[1]
+    distance = positions[:, None] - key_positions[None, :]
+    columns = jnp.take(
+        rel_proj.astype(jnp.float32).T, jnp.clip(distance, 0, extent - 1), axis=0
+    )
+    bias = jnp.einsum(
+        "thf,tkf->htk",
+        rel_r.astype(jnp.float32),
+        columns,
+        preferred_element_type=jnp.float32,
+    )
+    return jnp.where(((distance >= 0) & (distance < extent))[None], bias, 0.0)
 
 
 def _prefill_chunk(page_size):
@@ -583,14 +621,29 @@ def _fused_moe_jax(
     the layer's all-reduce adds them up. Like the Pallas kernel, it reads the
     router's global expert ids. w1 holds each expert's gate and up projections
     side by side, [experts, hidden, 2 * intermediate].
+
+    The experts are SiLU-gated, or SiTU-gated with activation_name
+    "situ:{beta}:{linear_beta}" (Inkling 2): beta * tanh(g / beta) * sigmoid(g)
+    * linear_beta * tanh(u / linear_beta) for gate g and up u.
     """
     import jax
     import jax.numpy as jnp
+    import numpy as np
     import torch.distributed as dist
 
+    activation = {}
+    if activation_name.startswith("situ:"):
+        beta, linear_beta = activation_name.split(":")[1:]
+        if linear_beta == "none":
+            raise NotImplementedError("SiTU MoE on Tenstorrent takes an up softcap (linear_beta)")
+        activation = dict(
+            activation="situ", activation_beta=np.float32(beta), activation_limit=np.float32(linear_beta)
+        )
+    elif activation_name != "silu":
+        raise NotImplementedError(f"MoE on Tenstorrent runs SiLU or SiTU experts, not {activation_name}")
     extras = (w1_bias, w2_bias, w1_channel_scale, w2_channel_scale)
-    if activation_name != "silu" or no_combine or w_quant_bits or any(e is not None for e in extras):
-        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 SiLU experts without biases, combined")
+    if no_combine or w_quant_bits or any(e is not None for e in extras):
+        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 experts without biases, combined")
     fp8 = w1.dtype == w2.dtype == jnp.float8_e4m3fn
     if fp8:
         if w1_scale is None or w2_scale is None or w1_scale.shape[1] != 1 or w2_scale.shape[1] != 1:
@@ -620,8 +673,8 @@ def _fused_moe_jax(
     fused_moe_ep = jax.ffi.ffi_call("tt.fused_moe_ep", jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype))
     operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
     if fp8:
-        return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)))
-    return fused_moe_ep(*operands, weight_dtype="bf16")
+        return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)), **activation)
+    return fused_moe_ep(*operands, weight_dtype="bf16", **activation)
 
 
 def patch_fused_moe(module):

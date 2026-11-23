@@ -16,7 +16,11 @@
 // where the experts are split evenly over every device of the mesh in device
 // order, so device d holds experts d * E_local to (d + 1) * E_local - 1.
 // Returns each token's routing-weighted sum of the SiLU-gated experts this
-// device holds, [T, H] in x's type; the layer is the sum over devices.
+// device holds, [T, H] in x's type; the layer is the sum over devices. With
+// activation = "situ" the experts are SiTU-gated instead (Inkling 2):
+//   beta * tanh(g / beta) * sigmoid(g) * limit * tanh(u / limit)
+// for gate g and up u, with the float attributes activation_beta and
+// activation_limit.
 //
 // The kernel stores the experts in BFP4, or in BF16 as they are with the
 // weight_dtype = "bf16" attribute, takes up to 512 tokens per call, runs only
@@ -82,6 +86,27 @@ public:
         weightDtype.getValue() != "bf16") {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep's weight_dtype is bfp4 or bf16");
+    }
+
+    auto activationFunction = ttcore::MoEActivationFunction::Silu;
+    FloatAttr activationLimit, activationBeta;
+    if (StringAttr name =
+            config ? config.getAs<StringAttr>("activation") : nullptr) {
+      if (name.getValue() == "situ") {
+        auto beta = config.getAs<FloatAttr>("activation_beta");
+        auto limit = config.getAs<FloatAttr>("activation_limit");
+        if (!beta || !limit) {
+          return rewriter.notifyMatchFailure(
+              op, "tt.fused_moe_ep's situ activation takes activation_beta "
+                  "and activation_limit");
+        }
+        activationFunction = ttcore::MoEActivationFunction::SiTU;
+        activationBeta = rewriter.getF32FloatAttr(beta.getValueAsDouble());
+        activationLimit = rewriter.getF32FloatAttr(limit.getValueAsDouble());
+      } else if (name.getValue() != "silu") {
+        return rewriter.notifyMatchFailure(
+            op, "tt.fused_moe_ep's activation is silu or situ");
+      }
     }
 
     if ((adaptor.getOperands().size() != 6 &&
@@ -235,8 +260,8 @@ public:
     Value mapping = rewriter.create<ttir::ConstantOp>(
         loc, mappingType, DenseElementsAttr::get(mappingType, owners));
 
-    auto activation = ttcore::MoEActivationFunctionAttr::get(
-        ctx, ttcore::MoEActivationFunction::Silu);
+    auto activation =
+        ttcore::MoEActivationFunctionAttr::get(ctx, activationFunction);
     // An [m, n] 0/1 matrix, 1 where row r equals column c's index index(c):
     // only the row and column indices are constants, and the comparison runs
     // once, when the program loads.
@@ -277,7 +302,8 @@ public:
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::Float8E4M3FN)
           : bf16Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
-              : ttcore::DataTypeAttr());
+              : ttcore::DataTypeAttr(),
+          activationLimit, activationBeta);
 
       // Each token's weighted sum of its slots as one matmul in FP32: row i
       // of the placement matrix holds token i's weight j at column j * t + i,
