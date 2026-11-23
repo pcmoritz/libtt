@@ -753,6 +753,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_causal_conv1d_update_activation.patch",
         "//third_party/tt_xla:tt_mlir_sdpa_decode_window_bias.patch",
         "//third_party/tt_xla:tt_mlir_const_eval_private_constants.patch",
+        "//third_party/tt_xla:tt_mlir_attn_res.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

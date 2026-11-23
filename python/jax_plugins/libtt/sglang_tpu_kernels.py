@@ -48,6 +48,7 @@ ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
 FUSED_MOE_MODULE = "sglang_tpu.moe.pallas.fused_moe_op"
 FP8_MOE_FUSED_RS_MODULE = "sglang_tpu.fp8_moe_fused_rs"
 FP4_MOE_MODULE = "sglang_tpu.fp4_moe"
+INKLING2_ATTN_RES_MODULE = "sglang_tpu.inkling2_attn_res"
 
 
 def _ragged_paged_attention(module):
@@ -1012,6 +1013,128 @@ def patch_fp4_moe(module):
     module.apply_tpu_nvfp4_moe = apply_tpu_nvfp4_moe
 
 
+def patch_inkling2_attn_res(module):
+    """Inkling 2's block attention residuals for decode steps: up to four tokens and eight
+    sources run on `ttnn::experimental::attn_res` (the `tt.attn_res` call), one program where
+    the stack, its RMS norm, the logits matmul, the softmax over the sources, the weighted sum
+    and the next norm took eleven. Both upstream's fused form with the RMS norm that follows
+    (its Pallas prefill kernel `inkling2_attn_res_norm`) and the mixture alone
+    (`attn_res_tpu`: the later loop passes, the loop messages and the final output). Larger
+    batches keep upstream's XLA path; the Pallas kernel itself only runs on TPUs."""
+    import functools
+    from typing import Optional
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+
+    max_tokens, max_sources = 4, 8
+
+    def supports_attn_res_norm(tokens: int, num_sources: int) -> bool:
+        return tokens <= max_tokens and num_sources <= max_sources
+
+    def attn_res_call(sources, addend, queries, norm_weights, *, normalize, eps_res, eps_norm=0.0):
+        """[Q, T, W]: BF16 normed mixtures with norm weights, else the FP32 mixtures."""
+        tokens, width = sources[0].shape
+        operands = [
+            *(s.astype(jnp.bfloat16) for s in sources),
+            *([addend] if addend is not None else []),
+            queries.astype(jnp.float32),
+            *([norm_weights.astype(jnp.float32)] if norm_weights is not None else []),
+        ]
+        dtype = jnp.bfloat16 if norm_weights is not None else jnp.float32
+        return jax.ffi.ffi_call("tt.attn_res", jax.ShapeDtypeStruct((queries.shape[0], tokens, width), dtype))(
+            *operands,
+            num_sources=np.int64(len(sources)),
+            has_addend=addend is not None,
+            has_weight=norm_weights is not None,
+            normalize=bool(normalize),
+            eps_res=np.float32(eps_res),
+            eps_norm=np.float32(eps_norm),
+        )
+
+    def attn_res_norm_jax(sources, addend, queries, norm_weights, *, normalize, eps_res, eps_norm):
+        return attn_res_call(
+            sources, addend, queries, norm_weights, normalize=normalize, eps_res=eps_res, eps_norm=eps_norm
+        )
+
+    @functools.cache
+    def register_inkling2_attn_res_op():
+        from torch_tpu._internal import pallas
+
+        # Upstream's signature: ten source slots, unused ones None.
+        def _op(
+            s0: jax.Array,
+            s1: Optional[jax.Array],
+            s2: Optional[jax.Array],
+            s3: Optional[jax.Array],
+            s4: Optional[jax.Array],
+            s5: Optional[jax.Array],
+            s6: Optional[jax.Array],
+            s7: Optional[jax.Array],
+            s8: Optional[jax.Array],
+            s9: Optional[jax.Array],
+            addend: Optional[jax.Array],
+            queries: jax.Array,
+            norm_weights: jax.Array,
+            normalize: bool,
+            eps_res: float,
+            eps_norm: float,
+        ) -> jax.Array:
+            sources = [s for s in (s0, s1, s2, s3, s4, s5, s6, s7, s8, s9) if s is not None]
+            return attn_res_norm_jax(
+                sources, addend, queries, norm_weights, normalize=normalize, eps_res=eps_res, eps_norm=eps_norm
+            )
+
+        op = pallas.jax_op("libtt::inkling2_attn_res_norm", _op)
+
+        @op.register_fake
+        def fake(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, addend, queries, norm_weights, normalize, eps_res, eps_norm):
+            return s0.new_empty((queries.shape[0], *s0.shape), dtype=torch.bfloat16)
+
+        return op
+
+    @functools.cache
+    def mixture_op():
+        from torch_tpu._internal import pallas
+
+        def _op(
+            s0: jax.Array,
+            s1: Optional[jax.Array],
+            s2: Optional[jax.Array],
+            s3: Optional[jax.Array],
+            s4: Optional[jax.Array],
+            s5: Optional[jax.Array],
+            s6: Optional[jax.Array],
+            s7: Optional[jax.Array],
+            addend: Optional[jax.Array],
+            query_rows: jax.Array,
+            normalize: bool,
+            eps_res: float,
+        ) -> jax.Array:
+            sources = [s for s in (s0, s1, s2, s3, s4, s5, s6, s7) if s is not None]
+            return attn_res_call(sources, addend, query_rows, None, normalize=normalize, eps_res=eps_res)
+
+        op = pallas.jax_op("libtt::inkling2_attn_res", _op)
+
+        @op.register_fake
+        def fake(s0, s1, s2, s3, s4, s5, s6, s7, addend, query_rows, normalize, eps_res):
+            return s0.new_empty((query_rows.shape[0], *s0.shape), dtype=torch.float32)
+
+        return op
+
+    def attn_res_tpu(sources, addend, query_rows, *, normalize, eps_res):
+        slots = list(sources) + [None] * (max_sources - len(sources))
+        return mixture_op()(*slots, addend, query_rows, bool(normalize), float(eps_res))
+
+    module.supports_attn_res_norm = supports_attn_res_norm
+    module.attn_res_norm_jax = attn_res_norm_jax
+    module.register_inkling2_attn_res_op = register_inkling2_attn_res_op
+    module.supports_attn_res = supports_attn_res_norm
+    module.attn_res_tpu = attn_res_tpu
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
@@ -1026,4 +1149,5 @@ PATCHES = {
     FUSED_MOE_MODULE: patch_fused_moe,
     FP8_MOE_FUSED_RS_MODULE: patch_fp8_moe_fused_rs,
     FP4_MOE_MODULE: patch_fp4_moe,
+    INKLING2_ATTN_RES_MODULE: patch_inkling2_attn_res,
 }
