@@ -37,6 +37,7 @@ FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
 GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
 MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
 MAMBA_STATE_ROWS_MODULE = "sglang_tpu.mamba_state_rows"
+INKLING_SCONV_MODULE = "sglang_tpu.attention_inkling_sconv_pallas"
 KV_FUSED_ROPE_WRITE_MODULE = "sglang_tpu.kv_fused_rope_write"
 BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_worker"
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
@@ -475,8 +476,10 @@ def patch_mamba_state_rows(module):
 
         # torch_tpu's jax_op reads the signature's annotations.
         def read_rows(pool: jax.Array, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+            # The callers clamp the rows to the pool.
             flat = pool.reshape(pool.shape[0], -1)
-            return pool, jnp.take(flat, rows, axis=0).reshape(rows.shape[0], *pool.shape[1:])
+            out = flat.at[rows].get(mode="promise_in_bounds")
+            return pool, out.reshape(rows.shape[0], *pool.shape[1:])
 
         op = pallas.jax_op("sglang::tpu_state_row_read", read_rows, donate_argnums=(0,))
 
@@ -508,6 +511,70 @@ def patch_mamba_state_rows(module):
 
     module.state_row_read_op = state_row_read_op
     module.state_row_write_op = state_row_write_op
+
+
+def patch_inkling_sconv(module):
+    """Inkling's short convolutions: a decode step with static weights runs on
+    TTNN's causal conv update, without its SiLU, which reads and updates each
+    request's window in the pool in place (`[slots, channels, 3]`, see
+    `sglang_tpu_gdn.patch_mamba_pool`); the residual and the scale follow in
+    FP32. The rest (extends, verifies and the dynamic weights of global layers'
+    K and V) convolve in torch, as in SGLang-TorchTPU."""
+    import functools
+
+    import torch
+
+    backend = module.TpuInklingSconvBackend
+    torch_decode = backend._xla_sconv_decode
+
+    @functools.cache
+    def conv_update_op():
+        import jax
+        import jax.numpy as jnp
+        from torch_tpu._internal import pallas
+
+        from jax_plugins.libtt import sglang_tpu_gdn
+
+        def conv_update(
+            state: jax.Array, x: jax.Array, weight: jax.Array, slots: jax.Array, initial: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            outputs = []
+            for start in range(0, x.shape[0], sglang_tpu_gdn.MAX_ROWS):
+                rows = slice(start, start + sglang_tpu_gdn.MAX_ROWS)
+                state, out = jax.ffi.ffi_call(
+                    "tt.causal_conv1d_update",
+                    (jax.ShapeDtypeStruct(state.shape, state.dtype), jax.ShapeDtypeStruct(x[rows].shape, jnp.float32)),
+                    input_output_aliases={0: 0},
+                    vmap_method="sequential",
+                )(state, x[rows], weight, slots[rows], initial[rows], apply_silu=False)
+                outputs.append(out)
+            return state, jnp.concatenate(outputs)
+
+        op = pallas.jax_op("libtt::inkling_conv_update", conv_update, donate_argnums=(0,))
+
+        @op.register_fake
+        def fake(state, x, weight, slots, initial):
+            return torch.empty_like(state), x.new_empty(x.shape, dtype=torch.float32)
+
+        return op
+
+    def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual):
+        if dyn is not None or state.dim() != 3 or self._track_end is not None:
+            return torch_decode(self, x, state=state, weight=weight, dyn=dyn, use_residual=use_residual)
+        num_seqs, dim = x.shape
+        kernel_size = weight.shape[-1]
+        # Padding rows (index -1) go to slot 0, which the kernel never writes.
+        slots = torch.where(self._state_indices[:num_seqs] >= 0, self._state_indices[:num_seqs], 0)
+        initial = (self._seq_lens[:num_seqs] > 1).to(torch.bfloat16)
+        pool, conv = conv_update_op()(
+            state, x.to(torch.bfloat16), weight.reshape(dim, kernel_size), slots.to(torch.int32), initial
+        )
+        state.copy_(pool)
+        acc = conv + x.float() if use_residual else conv
+        return (acc * (kernel_size + int(use_residual)) ** -0.5).to(x.dtype)
+
+    backend._xla_sconv_decode = _xla_sconv_decode
+    module.libtt_conv_update_op = conv_update_op  # for tests
 
 
 def patch_mamba_pool(module):
@@ -755,6 +822,7 @@ PATCHES = {
     GDN_MODULE: patch_gdn,
     MAMBA_POOL_MODULE: patch_mamba_pool,
     MAMBA_STATE_ROWS_MODULE: patch_mamba_state_rows,
+    INKLING_SCONV_MODULE: patch_inkling_sconv,
     KV_FUSED_ROPE_WRITE_MODULE: patch_kv_fused_rope_write,
     BLOCK_DRAFT_WORKER_MODULE: patch_block_draft_worker,
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,

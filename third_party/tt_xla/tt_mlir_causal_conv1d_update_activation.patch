@@ -1,0 +1,88 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6842,7 +6842,10 @@ def TTIR_CausalConv1dUpdateOp : TTIR_InplaceOp<"causal_conv1d_update", [TTIR_Cac
+                        AnyRankedTensor:$weight,
+                        AnyRankedTensor:$state_indices,
+                        AnyRankedTensor:$has_initial_state,
+-                       Optional<AnyRankedTensor>:$state_slots);
++                       Optional<AnyRankedTensor>:$state_slots,
++                       // Without it, the plain convolution (Inkling 2's short
++                       // convolutions).
++                       DefaultValuedAttr<BoolAttr, "true">:$apply_silu);
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -5151,7 +5151,10 @@ def TTNN_CausalConv1dUpdateOp : TTNN_InplaceOp<"causal_conv1d_update", [OpModelE
+                        AnyRankedTensor:$weight,
+                        AnyRankedTensor:$state_indices,
+                        AnyRankedTensor:$has_initial_state,
+-                       Optional<AnyRankedTensor>:$state_slots);
++                       Optional<AnyRankedTensor>:$state_slots,
++                       // Without it, the plain convolution (Inkling 2's short
++                       // convolutions).
++                       DefaultValuedAttr<BoolAttr, "true">:$apply_silu);
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
+diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+--- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
++++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+@@ -122,6 +122,8 @@ table CausalConv1dUpdateOp {
+   output: tt.target.ttnn.TensorRef;
+   // Optional [B, T] slots for the window after each of T steps per state.
+   state_slots: tt.target.ttnn.TensorRef;
++  // silu(conv), or the convolution itself.
++  apply_silu: bool = true;
+ }
+ 
+ table StatePoolUpdateOp {
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10241,6 +10241,17 @@ public:
+       auto type = getTypeConverter()->convertType(op.getResult(1).getType());
+       auto result = rewriter.create<ttir::CausalConv1dUpdateOp>(
+           op.getLoc(), type, adaptor.getOperands());
++      // backend_config's apply_silu = false runs the plain convolution.
++      auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
++      if (!config) {
++        config = dyn_cast_or_null<DictionaryAttr>(
++            op->getDiscardableAttr("mhlo.backend_config"));
++      }
++      if (auto applySilu =
++              config ? dyn_cast_or_null<BoolAttr>(config.get("apply_silu"))
++                     : nullptr) {
++        result.setApplySiluAttr(applySilu);
++      }
+       rewriter.replaceOp(op, {adaptor.getOperands()[0], result.getResult()});
+       return success();
+     }
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -4157,7 +4157,7 @@ createOp(FlatbufferObjectCache &cache, CausalConv1dUpdateOp op) {
+       tensor(op.getHasInitialState()),
+       cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
+                                   std::nullopt),
+-      op.getStateSlots() ? tensor(op.getStateSlots()) : 0);
++      op.getStateSlots() ? tensor(op.getStateSlots()) : 0, op.getApplySilu());
+ }
+ 
+ ::flatbuffers::Offset<::tt::target::ttnn::StatePoolUpdateOp>
+diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
+--- a/runtime/lib/ttnn/operations/transformer/recurrent.cpp
++++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
+@@ -95,7 +95,8 @@ void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
+       utils::getDataType(op->output()),
+       op->state_slots() ? std::optional<::ttnn::Tensor>(tiled(
+                               get(op->state_slots()), ::ttnn::DataType::INT32))
+-                        : std::nullopt);
++                        : std::nullopt,
++      op->apply_silu());
+   put(pool, op->output(), output);
+ }
+ 

@@ -1,0 +1,79 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
+@@ -21,6 +21,7 @@ namespace {
+ 
+ struct ConvParams {
+     DataType output_dtype = DataType::BFLOAT16;
++    bool apply_silu = true;
+ };
+ 
+ struct ConvInputs {
+@@ -183,7 +184,7 @@ ProgramDescriptor ConvOperation::create_descriptor(
+     KernelDescriptor compute{
+         .kernel_source = kernel_dir + "compute/causal_conv1d_update.cpp",
+         .core_ranges = cores,
+-        .compile_time_args = {channel_tiles, num_workers, batch_size * tokens},
++        .compile_time_args = {channel_tiles, num_workers, batch_size * tokens, params.apply_silu},
+         .config = ComputeConfigDescriptor{
+             .math_fidelity = tt::tt_metal::MathFidelity::HiFi2,
+             .fp32_dest_acc_en = false,
+@@ -218,10 +219,11 @@ Tensor causal_conv1d_update(
+     const Tensor& state_indices,
+     const Tensor& has_initial_state,
+     DataType output_dtype,
+-    const std::optional<Tensor>& state_slots) {
++    const std::optional<Tensor>& state_slots,
++    bool apply_silu) {
+     using Op = prim::ConvOperation;
+     return device_operation::launch<Op>(
+-        {.output_dtype = output_dtype},
++        {.output_dtype = output_dtype, .apply_silu = apply_silu},
+         {.input = input,
+          .state = state,
+          .weight = weight,
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
+@@ -11,7 +11,7 @@ namespace ttnn::transformer {
+ 
+ // One four-tap depthwise causal convolution decode step. The operation
+ // gathers and updates request state in place, and returns silu(conv) in
+-// output_dtype, BFLOAT16 or FLOAT32.
++// output_dtype, BFLOAT16 or FLOAT32, or conv itself without apply_silu.
+ //
+ // With state_slots, an int32 [B, T], each of the B states takes T steps, as
+ // in a speculative verify of T draft tokens: input holds T rows per state,
+@@ -24,6 +24,7 @@ Tensor causal_conv1d_update(
+     const Tensor& state_indices,
+     const Tensor& has_initial_state,
+     tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT16,
+-    const std::optional<Tensor>& state_slots = std::nullopt);
++    const std::optional<Tensor>& state_slots = std::nullopt,
++    bool apply_silu = true);
+ 
+ }  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
+@@ -36,6 +36,7 @@ ALWI void rows_silu(uint32_t idst) {
+ void kernel_main() {
+     constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
+     constexpr uint32_t num_workers = get_compile_time_arg_val(1);
++    constexpr bool apply_silu = get_compile_time_arg_val(3);
+     const uint32_t worker = get_arg_val<uint32_t>(0);
+ 
+     constexpr uint32_t operands = tt::CBIndex::c_0;
+@@ -65,8 +66,10 @@ void kernel_main() {
+         rows_add(0, 2, 0);
+         rows_add(4, 6, 4);
+         rows_add(0, 4, 0);
+-        silu_tile_init();
+-        rows_silu(0);
++        if constexpr (apply_silu) {
++            silu_tile_init();
++            rows_silu(0);
++        }
+ 
+         tile_regs_commit();
+         tile_regs_wait();
