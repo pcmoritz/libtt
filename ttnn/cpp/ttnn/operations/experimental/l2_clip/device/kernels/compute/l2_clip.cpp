@@ -5,8 +5,8 @@
 // of 16, its rows' left and right faces') sums of squares, from its group's
 // scaled input tiles copied one by one into tile 1 (the scale's row
 // broadcast down tile 2); tile 4 keeps the output tile's own scaled input,
-// tile 6 the row scale spread across each row; then
-// output = v * min(1, threshold * rsqrt(sum + eps^2)) * row_scale.
+// tile 6 the row scale spread across each row, tile 3 the gate; then
+// output = v * min(1, threshold * rsqrt(sum + eps^2)) * row_scale * sigmoid(gate).
 //
 // SFPU lane layout (fp32 DST): vector d (0..7) of a face holds, in lane l
 // (0..31), the face's element at row 4 * (d / 2) + l / 8, column
@@ -42,6 +42,7 @@ inline __attribute__((always_inline)) void static_for(F&& f) {
 
 #ifdef TRISC_MATH
 #include "sfpi.h"
+#include "ckernel_sfpu_exp.h"
 
 namespace {
 
@@ -183,16 +184,24 @@ sfpi_inline vFloat clip_factor(vFloat partial, uint32_t threshold_bits, uint32_t
     return f;
 }
 
-// Tile 4 (the kept scaled input) times its rows' factors.
-template <bool half_tile_groups, bool row_scaled>
+// Tile 4 (the kept scaled input) times its rows' clip factors (with `clip`)
+// and row scales (with `row_scaled`).
+template <bool half_tile_groups, bool row_scaled, bool clip>
 inline void apply_clip(uint32_t threshold_bits, uint32_t eps_bits) {
+    if constexpr (!row_scaled && !clip) {
+        return;
+    }
     _llk_math_eltwise_sfpu_start_(0);
     static_for<8>([&](auto BB) {
         constexpr uint32_t B = decltype(BB)::value;
-        vFloat left = clip_factor(dst_reg[B], threshold_bits, eps_bits);
-        vFloat right = left;
-        if constexpr (half_tile_groups) {
-            right = clip_factor(dst_reg[8 + B], threshold_bits, eps_bits);
+        vFloat left = 1.0f;
+        vFloat right = 1.0f;
+        if constexpr (clip) {
+            left = clip_factor(dst_reg[B], threshold_bits, eps_bits);
+            right = left;
+            if constexpr (half_tile_groups) {
+                right = clip_factor(dst_reg[8 + B], threshold_bits, eps_bits);
+            }
         }
         if constexpr (row_scaled) {
             const vFloat s = dst_reg[band(6, B, 0, 0)];
@@ -203,6 +212,27 @@ inline void apply_clip(uint32_t threshold_bits, uint32_t eps_bits) {
         dst_reg[band(4, B, 0, 1)] = vFloat(dst_reg[band(4, B, 0, 1)]) * left;
         dst_reg[band(4, B, 1, 0)] = vFloat(dst_reg[band(4, B, 1, 0)]) * right;
         dst_reg[band(4, B, 1, 1)] = vFloat(dst_reg[band(4, B, 1, 1)]) * right;
+    });
+    _llk_math_eltwise_sfpu_done_();
+}
+
+sfpi_inline vFloat recip_positive(vFloat x) {
+    vFloat y = sfpi::approx_recip(x);
+    y = y * (2.0f - x * y);
+    y = y * (2.0f - x * y);
+    return y;
+}
+
+// Tile 4 times sigmoid(tile 3), every element, in FP32.
+inline void apply_gate() {
+    _llk_math_eltwise_sfpu_start_(0);
+    static_for<32>([](auto ii) {
+        constexpr uint32_t i = decltype(ii)::value;
+        vFloat g = dst_reg[3 * 32 + i];
+        v_if(g < -80.0f) { g = -80.0f; }
+        v_endif;
+        const vFloat s = recip_positive(1.0f + ckernel::sfpu::_sfpu_exp_fp32_accurate_(-g));
+        dst_reg[4 * 32 + i] = vFloat(dst_reg[4 * 32 + i]) * s;
     });
     _llk_math_eltwise_sfpu_done_();
 }
@@ -236,6 +266,9 @@ void kernel_main() {
     constexpr bool has_row_scale = get_named_compile_time_arg_val("has_row_scale") != 0;
     constexpr uint32_t threshold = get_named_compile_time_arg_val("threshold");
     constexpr uint32_t eps_squared = get_named_compile_time_arg_val("eps_squared");
+    constexpr uint32_t cb_gate = get_named_compile_time_arg_val("cb_gate");
+    constexpr bool has_gate = get_named_compile_time_arg_val("has_gate") != 0;
+    constexpr bool clip = get_named_compile_time_arg_val("clip") != 0;
 
     compute_kernel_hw_startup(cb_input, cb_input, cb_output);
     for (uint32_t unit = start; unit < start + count; ++unit) {
@@ -246,6 +279,9 @@ void kernel_main() {
         }
         if constexpr (has_row_scale) {
             cb_wait_front(cb_row_scale, 1);
+        }
+        if constexpr (has_gate) {
+            cb_wait_front(cb_gate, 1);
         }
         tile_regs_acquire();
         if constexpr (has_row_scale) {
@@ -263,9 +299,16 @@ void kernel_main() {
                 sfpu_init();
             }
             MATH((scale_and_keep<has_scale>(k == own)));
-            MATH((add_squares<half_tile_groups>(k == 0)));
+            if constexpr (clip) {
+                MATH((add_squares<half_tile_groups>(k == 0)));
+            }
         }
-        MATH((apply_clip<half_tile_groups, has_row_scale>(threshold, eps_squared)));
+        MATH((apply_clip<half_tile_groups, has_row_scale, clip>(threshold, eps_squared)));
+        if constexpr (has_gate) {
+            copy_from(cb_gate, 0, 3);
+            sfpu_init();
+            MATH((apply_gate()));
+        }
         tile_regs_commit();
 
         cb_reserve_back(cb_output, 1);
@@ -280,6 +323,9 @@ void kernel_main() {
         }
         if constexpr (has_row_scale) {
             cb_pop_front(cb_row_scale, 1);
+        }
+        if constexpr (has_gate) {
+            cb_pop_front(cb_gate, 1);
         }
     }
 }

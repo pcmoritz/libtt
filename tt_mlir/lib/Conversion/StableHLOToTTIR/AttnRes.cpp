@@ -77,9 +77,9 @@ public:
   }
 };
 
-// tt.l2_clip(input[, scale][, row_scale]) with backend_config group,
-// threshold, epsilon, offset, width, has_scale and has_row_scale:
-// ttir.l2_clip.
+// tt.l2_clip(input[, scale][, row_scale][, gate]) with backend_config group,
+// threshold, epsilon, offset, width, has_scale, has_row_scale and optionally
+// has_gate and gate_offset: ttir.l2_clip.
 class L2ClipConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
   using OpConversionPattern<stablehlo::CustomCallOp>::OpConversionPattern;
@@ -104,15 +104,19 @@ public:
     auto epsilon = config ? config.getAs<FloatAttr>("epsilon") : nullptr;
     auto hasScale = config ? config.getAs<BoolAttr>("has_scale") : nullptr;
     auto hasRowScale = config ? config.getAs<BoolAttr>("has_row_scale") : nullptr;
+    // Optional: a sigmoid gate read from gate_offset of another tensor.
+    auto hasGate = config ? config.getAs<BoolAttr>("has_gate") : nullptr;
+    auto gateOffset = config ? config.getAs<IntegerAttr>("gate_offset") : nullptr;
+    const bool gated = hasGate && hasGate.getValue();
     if (!group || !offset || !width || !threshold || !epsilon || !hasScale ||
-        !hasRowScale) {
+        !hasRowScale || (gated && !gateOffset)) {
       return rewriter.notifyMatchFailure(
           op, "tt.l2_clip takes group, offset, width, threshold, epsilon, "
               "has_scale and has_row_scale");
     }
     ValueRange operands = adaptor.getOperands();
-    const size_t expected =
-        1 + size_t{hasScale.getValue()} + size_t{hasRowScale.getValue()};
+    const size_t expected = 1 + size_t{hasScale.getValue()} +
+                            size_t{hasRowScale.getValue()} + size_t{gated};
     if (operands.size() != expected || op->getNumResults() != 1) {
       return rewriter.notifyMatchFailure(
           op, "tt.l2_clip's operands are the input, the scale and the row "
@@ -121,6 +125,7 @@ public:
     size_t next = 1;
     Value scale = hasScale.getValue() ? operands[next++] : Value();
     Value rowScale = hasRowScale.getValue() ? operands[next++] : Value();
+    Value gate = gated ? operands[next++] : Value();
     auto type = getTypeConverter()->convertType(op.getResult(0).getType());
     auto i64 = [&](IntegerAttr attr) {
       return rewriter.getI64IntegerAttr(attr.getInt());
@@ -129,7 +134,8 @@ public:
         op, type, operands[0], scale, rowScale, i64(group),
         rewriter.getF32FloatAttr(threshold.getValueAsDouble()),
         rewriter.getF32FloatAttr(epsilon.getValueAsDouble()), i64(offset),
-        i64(width));
+        i64(width), gate,
+        rewriter.getI64IntegerAttr(gated ? gateOffset.getInt() : 0));
     return success();
   }
 };

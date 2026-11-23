@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -2458,6 +2458,26 @@ def TTIR_RMSNormGatedOp : TTIR_NamedOp<"rms_norm_gated"> {
+@@ -2458,6 +2458,30 @@ def TTIR_RMSNormGatedOp : TTIR_NamedOp<"rms_norm_gated"> {
    let results = (outs AnyRankedTensor:$output);
  }
  
@@ -10,8 +10,10 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +  let description = [{
 +    v = input[..., offset : offset + width] * scale, then
 +    output = v * min(1, threshold / sqrt(sum_group(v^2) + epsilon^2)) *
-+    row_scale over each group of `group` columns, in FP32: Inkling 2's query,
-+    key and relative-projection clips. scale is [width], row_scale [rows, 1].
++    row_scale * sigmoid(gate[..., gate_offset : gate_offset + width]) over
++    each group of `group` columns, in FP32: Inkling 2's query, key and
++    relative-projection clips, and with an infinite threshold its attention
++    output gate. scale is [width], row_scale [rows, 1], the gate as wide.
 +    libtt's tt.l2_clip custom call (sglang_tpu_kernels.py) forms it.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$input,
@@ -21,7 +23,9 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       F32Attr:$threshold,
 +                       F32Attr:$epsilon,
 +                       I64Attr:$offset,
-+                       I64Attr:$width);
++                       I64Attr:$width,
++                       Optional<AnyRankedTensor>:$gate,
++                       DefaultValuedAttr<I64Attr, "0">:$gate_offset);
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
@@ -31,7 +35,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -2929,6 +2929,22 @@ def TTNN_RMSNormGatedOp : TTNN_Op<"rms_norm_gated", [OpModelExempt]> {
+@@ -2929,6 +2929,24 @@ def TTNN_RMSNormGatedOp : TTNN_Op<"rms_norm_gated", [OpModelExempt]> {
    let results = (outs AnyRankedTensor:$output);
  }
  
@@ -47,7 +51,9 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       F32Attr:$threshold,
 +                       F32Attr:$epsilon,
 +                       I64Attr:$offset,
-+                       I64Attr:$width);
++                       I64Attr:$width,
++                       Optional<AnyRankedTensor>:$gate,
++                       DefaultValuedAttr<I64Attr, "0">:$gate_offset);
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
@@ -57,7 +63,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
 --- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
-@@ -61,6 +61,18 @@ table DitRMSNormUnaryFusedOp {
+@@ -61,6 +61,20 @@ table DitRMSNormUnaryFusedOp {
    out: tt.target.ttnn.TensorRef;
  }
  
@@ -71,6 +77,8 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 +  offset: uint32;
 +  width: uint32;
 +  out: tt.target.ttnn.TensorRef;
++  gate: tt.target.ttnn.TensorRef;
++  gate_offset: uint32;
 +}
 +
  table AttnResOp {
@@ -103,7 +111,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -1311,6 +1311,22 @@ public:
+@@ -1311,6 +1311,23 @@ public:
    }
  };
  
@@ -118,7 +126,8 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +        op, this->getTypeConverter()->convertType(op.getType()),
 +        adaptor.getInput(), adaptor.getScale(), adaptor.getRowScale(),
 +        op.getGroupAttr(), op.getThresholdAttr(), op.getEpsilonAttr(),
-+        op.getOffsetAttr(), op.getWidthAttr());
++        op.getOffsetAttr(), op.getWidthAttr(), adaptor.getGate(),
++        op.getGateOffsetAttr());
 +    return success();
 +  }
 +};
@@ -126,7 +135,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class AttnResOpConversionPattern
      : public OpConversionPattern<ttir::AttnResOp> {
  public:
-@@ -4384,6 +4400,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4384,6 +4401,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             RMSNormResidualOpConversionPattern,
             RMSNormGatedOpConversionPattern,
             AttnResOpConversionPattern,
@@ -137,7 +146,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -2108,6 +2108,25 @@ createOp(FlatbufferObjectCache &cache, RMSNormGatedOp op) {
+@@ -2108,6 +2108,28 @@ createOp(FlatbufferObjectCache &cache, RMSNormGatedOp op) {
        static_cast<uint32_t>(op.getGateOffset()));
  }
  
@@ -151,19 +160,22 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      op.getScale() ? tensor(op.getScale()) : 0;
 +  ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> rowScale =
 +      op.getRowScale() ? tensor(op.getRowScale()) : 0;
++  ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> gate =
++      op.getGate() ? tensor(op.getGate()) : 0;
 +  return ::tt::target::ttnn::CreateL2ClipOp(
 +      *cache.fbb, tensor(op.getInput()), scale, rowScale,
 +      static_cast<uint32_t>(op.getGroup()), op.getThreshold().convertToFloat(),
 +      op.getEpsilon().convertToFloat(), static_cast<uint32_t>(op.getOffset()),
 +      static_cast<uint32_t>(op.getWidth()),
 +      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
-+                                  std::nullopt));
++                                  std::nullopt),
++      gate, static_cast<uint32_t>(op.getGateOffset()));
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::AttnResOp>
  createOp(FlatbufferObjectCache &cache, AttnResOp op) {
    auto tensor = [&](Value value) {
-@@ -5817,6 +5836,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5817,6 +5839,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
                             locInfo);
    }

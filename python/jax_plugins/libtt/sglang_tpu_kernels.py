@@ -1171,9 +1171,11 @@ def patch_inkling2_attn_res(module):
 
 
 def patch_inkling2_l2_clip(module):
-    """Inkling 2's per-head L2 clips of its queries, keys and relative projections on
-    `ttnn::experimental::l2_clip` (the `tt.l2_clip` call), one program where the typecast, the
-    scale, the RMS norm and the abs, minimum, sign and tau products took seven."""
+    """Inkling 2's per-head L2 clips of its queries, keys and relative projections, and its
+    attention output gate (an infinite threshold and a sigmoid gate), on
+    `ttnn::experimental::l2_clip` (the `tt.l2_clip` call): one program where the typecast, the
+    scale, the RMS norm and the abs, minimum, sign and tau products took seven, reading its
+    columns (and the gate's) in place from the projection."""
     import functools
     from typing import Optional
 
@@ -1193,36 +1195,49 @@ def patch_inkling2_l2_clip(module):
             x: jax.Array,
             scale: Optional[jax.Array],
             row_scale: Optional[jax.Array],
+            gate: Optional[jax.Array],
             group: int,
             threshold: float,
             eps: float,
+            offset: int,
+            width: int,
+            gate_offset: int,
         ) -> jax.Array:
             operands = [x]
             if scale is not None:
                 operands.append(scale.astype(jnp.float32))
             if row_scale is not None:
                 operands.append(row_scale.astype(jnp.float32).reshape(-1, 1))
-            return jax.ffi.ffi_call("tt.l2_clip", jax.ShapeDtypeStruct(x.shape, x.dtype))(
+            if gate is not None:
+                operands.append(gate)
+            return jax.ffi.ffi_call("tt.l2_clip", jax.ShapeDtypeStruct((*x.shape[:-1], width), x.dtype))(
                 *operands,
                 group=np.int64(group),
-                offset=np.int64(0),
-                width=np.int64(x.shape[-1]),
+                offset=np.int64(offset),
+                width=np.int64(width),
                 threshold=np.float32(threshold),
                 epsilon=np.float32(eps),
                 has_scale=scale is not None,
                 has_row_scale=row_scale is not None,
+                has_gate=gate is not None,
+                gate_offset=np.int64(gate_offset),
             )
 
         op = pallas.jax_op("libtt::inkling2_l2_clip", _op)
 
         @op.register_fake
-        def fake(x, scale, row_scale, group, threshold, eps):
-            return torch.empty_like(x)
+        def fake(x, scale, row_scale, gate, group, threshold, eps, offset, width, gate_offset):
+            return x.new_empty((*x.shape[:-1], width))
 
         return op
 
-    def l2_clip_tpu(x, *, group, threshold, eps, scale=None, row_scale=None):
-        return l2_clip_op()(x, scale, row_scale, int(group), float(threshold), float(eps))
+    def l2_clip_tpu(
+        x, *, group, threshold, eps, scale=None, row_scale=None, offset=0, width=None, gate=None, gate_offset=0
+    ):
+        width = x.shape[-1] - offset if width is None else width
+        return l2_clip_op()(
+            x, scale, row_scale, gate, int(group), float(threshold), float(eps), int(offset), int(width), int(gate_offset)
+        )
 
     module.supports_l2_clip = supports_l2_clip
     module.l2_clip_tpu = l2_clip_tpu

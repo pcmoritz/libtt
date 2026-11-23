@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -38,6 +39,11 @@ struct ClipCase {
     bool row_scale;
     DataType in_dtype;
     DataType out_dtype;
+    // With gate_columns, a gate of that width read from gate_offset; an
+    // infinite threshold with clip false.
+    uint32_t gate_columns = 0;
+    uint32_t gate_offset = 0;
+    bool clip = true;
 };
 
 class L2ClipTest : public ::testing::Test {
@@ -64,7 +70,7 @@ protected:
     size_t check(const ClipCase& k, uint32_t seed) {
         std::mt19937 rng(seed);
         std::normal_distribution<float> normal(0.0f, 1.0f);
-        std::vector<float> x(k.rows * k.columns), scale(k.width), row_scale(k.rows);
+        std::vector<float> x(k.rows * k.columns), scale(k.width), row_scale(k.rows), gate(k.rows * k.gate_columns);
         for (float& v : x) {
             v = normal(rng);
         }
@@ -74,8 +80,12 @@ protected:
         for (float& v : row_scale) {
             v = 1.0f + 0.2f * std::fabs(normal(rng));
         }
+        for (float& v : gate) {
+            v = 2.0f * normal(rng);
+        }
         // About the groups' typical norm, so that some clip and some do not.
-        const float threshold = std::sqrt(static_cast<float>(k.group)) * 1.05f;
+        const float threshold =
+            k.clip ? std::sqrt(static_cast<float>(k.group)) * 1.05f : std::numeric_limits<float>::infinity();
         constexpr float eps = 1e-6f;
         const auto input = device_tensor(x, ttnn::Shape({k.rows, k.columns}), k.in_dtype);
         std::optional<ttnn::Tensor> scale_tensor, row_scale_tensor;
@@ -85,8 +95,13 @@ protected:
         if (k.row_scale) {
             row_scale_tensor = device_tensor(row_scale, ttnn::Shape({k.rows, 1}), DataType::FLOAT32);
         }
+        std::optional<ttnn::Tensor> gate_tensor;
+        if (k.gate_columns != 0) {
+            gate_tensor = device_tensor(gate, ttnn::Shape({k.rows, k.gate_columns}), k.in_dtype);
+        }
         const auto out = ttnn::experimental::l2_clip(
-            input, k.group, threshold, eps, k.offset, k.width, scale_tensor, row_scale_tensor, k.out_dtype);
+            input, k.group, threshold, eps, k.offset, k.width, scale_tensor, row_scale_tensor, k.out_dtype,
+            gate_tensor, k.gate_offset);
         EXPECT_EQ(out.logical_shape(), ttnn::Shape({k.rows, k.width}));
         const auto got = out.cpu().to_vector<float>();
         size_t wrong = 0, clipped = 0;
@@ -98,10 +113,13 @@ protected:
                     v[c] = static_cast<double>(x[r * k.columns + k.offset + g + c]) * (k.scale ? scale[g + c] : 1.0);
                     sum += v[c] * v[c];
                 }
-                const double f = std::min(1.0, threshold / std::sqrt(sum + double(eps) * eps));
+                const double f = k.clip ? std::min(1.0, threshold / std::sqrt(sum + double(eps) * eps)) : 1.0;
                 clipped += f < 1.0;
                 for (uint32_t c = 0; c < k.group; ++c) {
-                    const double want = v[c] * f * (k.row_scale ? row_scale[r] : 1.0);
+                    double want = v[c] * f * (k.row_scale ? row_scale[r] : 1.0);
+                    if (k.gate_columns != 0) {
+                        want /= 1.0 + std::exp(-static_cast<double>(gate[r * k.gate_columns + k.gate_offset + g + c]));
+                    }
                     const double value = got[r * k.width + g + c];
                     const double tolerance = k.out_dtype == DataType::BFLOAT16 ? std::ldexp(std::fabs(want), -7) + 1e-30
                                                                                 : std::fabs(want) * 1e-5 + 1e-30;
@@ -112,7 +130,9 @@ protected:
                 }
             }
         }
-        EXPECT_GT(clipped, 0u);
+        if (k.clip) {
+            EXPECT_GT(clipped, 0u);
+        }
         return wrong;
     }
 
@@ -131,6 +151,11 @@ TEST_F(L2ClipTest, MatchesReference) {
         {4, 2176, 0, 768, 128, true, true, DataType::BFLOAT16, DataType::BFLOAT16},
         {33, 2176, 1280, 96, 16, true, false, DataType::FLOAT32, DataType::FLOAT32},
         {40, 512, 128, 256, 64, false, true, DataType::FLOAT32, DataType::BFLOAT16},
+        // The attention output gate: x * sigmoid(the projection's gate
+        // columns 1376 ..), no clip; and a gate with a clip.
+        {1, 768, 0, 768, 32, false, false, DataType::BFLOAT16, DataType::BFLOAT16, 2176, 1376, false},
+        {4, 768, 0, 768, 32, false, false, DataType::BFLOAT16, DataType::BFLOAT16, 2176, 1376, false},
+        {2, 2176, 0, 768, 128, true, true, DataType::BFLOAT16, DataType::BFLOAT16, 2176, 1376, true},
     };
     uint32_t seed = 1;
     for (const auto& k : cases) {

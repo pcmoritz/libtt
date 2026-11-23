@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,12 +31,14 @@ struct L2ClipParams {
     uint32_t offset = 0;
     uint32_t width = 0;
     DataType dtype = DataType::BFLOAT16;
+    uint32_t gate_offset = 0;
 };
 
 struct L2ClipInputs {
     Tensor input;
     std::optional<Tensor> scale;
     std::optional<Tensor> row_scale;
+    std::optional<Tensor> gate;
 };
 
 struct L2ClipOperation {
@@ -98,6 +101,18 @@ void L2ClipOperation::validate_on_program_cache_miss(const operation_attributes_
             rows,
             in.row_scale->logical_shape());
     }
+    if (in.gate.has_value()) {
+        validate_tensor(*in.gate, "gate");
+        const uint32_t gate_columns = in.gate->logical_shape()[-1];
+        TT_FATAL(
+            in.gate->padded_shape().volume() / in.gate->padded_shape()[-1] ==
+                    in.input.padded_shape().volume() / in.input.padded_shape()[-1] &&
+                params.gate_offset % TILE_WIDTH == 0 && params.gate_offset + params.width <= gate_columns,
+            "the gate must have the input's rows and columns {} .. {} tile aligned within its {}",
+            params.gate_offset,
+            params.gate_offset + params.width,
+            gate_columns);
+    }
     TT_FATAL(is_float(params.dtype), "the output must be BFLOAT16 or FLOAT32");
 }
 
@@ -120,6 +135,7 @@ ProgramDescriptor L2ClipOperation::create_descriptor(
     // Absent operands stand in as the input in the kernels' arguments.
     const auto& scale = in.scale.has_value() ? in.scale->mesh_tensor() : input;
     const auto& row_scale = in.row_scale.has_value() ? in.row_scale->mesh_tensor() : input;
+    const auto& gate = in.gate.has_value() ? in.gate->mesh_tensor() : input;
     auto* device = &input.mutable_device();
 
     // Work units are output tiles, row-major: tile row u / Nt, column u % Nt.
@@ -149,12 +165,18 @@ ProgramDescriptor L2ClipOperation::create_descriptor(
     make_cb(1, Gt, scale.dtype());     // their scale tiles
     make_cb(2, 1, row_scale.dtype());  // the unit's row scale tile
     make_cb(3, 1, params.dtype);       // its output tile
+    make_cb(4, 1, gate.dtype());       // its gate tile
 
     const std::vector<std::pair<std::string, uint32_t>> common_args = {
         {"cb_input", 0},
         {"cb_scale", 1},
         {"cb_row_scale", 2},
         {"cb_output", 3},
+        {"cb_gate", 4},
+        {"gate_Nt", gate.padded_shape()[-1] / TILE_WIDTH},
+        {"gate_offset_tiles", params.gate_offset / TILE_WIDTH},
+        {"has_gate", in.gate.has_value() ? 1u : 0u},
+        {"clip", std::isfinite(params.threshold) ? 1u : 0u},
         {"Nt", Nt},
         {"in_Nt", in_Nt},
         {"offset_tiles", params.offset / TILE_WIDTH},
@@ -171,6 +193,7 @@ ProgramDescriptor L2ClipOperation::create_descriptor(
     TensorAccessorArgs(input).append_to(reader_args);
     TensorAccessorArgs(scale).append_to(reader_args);
     TensorAccessorArgs(row_scale).append_to(reader_args);
+    TensorAccessorArgs(gate).append_to(reader_args);
     KernelDescriptor reader{
         .kernel_source = kernel_dir + "dataflow/reader_l2_clip.cpp",
         .core_ranges = cores,
@@ -192,7 +215,8 @@ ProgramDescriptor L2ClipOperation::create_descriptor(
         .dst_full_sync_en = true,
         .math_approx_mode = false};
     compute_config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
-    for (auto [cb, dtype] : {std::pair{0, input.dtype()}, {1, scale.dtype()}, {2, row_scale.dtype()}}) {
+    for (auto [cb, dtype] :
+         {std::pair{0, input.dtype()}, {1, scale.dtype()}, {2, row_scale.dtype()}, {4, gate.dtype()}}) {
         if (dtype == DataType::FLOAT32) {
             compute_config.unpack_to_dest_mode[cb] = UnpackToDestMode::UnpackToDestFp32;
         }
@@ -207,7 +231,7 @@ ProgramDescriptor L2ClipOperation::create_descriptor(
     for (uint32_t i = 0; i < num_cores; ++i) {
         const uint32_t start = i * base + std::min(i, extra);
         const uint32_t count = base + (i < extra ? 1 : 0);
-        reader.emplace_runtime_args(core_list[i], {start, count, input, scale, row_scale});
+        reader.emplace_runtime_args(core_list[i], {start, count, input, scale, row_scale, gate});
         writer.emplace_runtime_args(core_list[i], {start, count, output});
         compute.emplace_runtime_args(core_list[i], {start, count});
     }
@@ -231,7 +255,9 @@ ttnn::Tensor l2_clip(
     uint32_t width,
     const std::optional<ttnn::Tensor>& scale,
     const std::optional<ttnn::Tensor>& row_scale,
-    std::optional<tt::tt_metal::DataType> dtype) {
+    std::optional<tt::tt_metal::DataType> dtype,
+    const std::optional<ttnn::Tensor>& gate,
+    uint32_t gate_offset) {
     using Op = prim::L2ClipOperation;
     const uint32_t columns = input.logical_shape()[-1];
     return device_operation::launch<Op>(
@@ -240,8 +266,9 @@ ttnn::Tensor l2_clip(
          .epsilon = epsilon,
          .offset = offset,
          .width = width != 0 ? width : columns - offset,
-         .dtype = dtype.value_or(input.dtype())},
-        {.input = input, .scale = scale, .row_scale = row_scale});
+         .dtype = dtype.value_or(input.dtype()),
+         .gate_offset = gate_offset},
+        {.input = input, .scale = scale, .row_scale = row_scale, .gate = gate});
 }
 
 }  // namespace ttnn::experimental
