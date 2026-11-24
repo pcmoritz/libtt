@@ -32,9 +32,9 @@
 //   s1, s3       [E_local, I] f32 the gate and up projections' scales,
 //   s2           [E_local, H] f32 and the down projections'.
 // This lowering chunks the tokens, builds
-// the expert-to-device mapping, and sums each token's slots with its weights in
-// one matmul accumulated in FP32; the kernel reads the ids as they are and
-// skips padding's negative ids.
+// the expert-to-device mapping, and sums each token's slots with its weights
+// (ttir.moe_combine up to a tile of slots, else one matmul accumulated in
+// FP32); the kernel reads the ids as they are and skips padding's negative ids.
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
@@ -307,6 +307,14 @@ public:
               : ttcore::DataTypeAttr(),
           activationLimit, activationBeta);
 
+      // Up to a tile of slots, ttir.moe_combine sums each token's in one
+      // program, reading the slots as moe_compute writes them (row-major).
+      if (k * t <= 32) {
+        outputs.push_back(rewriter.create<ttir::MoeCombineOp>(
+            loc, typed(chunkWeights, {t, hidden}, outType.getElementType()),
+            slots, chunkWeights));
+        continue;
+      }
       // Each token's weighted sum of its slots as one matmul in FP32: row i
       // of the placement matrix holds token i's weight j at column j * t + i,
       // its weights spread over t columns each and masked to its own column.
