@@ -196,23 +196,24 @@ inline void normalize_tile() {
 }
 
 // Phase B3: slots `count` of the gather tile in DST tile 7 added into the
-// token rows of DST tile j (set by the first group).
+// token rows of DST tile j (set by the first group), summed in a register.
 template <uint32_t j, bool first>
 inline void sum_hidden_slots(uint32_t count) {
     _llk_math_eltwise_sfpu_start_(0);
     static_for<4>([&](auto xx) {
         constexpr uint32_t x = decltype(xx)::value;
-        static_for<8>([&](auto ss) {
-            constexpr uint32_t s = decltype(ss)::value;
+        vFloat sum = dst_reg[slot(7, 0, x)];
+        static_for<7>([&](auto ss) {
+            constexpr uint32_t s = decltype(ss)::value + 1;
             if (s < count) {
-                vFloat v = dst_reg[slot(7, s, x)];
-                if (first && s == 0) {
-                    dst_reg[pos(j, x)] = v;
-                } else {
-                    dst_reg[pos(j, x)] = vFloat(dst_reg[pos(j, x)]) + v;
-                }
+                sum += dst_reg[slot(7, s, x)];
             }
         });
+        if constexpr (first) {
+            dst_reg[pos(j, x)] = sum;
+        } else {
+            dst_reg[pos(j, x)] = vFloat(dst_reg[pos(j, x)]) + sum;
+        }
     });
     _llk_math_eltwise_sfpu_done_();
 }
@@ -465,12 +466,15 @@ void kernel_main() {
     if (first) {
         cb_wait_front(cb_gather2, groups * QR);
         tile_regs_acquire();
+        // One copy init and one SFPU init for every gather tile.
+        reconfig_data_format_srca(cb_gather2);
+        copy_init(cb_gather2);
+        sfpu_init();
         for (uint32_t group = 0; group < groups; ++group) {
             const uint32_t count = K - 8 * group < 8 ? K - 8 * group : 8;
             static_for<QR>([&](auto jj) {
                 constexpr uint32_t j = decltype(jj)::value;
-                copy_from(cb_gather2, group * QR + j, 7);
-                sfpu_init();
+                copy_tile(cb_gather2, group * QR + j, 7);
                 if (group == 0) {
                     MATH((sum_hidden_slots<j, true>(count)));
                 } else {

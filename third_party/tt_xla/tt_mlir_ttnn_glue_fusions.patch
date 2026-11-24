@@ -80,7 +80,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
      if (restrictToMatmulProducer &&
          !unaryOp.getInput().getDefiningOp<MatmulOp>() &&
          !unaryOp.getInput().getDefiningOp<LinearOp>()) {
-@@ -290,6 +311,144 @@ private:
+@@ -290,6 +311,147 @@ private:
  };
  } // namespace
  
@@ -185,8 +185,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +    llvm::SmallVector<std::pair<mlir::OpOperand *, TypecastOp>> upcasts;
 +    for (mlir::OpOperand *operand : {&op.getAMutable(), &op.getBMutable()}) {
 +      auto cast = operand->get().template getDefiningOp<TypecastOp>();
-+      if (cast && cast.getResult().hasOneUse() &&
-+          elementTypeOf(cast.getInput()).isBF16() &&
++      if (cast && elementTypeOf(cast.getInput()).isBF16() &&
 +          elementTypeOf(cast.getResult()).isF32()) {
 +        upcasts.emplace_back(operand, cast);
 +      }
@@ -214,8 +213,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +      }
 +      op.setComputeConfigAttr(config);
 +    });
++    // A cast that other ops read (a weight a loop's passes share) stays
++    // until the last of them reads the BF16 tensor too.
 +    for (auto &[operand, cast] : upcasts) {
-+      rewriter.eraseOp(cast);
++      if (cast.getResult().use_empty()) {
++        rewriter.eraseOp(cast);
++      }
 +    }
 +    return mlir::success();
 +  }
@@ -225,7 +228,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  namespace {
  class TTNNBinaryOpOutputActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseUnary> {
-@@ -320,7 +479,8 @@ public:
+@@ -320,7 +482,8 @@ public:
  
  private:
    bool isFusable(ElementwiseUnary unaryOp) const {
@@ -235,7 +238,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
    }
  
    ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
-@@ -329,11 +489,137 @@ private:
+@@ -329,11 +492,137 @@ private:
        return {};
      }
  
@@ -374,7 +377,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -705,8 +991,13 @@ public:
+@@ -705,8 +994,13 @@ public:
        firstPatterns.add<TTNNBinaryOpInputsActivation>(
            &getContext(), /*restrictToMatmulProducer=*/true);
      }
