@@ -212,10 +212,14 @@ def linear_cross_entropy_fwd(x, labels, w, *, reduction="sum", **_):
     for start, size in _token_chunks(x.shape[0]):
         logits = jnp.dot(x[start : start + size], w)
         targets = labels[start : start + size]
-        loss = jax.ffi.ffi_call("tt.cross_entropy_fw", jax.ShapeDtypeStruct((1, 1, size, 1), logits.dtype))(
+        # FP32 losses, like the TPU kernel's: TorchTitan's fused loss zeroes the hidden state of each ignored
+        # token (label -100) and subtracts log(vocabulary) per such row from the sum. BF16 losses round that
+        # row's loss (log(248,320) = 12.4225 becomes 12.4375), and with most tokens ignored in chat data the
+        # leftover moved the logged loss by 0.006 to 0.2.
+        loss = jax.ffi.ffi_call("tt.cross_entropy_fw", jax.ShapeDtypeStruct((1, 1, size, 1), jnp.float32))(
             logits[None, None], targets[None]
         )
-        loss = loss.reshape(size).astype(jnp.float32)
+        loss = loss.reshape(size)
         target_logits = jnp.take_along_axis(logits, targets[:, None], axis=1)[:, 0].astype(jnp.float32)
         losses.append(loss)
         logsumexps.append(loss + target_logits)
