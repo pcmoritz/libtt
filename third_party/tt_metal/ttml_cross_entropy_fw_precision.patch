@@ -1,85 +1,32 @@
-diff --git tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.cpp tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.cpp
---- tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.cpp
-+++ tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.cpp
-@@ -5,12 +5,26 @@
- #include "cross_entropy_fw.hpp"
- 
- #include "device/cross_entropy_fw_device_operation.hpp"
-+#include "ttnn/tensor/tensor_ops.hpp"  // ttnn::create_device_tensor
- 
- namespace ttml::metal {
- 
--ttnn::Tensor cross_entropy_fw(const ttnn::Tensor& input_tensor, const ttnn::Tensor& target_tensor) {
--    auto result = ttnn::prim::ttml_cross_entropy_fw(input_tensor, target_tensor);
--    return result;
-+ttnn::Tensor cross_entropy_fw(
-+    const ttnn::Tensor& input_tensor,
-+    const ttnn::Tensor& target_tensor,
-+    std::optional<tt::tt_metal::DataType> output_dtype) {
-+    std::optional<ttnn::Tensor> output;
-+    if (output_dtype.has_value() && *output_dtype != input_tensor.dtype()) {
-+        auto output_shape = input_tensor.logical_shape();
-+        output_shape[-1] = 1U;
-+        output = ttnn::create_device_tensor(
-+            tt::tt_metal::TensorSpec(
-+                ttnn::Shape(output_shape),
-+                tt::tt_metal::TensorLayout(
-+                    *output_dtype, tt::tt_metal::Layout::TILE, input_tensor.memory_config())),
-+            input_tensor.device());
-+    }
-+    return ttnn::prim::ttml_cross_entropy_fw(input_tensor, target_tensor, output);
- }
- 
- }  // namespace ttml::metal
-diff --git tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.hpp tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.hpp
---- tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.hpp
-+++ tt-train/sources/ttml/metal/ops/cross_entropy_fw/cross_entropy_fw.hpp
-@@ -14,9 +14,12 @@
- // read); its position contributes a zero logit, i.e. loss = logsumexp for that row — the same
- // convention select_target_logit uses for out-of-shard targets. There is no ignore_index:
- // every position in the logical shape contributes to the loss.
-+//
-+// The loss is computed in FP32; output_dtype (BFLOAT16 or FLOAT32, default the input's) is the dtype it is
-+// written in.
- ttnn::Tensor cross_entropy_fw(
--    const ttnn::Tensor& input,  // logits : model output (N, 1, H, W)
--    const ttnn::Tensor& target  // target : ground truth (N, H)
--);
-+    const ttnn::Tensor& input,   // logits : model output (N, 1, H, W)
-+    const ttnn::Tensor& target,  // target : ground truth (N, H)
-+    std::optional<tt::tt_metal::DataType> output_dtype = std::nullopt);
- 
- }  // namespace ttml::metal
 diff --git tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_device_operation.cpp tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_device_operation.cpp
 --- tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_device_operation.cpp
 +++ tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_device_operation.cpp
-@@ -46,7 +46,12 @@
+@@ -46,7 +46,11 @@
          input_nc_pages);
  
      if (preallocated_output_tensor.has_value()) {
 -        check_device_tensor(preallocated_output_tensor.value(), "CrossEntropyForward", "Preallocated Output");
-+        // The kernel computes the loss in FP32 and packs it in the output's format.
 +        check_device_tensor(
 +            preallocated_output_tensor.value(),
 +            "CrossEntropyForward",
 +            "Preallocated Output",
-+            {.dtypes = {tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::DataType::FLOAT32}});
++            {.dtypes = {tt::tt_metal::DataType::FLOAT32}});
      }
  }
  
-@@ -82,8 +87,11 @@
-     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
-     const auto& input_tensor = tensor_args.input;
-     const auto& input_logical_shape = input_tensor.logical_shape();
-+    // The output dtype sets the output circular buffer's format.
-+    const auto output_dtype = tensor_args.preallocated_output.has_value() ? tensor_args.preallocated_output->dtype()
-+                                                                          : input_tensor.dtype();
-     auto hash = tt::tt_metal::operation::hash_operation<CrossEntropyForwardDeviceOperation>(
--        args, input_tensor.dtype(), input_logical_shape);
-+        args, input_tensor.dtype(), input_logical_shape, output_dtype);
- 
-     return hash;
+@@ -57,10 +61,11 @@
+     }
+     auto input_logical_shape = tensor_args.input.logical_shape();
+     input_logical_shape[-1] = 1U;
++    // The kernel computes the loss in FP32 and returns it in FP32.
+     return tt::tt_metal::TensorSpec(
+         ttnn::Shape(input_logical_shape),
+         tt::tt_metal::TensorLayout(
+-            tensor_args.input.dtype(), tt::tt_metal::Layout::TILE, tensor_args.input.memory_config()));
++            tt::tt_metal::DataType::FLOAT32, tt::tt_metal::Layout::TILE, tensor_args.input.memory_config()));
  }
+ 
+ CrossEntropyForwardDeviceOperation::tensor_return_value_t CrossEntropyForwardDeviceOperation::create_output_tensors(
 diff --git tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_program_factory.cpp tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_program_factory.cpp
 --- tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_program_factory.cpp
 +++ tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy_fw_program_factory.cpp
@@ -110,7 +57,7 @@ diff --git tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/cross_entropy
  
      uint32_t bfloat16_single_tile_size_bytes = tt::tile_size(tt::DataFormat::Float16_b);
 -    uint32_t float32_single_tile_size_bytes = tt::tile_size(tt::DataFormat::Float32);
-+    // The loss leaves DST in FP32; the output tensor's dtype (BF16 or FP32) sets its packed format.
++    // The loss is computed and returned in FP32 (see compute_output_specs).
 +    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
 +    uint32_t output_single_tile_size_bytes = tt::tile_size(output_data_format);
  

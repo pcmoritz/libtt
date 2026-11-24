@@ -1,58 +1,18 @@
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -3312,7 +3312,8 @@
-       hardcodes its circular buffers to `Float16_b`. `target` holds the class
-       indices as `(N, H)` and reaches the kernel as row-major uint32.
- 
--      The result is shaped `(N, 1, H, 1)`.
-+      The result is shaped `(N, 1, H, 1)`. The kernel computes the loss in
-+      fp32; an f32 result keeps it, any other result type gets it in bf16.
-     }];
- 
-     let arguments = (ins AnyRankedTensor:$input,
-@@ -3323,7 +3324,8 @@
-     let extraClassDeclaration = [{
-       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
-         return wa::TTNNOperandsWorkaroundsFactory::
--            createCrossEntropyForwardOpOperandsWorkarounds();
-+            createCrossEntropyForwardOpOperandsWorkarounds(
-+                getResult().getType());
-       }
-     }];
- 
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-@@ -257,7 +257,7 @@
- 
-   // Create workarounds for cross entropy forward op operands.
-   static TTNNOperandsWorkarounds
--  createCrossEntropyForwardOpOperandsWorkarounds();
-+  createCrossEntropyForwardOpOperandsWorkarounds(RankedTensorType resultType);
- 
-   // Create workarounds for cross entropy backward op operands.
-   static TTNNOperandsWorkarounds
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -196,10 +196,12 @@
+@@ -196,8 +196,8 @@
  // Factory method to create a set of workarounds for CrossEntropyForwardOp.
  //
  // They encode the calling convention of ttml::metal::cross_entropy_fw. It
 -// requires the class indices to be row-major pages of uint32s, input and output
 -// to be tiled bf16, and every operand to live in DRAM.
-+// requires the class indices to be row-major pages of uint32s, input to be
-+// tiled bf16, output to be tiled bf16 or f32, and every operand to live in
-+// DRAM. The kernel computes the loss in fp32, so an f32 result keeps it.
++// requires the class indices to be row-major pages of uint32s and input to be
++// tiled bf16, returns tiled f32 losses, and keeps every operand in DRAM.
  TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
--    createCrossEntropyForwardOpOperandsWorkarounds() {
-+    createCrossEntropyForwardOpOperandsWorkarounds(
-+        RankedTensorType resultType) {
+     createCrossEntropyForwardOpOperandsWorkarounds() {
    TTNNOperandWorkarounds inputTiledBf16Workaround;
-   inputTiledBf16Workaround.tensorLayoutWorkaround = Layout::Tile;
-   inputTiledBf16Workaround.tensorDataTypeWorkaround =
-@@ -212,16 +214,18 @@
+@@ -212,16 +212,15 @@
        ttcore::DataType::UInt32;
    targetRowMajorUInt32Workaround.tensorBufferTypeWorkaround = BufferType::DRAM;
  
@@ -61,41 +21,16 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 -  outputTiledBf16Workaround.tensorDataTypeWorkaround =
 -      ttcore::DataType::BFloat16;
 -  outputTiledBf16Workaround.tensorBufferTypeWorkaround = BufferType::DRAM;
-+  TTNNOperandWorkarounds outputTiledWorkaround;
-+  outputTiledWorkaround.tensorLayoutWorkaround = Layout::Tile;
-+  if (!resultType.getElementType().isF32()) {
-+    outputTiledWorkaround.tensorDataTypeWorkaround =
-+        ttcore::DataType::BFloat16;
-+  }
-+  outputTiledWorkaround.tensorBufferTypeWorkaround = BufferType::DRAM;
++  TTNNOperandWorkarounds outputTiledF32Workaround;
++  outputTiledF32Workaround.tensorLayoutWorkaround = Layout::Tile;
++  outputTiledF32Workaround.tensorDataTypeWorkaround = ttcore::DataType::Float32;
++  outputTiledF32Workaround.tensorBufferTypeWorkaround = BufferType::DRAM;
  
    return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds(0, 0)
        .addInputOperandWorkaround(inputTiledBf16Workaround)
        .addInputOperandWorkaround(targetRowMajorUInt32Workaround)
 -      .addOutputOperandWorkaround(outputTiledBf16Workaround);
-+      .addOutputOperandWorkaround(outputTiledWorkaround);
++      .addOutputOperandWorkaround(outputTiledF32Workaround);
  }
  
  // Factory method to create a set of workarounds for CrossEntropyBackwardOp.
-diff --git a/runtime/lib/ttnn/operations/ttml/cross_entropy_fw.cpp b/runtime/lib/ttnn/operations/ttml/cross_entropy_fw.cpp
---- a/runtime/lib/ttnn/operations/ttml/cross_entropy_fw.cpp
-+++ b/runtime/lib/ttnn/operations/ttml/cross_entropy_fw.cpp
-@@ -4,6 +4,7 @@
- 
- #include "operations/ttml/cross_entropy_fw.h"
- #include "metal/ops/cross_entropy_fw/cross_entropy_fw.hpp" // ttml::metal::cross_entropy_fw
-+#include "tt/runtime/detail/ttnn/operations/utils.h"
- 
- namespace tt::runtime::ttnn::operations::ttml {
- 
-@@ -16,7 +17,9 @@
-   const ::ttnn::Tensor &target =
-       tensorPool.getTTNNTensorAndValidate(op->target());
- 
--  ::ttnn::Tensor output = ::ttml::metal::cross_entropy_fw(input, target);
-+  // The kernel computes the loss in fp32 and writes it in the result's dtype.
-+  ::ttnn::Tensor output = ::ttml::metal::cross_entropy_fw(
-+      input, target, utils::getDataType(op->out()));
- 
-   tensorPool.insertTTNNTensorAndValidate(op->out(), output);
- }
