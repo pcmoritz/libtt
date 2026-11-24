@@ -1,7 +1,8 @@
 """tt-train's fused cross-entropy, as JAX custom calls and as TorchTitan's fused loss.
 
 `tt.cross_entropy_fw` and `tt.cross_entropy_bw` run ttml::metal::cross_entropy_fw
-and cross_entropy_bw on BF16 logits [N, 1, H, W]: per-row losses, and
+and cross_entropy_bw on BF16 logits [N, 1, H, W]: per-row losses (computed in
+FP32, returned in the call's result dtype, BF16 or FP32), and
 (softmax - one_hot) * scaler * grad. In TPU compatibility mode they replace the
 Pallas linear softmax cross-entropy behind TorchTitan's fused loss
 (`jax_plugins.libtt.torchtitan_tpu_kernels`), a chunk of tokens at a time.
@@ -61,6 +62,27 @@ def test_custom_calls_match_reference():
     assert _relative_error(np.asarray(dlogits)[0, 0], dlogits_want) < 1e-2
 
 
+@pytest.mark.parametrize("vocab, scale", [(1000, 3.0), (248320, 2.0)])
+def test_forward_losses_in_float32(vocab, scale):
+    # An FP32 result keeps the kernel's FP32 loss: losses of 2 to 20 to within about 4e-6, where BF16 results are
+    # up to 0.06 apart. 1,000 columns take the masked, L1-resident path; Qwen3.5's 248,320 stream through L1.
+    rows = 64
+    rng = np.random.default_rng(4)
+    logits = (rng.standard_normal((rows, vocab)) * scale).astype(ml_dtypes.bfloat16)
+    labels = rng.integers(0, vocab, rows).astype(np.int32)
+    _, _, losses_want = _softmax_and_losses(logits, labels)
+
+    def forward(logits, labels):
+        return jax.ffi.ffi_call("tt.cross_entropy_fw", jax.ShapeDtypeStruct((1, 1, rows, 1), jnp.float32))(
+            logits[None, None], labels[None]
+        )
+
+    losses = jax.jit(forward)(*_device(logits, labels))
+    assert losses.dtype == jnp.float32
+    err = np.asarray(losses).reshape(rows).astype(np.float64) - losses_want
+    assert np.max(np.abs(err)) < 2e-5, np.max(np.abs(err))
+
+
 @pytest.mark.parametrize("reduction", ["sum", "mean", "none"])
 def test_fused_loss_functions(monkeypatch, reduction):
     # TorchTitan's fused output layer and loss, two chunks of tokens and four
@@ -116,12 +138,12 @@ def test_weight_gradient_adds_up_in_float32(monkeypatch):
     assert np.max(np.abs(np.asarray(dw)[:, 1].astype(np.float64) - want)) / want < 5e-3
 
 
-def test_ignored_rows_add_exactly_log_vocabulary():
+def test_ignored_rows_add_log_vocabulary():
     # TorchTitan's fused loss zeroes the hidden state of each ignored token (label -100), so the row's logits are
     # uniform, and subtracts log(vocabulary) per ignored row from the kernel's sum. With Qwen3.5's 248,320-token
-    # vocabulary, log(V) = 12.4225 rounds to 12.4375 in BF16, the kernel's output dtype: 0.015 left over per ignored
-    # row, which with most tokens ignored (prompts, padding) raised the logged loss of a fine-tuning run by 0.006
-    # (MetaMathQA) to about 0.2 (tool calling). The forward now returns log(V) exactly for such rows.
+    # vocabulary, log(V) = 12.4225 rounded to 12.4375 in BF16, the kernel's former output dtype: 0.015 left over per
+    # ignored row, which with most tokens ignored (prompts, padding) raised the logged loss of a fine-tuning run by
+    # 0.006 (MetaMathQA) to about 0.2 (tool calling). The forward's losses are FP32, as the TPU kernel's are.
     rows, vocab = 64, 248320
     rng = np.random.default_rng(3)
     x = (rng.standard_normal((rows, HIDDEN)) * 0.5).astype(ml_dtypes.bfloat16)
@@ -135,8 +157,9 @@ def test_ignored_rows_add_exactly_log_vocabulary():
     losses, _ = jax.jit(lambda x, l, w: torchtitan_tpu_kernels.linear_cross_entropy_fwd(x, l, w, reduction="none"))(
         tx, tl, tw
     )
+    assert losses.dtype == jnp.float32
     losses = np.asarray(losses).astype(np.float64)
-    assert np.all(losses[ignored] == np.float32(np.log(vocab)))
+    assert np.max(np.abs(losses[ignored] - np.log(vocab))) <= 2 * np.spacing(np.float32(np.log(vocab)))
     # The sum TorchTitan forms: the kernel's sum less log(V) per ignored row, against the valid rows' FP64 losses.
     got = losses.sum() - ignored.sum() * np.float64(np.float32(np.log(vocab)))
     want = losses_want[~ignored].sum()
@@ -145,9 +168,9 @@ def test_ignored_rows_add_exactly_log_vocabulary():
 
 def test_forward_loss_on_a_large_vocabulary():
     # Qwen3.5's 248,320-token vocabulary with each row's target near the top (probability about 0.8, a loss of
-    # about 0.2, as late in fine-tuning). Each row's loss is BF16 (about 0.001 apart at 0.2) and the kernel's
-    # log-sum-exp scatters by a few thousandths per row; what must not appear is a bias that every row shares:
-    # Blackhole's BF16-precision exp in the sum of exponentials added about 0.001 on average here.
+    # about 0.2, as late in fine-tuning). The log-sum-exp is within about 3e-5 of FP64 in every row. Blackhole's
+    # BF16-precision exp in the sum of exponentials added about 0.001 to every row here, and BF16 losses scattered
+    # each row by a few thousandths.
     rows, vocab = 64, 248320
     rng = np.random.default_rng(2)
     logits = rng.normal(0.0, 2.0, (rows, vocab))
@@ -165,5 +188,5 @@ def test_forward_loss_on_a_large_vocabulary():
         tx, tl, tw
     )
     err = np.asarray(lse).astype(np.float64) - lse_want
-    assert abs(err.mean()) < 8e-4, err.mean()
-    assert np.max(np.abs(err)) < 1e-2, np.max(np.abs(err))
+    assert abs(err.mean()) < 1e-4, err.mean()
+    assert np.max(np.abs(err)) < 2e-4, np.max(np.abs(err))
