@@ -114,3 +114,56 @@ def test_weight_gradient_adds_up_in_float32(monkeypatch):
     _, dw = jax.jit(torchtitan_tpu_kernels.linear_cross_entropy_bwd)(jnp.ones((), jnp.float32), lse, tx, tl, tw)
     want = (32 * 2048 + (tokens - 32)) / VOCAB
     assert np.max(np.abs(np.asarray(dw)[:, 1].astype(np.float64) - want)) / want < 5e-3
+
+
+def test_ignored_rows_add_exactly_log_vocabulary():
+    # TorchTitan's fused loss zeroes the hidden state of each ignored token (label -100), so the row's logits are
+    # uniform, and subtracts log(vocabulary) per ignored row from the kernel's sum. With Qwen3.5's 248,320-token
+    # vocabulary, log(V) = 12.4225 rounds to 12.4375 in BF16, the kernel's output dtype: 0.015 left over per ignored
+    # row, which with most tokens ignored (prompts, padding) raised the logged loss of a fine-tuning run by 0.006
+    # (MetaMathQA) to about 0.2 (tool calling). The forward now returns log(V) exactly for such rows.
+    rows, vocab = 64, 248320
+    rng = np.random.default_rng(3)
+    x = (rng.standard_normal((rows, HIDDEN)) * 0.5).astype(ml_dtypes.bfloat16)
+    ignored = np.arange(rows) % 4 != 0  # three in four rows, as in chat data
+    x[ignored] = 0
+    w = (rng.standard_normal((HIDDEN, vocab)) * 0.1).astype(ml_dtypes.bfloat16)
+    labels = np.where(ignored, 0, rng.integers(0, vocab, rows)).astype(np.int32)
+    _, _, losses_want = _softmax_and_losses(x.astype(np.float64) @ w.astype(np.float64), labels)
+
+    tx, tw, tl = _device(x, w, labels)
+    losses, _ = jax.jit(lambda x, l, w: torchtitan_tpu_kernels.linear_cross_entropy_fwd(x, l, w, reduction="none"))(
+        tx, tl, tw
+    )
+    losses = np.asarray(losses).astype(np.float64)
+    assert np.all(losses[ignored] == np.float32(np.log(vocab)))
+    # The sum TorchTitan forms: the kernel's sum less log(V) per ignored row, against the valid rows' FP64 losses.
+    got = losses.sum() - ignored.sum() * np.float64(np.float32(np.log(vocab)))
+    want = losses_want[~ignored].sum()
+    assert abs(got - want) / (~ignored).sum() < 2e-3, (got, want)
+
+
+def test_forward_loss_on_a_large_vocabulary():
+    # Qwen3.5's 248,320-token vocabulary with each row's target near the top (probability about 0.8, a loss of
+    # about 0.2, as late in fine-tuning). Each row's loss is BF16 (about 0.001 apart at 0.2) and the kernel's
+    # log-sum-exp scatters by a few thousandths per row; what must not appear is a bias that every row shares:
+    # Blackhole's BF16-precision exp in the sum of exponentials added about 0.001 on average here.
+    rows, vocab = 64, 248320
+    rng = np.random.default_rng(2)
+    logits = rng.normal(0.0, 2.0, (rows, vocab))
+    labels = rng.integers(0, vocab, rows).astype(np.int32)
+    others = logits.copy()
+    others[np.arange(rows), labels] = -np.inf
+    others = others.astype(ml_dtypes.bfloat16).astype(np.float64)
+    logits[np.arange(rows), labels] = np.log(np.sum(np.exp(others), -1)) + np.log(0.8 / 0.2)
+    w = logits.astype(ml_dtypes.bfloat16)  # the output layer reproduces it: x is the identity
+    x = np.eye(rows, dtype=ml_dtypes.bfloat16)
+    _, lse_want, _ = _softmax_and_losses(w.astype(np.float64), labels)
+
+    tx, tw, tl = _device(x, w, labels)
+    _, lse = jax.jit(lambda x, l, w: torchtitan_tpu_kernels.linear_cross_entropy_fwd(x, l, w, reduction="none"))(
+        tx, tl, tw
+    )
+    err = np.asarray(lse).astype(np.float64) - lse_want
+    assert abs(err.mean()) < 8e-4, err.mean()
+    assert np.max(np.abs(err)) < 1e-2, np.max(np.abs(err))

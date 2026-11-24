@@ -1,0 +1,30 @@
+diff --git tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/kernels/compute/cross_entropy_fw_kernel.cpp tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/kernels/compute/cross_entropy_fw_kernel.cpp
+--- tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/kernels/compute/cross_entropy_fw_kernel.cpp
++++ tt-train/sources/ttml/metal/ops/cross_entropy_fw/device/kernels/compute/cross_entropy_fw_kernel.cpp
+@@ -215,11 +215,10 @@
+         sub_binary_tile_init();
+         sub_binary_tile(working_register, max_value_register, working_register);  // subtract max value from each tile
+ 
+-        // exp via the shared SDPA path: on Blackhole this dispatches to the hand-scheduled
+-        // TTI exp (~3x cheaper on the SFPU than the generic accurate exp_tile at bf16
+-        // output precision); on Wormhole it falls back to the same accurate sfpi exp.
+-        sdpa_exp_tile_init();
+-        sdpa_exp_tile(working_register);  // calculate exp for each tile in tile register
++        // The accurate exp (FP32 in FP32 DST): the loss is log(sum(exp)) - x[target], and the SDPA path's
++        // BF16-precision exp biased that sum, and so the loss, upward on Blackhole.
++        exp_tile_init</*approx*/ false>();
++        exp_tile</*approx*/ false>(working_register);  // calculate exp for each tile in tile register
+ 
+         if constexpr (do_mask_w) {
+             if (col + 1 == Wt) {
+@@ -281,8 +280,8 @@
+             sub_binary_tile(
+                 working_register, max_value_register, working_register);  // subtract max value from each tile
+ 
+-            sdpa_exp_tile_init();
+-            sdpa_exp_tile(working_register);  // calculate exp for each tile in tile register
++            exp_tile_init</*approx*/ false>();
++            exp_tile</*approx*/ false>(working_register);  // calculate exp for each tile in tile register
+ 
+             if constexpr (do_mask_w) {
+                 if (col + 1 == Wt) {

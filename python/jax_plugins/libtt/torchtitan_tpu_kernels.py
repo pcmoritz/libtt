@@ -46,6 +46,8 @@ TorchTitan does, and interleaves the BF16 results back with another: the same
 values and gradients, bit for bit.
 """
 
+import math
+
 SPLASH_MODULE = "torchtitan.experiments.tpu.kernels.splash_attention"
 LOSS_KERNEL_MODULE = "tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel"
 RMS_NORM_GATED_MODULE = "torchtitan.experiments.tpu.kernels.rms_norm_gated"
@@ -216,6 +218,12 @@ def linear_cross_entropy_fwd(x, labels, w, *, reduction="sum", **_):
             logits[None, None], targets[None]
         )
         loss = loss.reshape(size).astype(jnp.float32)
+        # TorchTitan's fused loss zeroes the hidden state of each ignored token (label -100) and subtracts
+        # log(vocabulary) per such row from the sum, as the TPU kernel returns that row's loss, uniform logits,
+        # exactly in FP32. tt-train's kernel returns BF16 losses, which round it (log(248,320) = 12.4225 becomes
+        # 12.4375), and with most tokens ignored in chat data the leftover moved the logged loss by 0.006 to 0.2.
+        zero_rows = jnp.all(x[start : start + size] == 0, axis=-1)
+        loss = jnp.where(zero_rows, jnp.float32(math.log(w.shape[-1])), loss)
         target_logits = jnp.take_along_axis(logits, targets[:, None], axis=1)[:, 0].astype(jnp.float32)
         losses.append(loss)
         logsumexps.append(loss + target_logits)
