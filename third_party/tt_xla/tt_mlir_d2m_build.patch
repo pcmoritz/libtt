@@ -1789,7 +1789,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  
      // Express the data rearrangement as a view. The allocator will later
      // decide whether to insert a CB allocation for any GenericOp that
-@@ -5493,6 +5540,223 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5493,6 +5540,236 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
  #include "ttmlir/Conversion/Passes.h.inc"
  
  namespace {
@@ -1815,8 +1815,10 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +    for (auto [inner, g] : {std::pair(outer.getLhs(), outer.getRhs()),
 +                            std::pair(outer.getRhs(), outer.getLhs())}) {
 +      auto innerMul = inner.getDefiningOp<ttir::MultiplyOp>();
++      auto innerType = mlir::cast<RankedTensorType>(inner.getType());
 +      if (!innerMul || !innerMul->hasOneUse() || !isRowFactor(g, outType) ||
-+          inner.getType() != outer.getType()) {
++          innerType.getShape() != outType.getShape() ||
++          innerType.getElementType() != outType.getElementType()) {
 +        continue;
 +      }
 +      Value a, f;
@@ -1829,7 +1831,9 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      } else {
 +        continue;
 +      }
-+      if (a.getType() != outType) {
++      auto aType = mlir::cast<RankedTensorType>(a.getType());
++      if (aType.getShape() != outType.getShape() ||
++          aType.getElementType() != outType.getElementType()) {
 +        continue;
 +      }
 +      auto fType = mlir::cast<RankedTensorType>(f.getType());
@@ -1849,8 +1853,17 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +        continue;
 +      }
 +      OpBuilder b(outer);
-+      auto fgType = RankedTensorType::get(shape, outType.getElementType(),
-+                                          outType.getEncoding());
++      // The factor product's own layout (a TTNN encoding describes the tile
++      // grid of its shape).
++      Attribute fgEncoding = fType.getShape() == ArrayRef<int64_t>(shape)
++                                 ? fType.getEncoding()
++                                 : gType.getEncoding();
++      if (auto layout =
++              mlir::dyn_cast_if_present<ttnn::TTNNLayoutAttr>(fgEncoding)) {
++        fgEncoding = ttnn::TTNNLayoutAttr::Builder(layout, shape).build();
++      }
++      auto fgType =
++          RankedTensorType::get(shape, outType.getElementType(), fgEncoding);
 +      Value fg = b.create<ttir::MultiplyOp>(outer.getLoc(), fgType, f, g);
 +      Value result = b.create<ttir::MultiplyOp>(outer.getLoc(), outType, a, fg);
 +      outer.getResult().replaceAllUsesWith(result);
@@ -2013,13 +2026,15 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  class TTIRToD2MPass final
      : public mlir::tt::impl::TTIRToD2MBase<TTIRToD2MPass> {
  public:
-@@ -5521,6 +5785,13 @@ public:
+@@ -5521,6 +5798,15 @@ public:
    void runOnOperation() override {
      MLIRContext *ctx = &getContext();
      ModuleOp module = getOperation();
 +    if (std::getenv("LIBTT_D2M_ALGEBRA")) {
 +      simplifySignMinAbs(module);
-+      reassociateRowFactors(module);
++      if (!std::getenv("LIBTT_D2M_NO_REASSOC")) {
++        reassociateRowFactors(module);
++      }
 +    }
 +    if (std::getenv("LIBTT_D2M_MERGE_SPREAD")) {
 +      rematerializeSharedElementwise(module);
@@ -2256,7 +2271,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
  template <typename SrcOp, typename DestOp>
  class TTNNToTTIROpConversionPattern : public mlir::OpConversionPattern<SrcOp> {
    using mlir::OpConversionPattern<SrcOp>::OpConversionPattern;
-@@ -31,8 +112,74 @@ public:
+@@ -31,8 +112,77 @@ public:
      auto outputType = mlir::cast<mlir::RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResult().getType()));
  
@@ -2284,6 +2299,9 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +                        mlir::tt::canExpandTTNNActivations(post);
 +      if (fp32In && expandable && outputType.getElementType().isBF16()) {
 +        mlir::Location loc = srcOp.getLoc();
++        // Keeps the BF16 result's encoding: D2M then packs the FP32 result
++        // into a BF16 CB (one rounding) and the typecast is a no-op; a real
++        // FP32->BF16 tile typecast is not D2M's narrowing path.
 +        auto wide = mlir::RankedTensorType::get(
 +            outputType.getShape(), rewriter.getF32Type(),
 +            outputType.getEncoding());
@@ -2333,7 +2351,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
  
      return mlir::success();
    }
-@@ -71,6 +218,38 @@ public:
+@@ -71,6 +221,38 @@ public:
                    })))
              : nullptr;
  
@@ -2372,7 +2390,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
      rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType, adaptor.getInput(),
                                          srcOp.getKeepDim(), dimArgAttr);
  
-@@ -242,12 +421,29 @@ public:
+@@ -242,12 +424,29 @@ public:
      auto outputType = mlir::cast<mlir::RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResult().getType()));
  
@@ -2403,7 +2421,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
          /*layout=*/mlir::tt::ttcore::MetalLayoutAttr{});
  
      return mlir::success();
-@@ -398,8 +594,7 @@ addElementwiseBinaryOpsConversionPatterns(mlir::MLIRContext *ctx,
+@@ -398,8 +597,7 @@ addElementwiseBinaryOpsConversionPatterns(mlir::MLIRContext *ctx,
        TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::BitwiseXorOp,
                                               mlir::tt::ttir::BitwiseXorOp>,
        TTNNToTTIRElementwiseConversionPattern<
@@ -2413,7 +2431,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
        TTNNToTTIRElementwiseConversionPattern<
            mlir::tt::ttnn::LogicalRightShiftOp,
            mlir::tt::ttir::LogicalRightShiftOp>,
-@@ -429,10 +624,209 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
+@@ -429,10 +627,209 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
  
  namespace mlir::tt {
  
@@ -4070,7 +4088,15 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
 diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
-@@ -14,6 +14,7 @@
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <cstdlib>
+ #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+ 
+ #include "ttmlir/Asserts.h"
+@@ -14,6 +15,7 @@
  #include "mlir/Dialect/Arith/IR/Arith.h"
  #include "mlir/Dialect/Func/IR/FuncOps.h"
  #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -4078,7 +4104,41 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
  #include "mlir/Dialect/SCF/IR/SCF.h"
  #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
  
-@@ -86,6 +87,12 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -83,9 +85,46 @@ collectDstAccesses(GenericOp gOp, Region &region,
+     return std::nullopt;
+   };
+ 
++  // libtt: a binary SFPU op may write its result over an operand that dies
++  // in it (all its remaining uses are this op's operands), as the LLKs allow
++  // (odst == dst0), instead of taking a fresh slice (v * v reuses v).
++  auto getDyingOperandSlice =
++      [&](OperandLoadStoreRegisterOpInterface op) -> std::optional<int> {
++    SmallVector<int64_t> dstOperands = op.getOperandsLoadFromDstRegister();
++    if (dstOperands.size() < 2 || std::getenv("LIBTT_D2M_NO_DYING_REUSE")) {
++      return std::nullopt;
++    }
++    for (int64_t operandIdx : dstOperands) {
++      if (op.isScalarOperand(operandIdx)) {
++        continue;
++      }
++      Value v = op->getOperand(operandIdx);
++      auto *defOp = v.getDefiningOp();
++      if (!defOp) {
++        continue;
++      }
++      auto *it = dstIntermediates.find(defOp);
++      auto remainingIt = remainingUses.find(defOp);
++      if (it == dstIntermediates.end() || remainingIt == remainingUses.end()) {
++        continue;
++      }
++      int64_t here = llvm::count(op->getOperands(), v);
++      if (remainingIt->second == here) {
++        return it->second.dstSlice;
++      }
++    }
++    return std::nullopt;
++  };
++
    auto releaseConsumedIntermediates =
        [&](OperandLoadStoreRegisterOpInterface op,
            std::optional<int> producedDstSlice) {
@@ -4091,7 +4151,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          for (Value operand : op->getOperands()) {
            Operation *defOp = operand.getDefiningOp();
            auto *dstIt = dstIntermediates.find(defOp);
-@@ -185,13 +192,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -185,13 +224,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
      for (auto *user : computeOp->getUsers()) {
        if (auto potentialStore = mlir::dyn_cast<affine::AffineStoreOp>(user);
            notDstMemspace(potentialStore)) {
@@ -4111,7 +4171,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            bool isUnaryOp = computeOp->getNumOperands() == 1;
            bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
            bool isReduction = isTileReductionOp(computeOp);
-@@ -199,7 +209,11 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -199,9 +241,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
                       "in-place DST only supported for unary, tile matmul, "
                       "reductions, and tile+scalar ops");
            dstSlice = getReusableOrFallbackDstSlice();
@@ -4123,8 +4183,13 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
 +          // for, e.g. x * bcast(c) with one CB operand.
            dstSlice = getFirstInputDstSlice();
            dstAllocator.setStoreToDst();
++        } else if (std::optional<int> dying = getDyingOperandSlice(computeOp)) {
++          dstSlice = *dying;
++          dstAllocator.setStoreToDst();
          } else {
-@@ -210,13 +224,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+           dstSlice = static_cast<int>(dstAllocator.allocateOutput());
+           dstAllocator.setStoreToDst();
+@@ -210,13 +259,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
          collectDstStoreAccess(potentialStore, copyInfos, dstSlice,
                                outermostInnerComputeLoop);
        } else if (auto scratchStore = mlir::dyn_cast<memref::StoreOp>(user)) {
@@ -4144,7 +4209,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            bool isUnaryOp = computeOp->getNumOperands() == 1;
            bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
            bool isReduction = isTileReductionOp(computeOp);
-@@ -224,7 +241,11 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -224,9 +276,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
                       "in-place DST only supported for unary, tile matmul, "
                       "reductions, and tile+scalar ops");
            dstSlice = getReusableOrFallbackDstSlice();
@@ -4156,17 +4221,25 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
 +          // for, e.g. x * bcast(c) with one CB operand.
            dstSlice = getFirstInputDstSlice();
            dstAllocator.setStoreToDst();
++        } else if (std::optional<int> dying = getDyingOperandSlice(computeOp)) {
++          dstSlice = *dying;
++          dstAllocator.setStoreToDst();
          } else {
-@@ -244,7 +265,7 @@ collectDstAccesses(GenericOp gOp, Region &region,
+           dstSlice = static_cast<int>(dstAllocator.allocateOutput());
+           dstAllocator.setStoreToDst();
+@@ -244,8 +303,10 @@ collectDstAccesses(GenericOp gOp, Region &region,
          int dstSlice;
          if (computeOp.getDstRegInPlace() || computeOp.isScalarOperand(1)) {
            dstSlice = getReusableOrFallbackDstSlice();
 -        } else if (numLoads >= 2) {
 +        } else if (numLoads >= 1) {
            dstSlice = getFirstInputDstSlice();
++        } else if (std::optional<int> dying = getDyingOperandSlice(computeOp)) {
++          dstSlice = *dying;
          } else {
            dstSlice = static_cast<int>(dstAllocator.allocateOutput());
-@@ -267,7 +288,15 @@ collectDstAccesses(GenericOp gOp, Region &region,
+         }
+@@ -267,7 +328,15 @@ collectDstAccesses(GenericOp gOp, Region &region,
  
      releaseConsumedIntermediates(computeOp, producedDstSlice);
  
@@ -4183,7 +4256,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
      for (int64_t i = 0, n = computeOp.getNumDstScratchSlices(); i < n; ++i) {
        setDstScratchIndex(computeOp, dstAllocator.allocateScratch(),
                           outermostInnerComputeLoop);
-@@ -288,8 +317,36 @@ static void dataCopyGenerate(PatternRewriter &rewriter, Location loc, Value dst,
+@@ -288,8 +357,36 @@ static void dataCopyGenerate(PatternRewriter &rewriter, Location loc, Value dst,
      auto insertionPointAfterLoopNest = rewriter.saveInsertionPoint();
  
      rewriter.setInsertionPoint(loopNestOrOp);
@@ -4222,7 +4295,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
  
      rewriter.restoreInsertionPoint(insertionPointAfterLoopNest);
      emitDstCopyNest(rewriter, loopNestOrOp, dst, copyInfo.stores,
-@@ -355,9 +412,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -355,9 +452,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
            return WalkResult::advance();
          }
  
@@ -4243,7 +4316,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          }
  
          if (loopOp->hasAttr("d2m.dst_access_inserted")) {
-@@ -375,6 +441,37 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -375,6 +481,37 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
              disableL1Acc || !hasTileMatmul(loopOp) ||
              !allTileMatmulOutputsSupportPackerL1Acc(loopOp);
  
@@ -4281,7 +4354,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          auto [copyInfos, dstIntermediates] =
              collectDstAccesses(gOp, *loopRegion, loopOp, dstCapacity);
  
-@@ -385,6 +482,7 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -385,6 +522,7 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
                 const CopyInfoMap &ci, bool disableL1Acc) {
                dataCopyGenerate(rw, loc, dst, ci, disableL1Acc);
              });
@@ -4580,7 +4653,7 @@ diff --git a/lib/Dialect/D2M/Transforms/SFPUTileLoopFission.cpp b/lib/Dialect/D2
 diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 --- a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 +++ b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
-@@ -14,12 +14,137 @@
+@@ -14,12 +14,152 @@
  #include "mlir/Dialect/Linalg/IR/Linalg.h"
  #include "llvm/Support/ErrorHandling.h"
  
@@ -4642,6 +4715,21 @@ diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Uti
 +        auto it = occupants.find(v);
 +        if (!iface.isScalarOperand(idx) && it != occupants.end() &&
 +            it->second.remaining <= 1) {
++          reuseFrom = v;
++          break;
++        }
++      }
++    }
++    // A binary op with no CB operand may write over an operand dying in it.
++    if (!reuseFrom && loads == 0 && !inPlace &&
++        !std::getenv("LIBTT_D2M_NO_DYING_REUSE") &&
++        iface.getOperandsLoadFromDstRegister().size() >= 2) {
++      for (int64_t idx : iface.getOperandsLoadFromDstRegister()) {
++        Value v = o.getOperand(idx);
++        auto it = occupants.find(v);
++        if (!iface.isScalarOperand(idx) && it != occupants.end() &&
++            it->second.remaining ==
++                static_cast<int64_t>(llvm::count(o.getOperands(), v))) {
 +          reuseFrom = v;
 +          break;
 +        }
@@ -4718,7 +4806,7 @@ diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Uti
  namespace {
  
  enum class DstExecutionClass { FPU, SFPU };
-@@ -100,11 +225,24 @@ getMaxDstTilesForLinalgOp(linalg::GenericOp op,
+@@ -100,11 +240,24 @@ getMaxDstTilesForLinalgOp(linalg::GenericOp op,
    }
    // SFPU ops only get half of DST, and whatever is left is split evenly because
    // every output must be resident simultaneously.
@@ -4744,7 +4832,7 @@ diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Uti
    if (tilesOnHW < coResidentTiles) {
      return std::nullopt;
    }
-@@ -380,6 +518,30 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
+@@ -380,6 +533,30 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
      return results;
    }
  
