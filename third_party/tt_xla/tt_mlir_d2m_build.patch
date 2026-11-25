@@ -945,10 +945,12 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
 diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
 --- a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
 +++ b/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
-@@ -2,6 +2,13 @@
+@@ -2,6 +2,15 @@
  //
  // SPDX-License-Identifier: Apache-2.0
  
++#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++#include "mlir/Dialect/SCF/Utils/Utils.h"
 +#include <string>
 +#include <map>
 +#include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -959,7 +961,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -42,7 +49,576 @@ namespace mlir::tt::d2m {
+@@ -42,7 +51,1051 @@ namespace mlir::tt::d2m {
  } // namespace mlir::tt::d2m
  
  namespace {
@@ -1091,7 +1093,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    ++numOps;
 +    return true;
 +  }
- 
++
 +  // scf.if (cond) { fill_tile_init; fill_tile(k, v) } with no else.
 +  static std::optional<std::pair<Value, ttkernel::FillTileOp>>
 +  conditionalFill(Operation *op) {
@@ -1533,10 +1535,485 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +} // namespace
 +
 +namespace {
++// libtt: keep a whole kernel in DST (LIBTT_D2M_DST_RESIDENT).
++//
++// D2M lowers a merged row subgraph phase by phase: each phase loads its
++// operands from CBs into DST, computes, and packs results into L1; a later
++// phase reloads them. For small rows the values fit in DST for the whole
++// kernel (8 FP32 tiles with full-sync DST). This pass fully unrolls the
++// kernel's tile loops, follows DST tile values through the straight-line
++// code, turns packs into and loads from compute-internal CBs into values that
++// stay in DST (a broadcast read becomes an in-DST broadcast), allocates DST
++// slices over the whole kernel with one acquire, and packs the kernel's
++// outputs at the end. A kernel that does not fit is left unchanged.
++struct DstResidentRewriter {
++  func::FuncOp funcOp;
++  static constexpr int kCapacity = 8;
+ 
++  enum class Kind { Load, Bcast, Compute, Fill };
++  struct Val {
++    Operation *def = nullptr;
++    int lastUse = -1;
++    int slot = -1;
++  };
++  struct Access {
++    int readSlot0 = -1, readSlot1 = -1, writeSlot = -1;
++    bool inPlace = false;
++  };
++
++  std::vector<Val> vals;
++
++  static std::optional<int64_t> ci(Value v) { return getConstantIntValue(v); }
++
++  // DST operand roles of a TTKernel op; nullopt if unknown.
++  static std::optional<Access> accessOf(Operation *op) {
++    Access a;
++    auto idx = [&](Value v) -> int {
++      auto c = ci(v);
++      return c ? static_cast<int>(*c) : -2;
++    };
++    if (auto c = dyn_cast<ttkernel::CopyTileOp>(op)) {
++      a.writeSlot = idx(c.getTileIndexDst());
++      return a;
++    }
++    if (isa<ttkernel::UnaryBcastTileOp>(op)) {
++      a.writeSlot = idx(op->getOperand(2));
++      return a;
++    }
++    if (auto p = dyn_cast<ttkernel::PackTileOp>(op)) {
++      a.readSlot0 = idx(p.getDstIndex());
++      return a;
++    }
++    if (auto f = dyn_cast<ttkernel::FillTileOp>(op)) {
++      a.writeSlot = idx(f.getDstIndex());
++      return a;
++    }
++    if (!op->hasTrait<ttkernel::TTKernelSFPUOpTrait>()) {
++      bool usesIndex = llvm::any_of(op->getOperandTypes(),
++                                    [](Type t) { return t.isIndex(); });
++      return usesIndex ? std::nullopt : std::optional<Access>(a);
++    }
++    SmallVector<Value> indices;
++    for (Value v : op->getOperands()) {
++      if (v.getType().isIndex()) {
++        indices.push_back(v);
++      }
++    }
++    if (indices.size() == 3) {
++      a.readSlot0 = idx(indices[0]);
++      a.readSlot1 = idx(indices[1]);
++      a.writeSlot = idx(indices[2]);
++      return a;
++    }
++    if (indices.size() == 1) {
++      a.readSlot0 = idx(indices[0]);
++      a.writeSlot = a.readSlot0;
++      a.inPlace = true;
++      return a;
++    }
++    return std::nullopt;
++  }
++
++  static bool isDstOp(Operation *op) {
++    return isa<ttkernel::CopyTileOp, ttkernel::UnaryBcastTileOp,
++               ttkernel::PackTileOp, ttkernel::FillTileOp>(op) ||
++           op->hasTrait<ttkernel::TTKernelSFPUOpTrait>();
++  }
++
++  static Value cbOf(Operation *op) {
++    if (auto c = dyn_cast<ttkernel::CopyTileOp>(op)) {
++      return c.getCb0();
++    }
++    if (isa<ttkernel::UnaryBcastTileOp>(op)) {
++      return op->getOperand(0);
++    }
++    if (auto p = dyn_cast<ttkernel::PackTileOp>(op)) {
++      return p.getOutCb();
++    }
++    return Value();
++  }
++
++  bool unrollAndFold() {
++    // Innermost loops first; give up on large kernels.
++    int64_t budget = 256;
++    SmallVector<scf::ForOp> loops;
++    funcOp.walk([&](scf::ForOp f) { loops.push_back(f); });
++    for (scf::ForOp f : loops) {
++      auto lb = ci(f.getLowerBound()), ub = ci(f.getUpperBound()),
++           st = ci(f.getStep());
++      if (!lb || !ub || !st || *st <= 0) {
++        return false;
++      }
++      budget -= (*ub - *lb) / *st;
++      if (budget < 0) {
++        return false;
++      }
++    }
++    for (scf::ForOp f : loops) {
++      if (failed(loopUnrollFull(f))) {
++        return false;
++      }
++    }
++    RewritePatternSet patterns(funcOp.getContext());
++    scf::IfOp::getCanonicalizationPatterns(patterns, funcOp.getContext());
++    (void)applyPatternsGreedily(funcOp, std::move(patterns));
++    return true;
++  }
++
++  bool run() {
++    if (funcOp.getBody().getBlocks().size() != 1) {
++      return false;
++    }
++    Block &block = funcOp.getBody().front();
++    // Only kernels with a compute-internal CB (packed and read back here).
++    llvm::DenseSet<Value> packed, loaded;
++    funcOp.walk([&](Operation *op) {
++      if (isa<ttkernel::PackTileOp>(op)) {
++        packed.insert(cbOf(op));
++      } else if (isa<ttkernel::CopyTileOp, ttkernel::UnaryBcastTileOp>(op)) {
++        loaded.insert(cbOf(op));
++      }
++    });
++    llvm::DenseSet<Value> internal;
++    for (Value c : packed) {
++      if (loaded.contains(c)) {
++        internal.insert(c);
++      }
++    }
++    if (internal.empty()) {
++      return false;
++    }
++    // Work on a clone; replace the body only on success.
++    if (!unrollAndFold()) {
++      return false;
++    }
++    SmallVector<Operation *> ops;
++    for (Operation &op : block.without_terminator()) {
++      if (op.getNumRegions() != 0) {
++        return false;
++      }
++      ops.push_back(&op);
++    }
++
++    // Values: slot -> current value; (cb, tile) -> value.
++    std::map<int, int> slotVal;
++    auto cbKey = [](Value cb) { return cb.getAsOpaquePointer(); };
++    std::map<std::pair<const void *, int64_t>, int> regionByCb;
++    struct OpInfo {
++      Operation *op;
++      Access acc;
++      int in0 = -1, in1 = -1, out = -1;
++      bool erase = false, finalPack = false, bcastInternal = false;
++    };
++    std::vector<OpInfo> infos;
++    auto use = [&](int v, int at) {
++      if (v >= 0) {
++        vals[v].lastUse = std::max(vals[v].lastUse, at);
++      }
++    };
++    int end = static_cast<int>(ops.size());
++    for (size_t i = 0; i < ops.size(); ++i) {
++      Operation *op = ops[i];
++      OpInfo info{op, {}};
++      int at = static_cast<int>(i);
++      if (isa<ttkernel::TileRegsAcquireOp, ttkernel::TileRegsReleaseOp,
++              ttkernel::TileRegsCommitOp, ttkernel::TileRegsWaitOp,
++              ttkernel::UnpackStallOnPackOp>(op)) {
++        info.erase = true;
++        infos.push_back(info);
++        continue;
++      }
++      // CB bookkeeping and format setup of internal CBs disappear.
++      if (isa<ttkernel::CBPushBackOp, ttkernel::CBWaitFrontOp,
++              ttkernel::CBPopFrontOp, ttkernel::CBReserveBackOp,
++              ttkernel::ReconfigDataFormatSrcAOp,
++              ttkernel::PackReconfigDataFormatOp, ttkernel::CopyTileInitOp,
++              ttkernel::UnaryBcastInitOp, ttkernel::UnaryBcastUninitOp>(
++              op) &&
++          internal.contains(op->getOperand(0))) {
++        info.erase = true;
++        infos.push_back(info);
++        continue;
++      }
++      if (!isDstOp(op)) {
++        if (llvm::any_of(op->getOperandTypes(),
++                         [](Type t) { return t.isIndex(); }) &&
++            !isPure(op)) {
++          // An unknown op reading DST indices.
++          if (!isa<ttkernel::CBPushBackOp, ttkernel::CBWaitFrontOp,
++                   ttkernel::CBPopFrontOp, ttkernel::CBReserveBackOp>(op)) {
++            return false;
++          }
++        }
++        infos.push_back(info);
++        continue;
++      }
++      auto acc = accessOf(op);
++      if (!acc || acc->readSlot0 == -2 || acc->readSlot1 == -2 ||
++          acc->writeSlot == -2 || acc->writeSlot >= 16 ||
++          acc->readSlot0 >= 16 || acc->readSlot1 >= 16) {
++        return false;
++      }
++      info.acc = *acc;
++      auto cur = [&](int slot) -> int {
++        auto it = slotVal.find(slot);
++        return it == slotVal.end() ? -1 : it->second;
++      };
++      auto fresh = [&](Operation *def) {
++        vals.push_back(Val{def, -1, -1});
++        return static_cast<int>(vals.size() - 1);
++      };
++      if (auto copy = dyn_cast<ttkernel::CopyTileOp>(op)) {
++        auto tile = ci(copy.getTileIndexCb());
++        if (internal.contains(copy.getCb0())) {
++          if (!tile) {
++            return false;
++          }
++          auto it = regionByCb.find({cbKey(copy.getCb0()), *tile});
++          if (it == regionByCb.end()) {
++            return false;
++          }
++          slotVal[acc->writeSlot] = it->second;
++          info.erase = true;
++        } else {
++          info.out = fresh(op);
++          slotVal[acc->writeSlot] = info.out;
++        }
++      } else if (isa<ttkernel::UnaryBcastTileOp>(op)) {
++        if (internal.contains(op->getOperand(0))) {
++          auto tile = ci(op->getOperand(1));
++          auto it = tile ? regionByCb.find({cbKey(op->getOperand(0)), *tile})
++                         : regionByCb.end();
++          auto type = op->getAttrOfType<ttkernel::BcastTypeAttr>("bcast_type");
++          if (it == regionByCb.end() || !type ||
++              type.getValue() != ttkernel::BcastType::Col) {
++            return false;
++          }
++          info.in0 = it->second;
++          use(info.in0, at);
++          info.bcastInternal = true;
++        }
++        info.out = fresh(op);
++        slotVal[acc->writeSlot] = info.out;
++      } else if (auto pack = dyn_cast<ttkernel::PackTileOp>(op)) {
++        int v = cur(acc->readSlot0);
++        if (v < 0) {
++          return false;
++        }
++        auto tile = ci(pack.getOutIndex());
++        if (internal.contains(pack.getOutCb())) {
++          if (!tile) {
++            return false;
++          }
++          regionByCb[{cbKey(pack.getOutCb()), *tile}] = v;
++          info.erase = true;
++        } else {
++          info.in0 = v;
++          info.finalPack = true;
++          use(v, end);
++        }
++      } else if (isa<ttkernel::FillTileOp>(op)) {
++        info.out = fresh(op);
++        slotVal[acc->writeSlot] = info.out;
++      } else {
++        info.in0 = acc->readSlot0 >= 0 ? cur(acc->readSlot0) : -1;
++        info.in1 = acc->readSlot1 >= 0 ? cur(acc->readSlot1) : -1;
++        if ((acc->readSlot0 >= 0 && info.in0 < 0) ||
++            (acc->readSlot1 >= 0 && info.in1 < 0)) {
++          return false;
++        }
++        use(info.in0, at);
++        use(info.in1, at);
++        info.out = fresh(op);
++        slotVal[acc->writeSlot] = info.out;
++      }
++      infos.push_back(info);
++    }
++
++    // Linear-scan allocation over the whole kernel.
++    std::vector<bool> busy(kCapacity, false);
++    auto take = [&]() -> int {
++      for (int s = 0; s < kCapacity; ++s) {
++        if (!busy[s]) {
++          busy[s] = true;
++          return s;
++        }
++      }
++      return -1;
++    };
++    struct Copy {
++      int at, from, to;
++    };
++    std::vector<Copy> copies;
++    for (size_t i = 0; i < infos.size(); ++i) {
++      OpInfo &info = infos[i];
++      int at = static_cast<int>(i);
++      if (info.out >= 0) {
++        Val &out = vals[info.out];
++        int in = info.acc.inPlace ? info.in0 : -1;
++        if (info.acc.inPlace) {
++          if (vals[in].lastUse == at) {
++            out.slot = vals[in].slot;
++          } else {
++            out.slot = take();
++            if (out.slot < 0) {
++              return false;
++            }
++            copies.push_back({at, vals[in].slot, out.slot});
++          }
++        } else {
++          // A binary op may write over an input dying here.
++          for (int v : {info.in0, info.in1}) {
++            if (out.slot < 0 && v >= 0 && vals[v].lastUse == at &&
++                !info.bcastInternal) {
++              out.slot = vals[v].slot;
++            }
++          }
++          if (out.slot < 0) {
++            out.slot = take();
++          }
++          if (out.slot < 0) {
++            return false;
++          }
++        }
++      }
++      // Free values whose last use is this op (unless the slot passed on).
++      for (int v : {info.in0, info.in1}) {
++        if (v >= 0 && vals[v].lastUse == at && vals[v].slot >= 0 &&
++            (info.out < 0 || vals[info.out].slot != vals[v].slot)) {
++          busy[vals[v].slot] = false;
++        }
++      }
++      if (info.out >= 0 && vals[info.out].lastUse < 0) {
++        busy[vals[info.out].slot] = false;
++      }
++    }
++
++    // Rewrite.
++    OpBuilder b(funcOp.getContext());
++    auto idxConst = [&](Operation *at, int v) -> Value {
++      b.setInsertionPoint(at);
++      return b.create<arith::ConstantIndexOp>(at->getLoc(), v);
++    };
++    auto helperCall = [&](Operation *at, StringRef fn, int from, int to) {
++      b.setInsertionPoint(at);
++      OperationState state(at->getLoc(), emitc::VerbatimOp::getOperationName());
++      state.addAttribute(
++          "value", b.getStringAttr(llvm::formatv("MATH((libtt_sfpu::{0}<{1}, "
++                                                 "{2}>()));",
++                                                 fn, from, to)
++                                       .str()));
++      state.addAttribute("libtt.sfpu_def",
++                         b.getStringAttr("// libtt in-DST tile helpers"));
++      b.create(state);
++    };
++    Operation *terminator = block.getTerminator();
++    SmallVector<Operation *> tail;
++    Operation *firstAcquire = nullptr;
++    for (OpInfo &info : infos) {
++      if (isa<ttkernel::TileRegsAcquireOp>(info.op) && !firstAcquire) {
++        firstAcquire = info.op;
++      }
++    }
++    if (!firstAcquire) {
++      return false;
++    }
++    b.setInsertionPoint(firstAcquire);
++    b.create<ttkernel::TileRegsAcquireOp>(firstAcquire->getLoc());
++    for (size_t i = 0; i < infos.size(); ++i) {
++      OpInfo &info = infos[i];
++      int at = static_cast<int>(i);
++      for (const Copy &c : copies) {
++        if (c.at == at) {
++          helperCall(info.op, "copy_dst", c.from, c.to);
++        }
++      }
++      if (info.erase) {
++        continue;
++      }
++      Operation *op = info.op;
++      if (info.bcastInternal) {
++        helperCall(op, "bcast_col0", vals[info.in0].slot,
++                   vals[info.out].slot);
++        info.erase = true;
++        continue;
++      }
++      if (info.finalPack) {
++        auto pack = cast<ttkernel::PackTileOp>(op);
++        pack->setOperand(0, idxConst(op, vals[info.in0].slot));
++        tail.push_back(op);
++        continue;
++      }
++      if (!isDstOp(op)) {
++        continue;
++      }
++      // Renumber this op's DST operands.
++      if (auto copy = dyn_cast<ttkernel::CopyTileOp>(op)) {
++        copy->setOperand(2, idxConst(op, vals[info.out].slot));
++      } else if (isa<ttkernel::UnaryBcastTileOp>(op)) {
++        op->setOperand(2, idxConst(op, vals[info.out].slot));
++      } else if (auto fill = dyn_cast<ttkernel::FillTileOp>(op)) {
++        fill->setOperand(0, idxConst(op, vals[info.out].slot));
++      } else {
++        SmallVector<OpOperand *> idxOperands;
++        for (OpOperand &operand : op->getOpOperands()) {
++          if (operand.get().getType().isIndex()) {
++            idxOperands.push_back(&operand);
++          }
++        }
++        if (idxOperands.size() == 3) {
++          idxOperands[0]->set(idxConst(op, vals[info.in0].slot));
++          idxOperands[1]->set(idxConst(op, vals[info.in1].slot));
++          idxOperands[2]->set(idxConst(op, vals[info.out].slot));
++        } else if (idxOperands.size() == 1) {
++          idxOperands[0]->set(idxConst(op, vals[info.out].slot));
++        }
++      }
++    }
++    // Packs of the kernel's outputs (with their pack reconfig and the
++    // following push) at the end, after commit / wait (packs between an
++    // acquire and a release are self-managed: TTKernelControlDstSection adds
++    // nothing), then the release.
++    b.setInsertionPoint(terminator);
++    b.create<ttkernel::TileRegsCommitOp>(terminator->getLoc());
++    b.create<ttkernel::TileRegsWaitOp>(terminator->getLoc());
++    for (Operation *op : tail) {
++      Operation *prev = op->getPrevNode();
++      while (prev && isPure(prev)) {
++        prev = prev->getPrevNode();
++      }
++      if (prev && isa<ttkernel::PackReconfigDataFormatOp>(prev)) {
++        prev->moveBefore(terminator);
++      }
++      op->moveBefore(terminator);
++    }
++    // Output CB pushes after the moved packs.
++    for (Operation *op : tail) {
++      Value cb = cast<ttkernel::PackTileOp>(op).getOutCb();
++      for (Operation *user : llvm::make_early_inc_range(cb.getUsers())) {
++        if (isa<ttkernel::CBPushBackOp>(user)) {
++          user->moveBefore(terminator);
++        }
++      }
++    }
++    b.setInsertionPoint(terminator);
++    b.create<ttkernel::TileRegsReleaseOp>(terminator->getLoc());
++    for (OpInfo &info : infos) {
++      if (info.erase) {
++        info.op->erase();
++      }
++    }
++    funcOp->setAttr("libtt.dst_full_sync", b.getUnitAttr());
++    return true;
++  }
++};
++} // namespace
++
++namespace {
  struct ConvertD2MToTTKernel
      : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
  
-@@ -217,6 +793,39 @@ struct ConvertD2MToTTKernel
+@@ -217,6 +1270,48 @@ struct ConvertD2MToTTKernel
        return;
      }
  
@@ -1564,7 +2041,16 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      }
 +    }
 +
-+    if (std::getenv("LIBTT_D2M_PHASE_MERGE") &&
++    bool resident = false;
++    if (std::getenv("LIBTT_D2M_DST_RESIDENT") && !funcOp.getBody().empty() &&
++        usesFp32Dst(funcOp)) {
++      resident = DstResidentRewriter{funcOp}.run();
++      if (std::getenv("LIBTT_D2M_SFPI_DEBUG")) {
++        llvm::errs() << "dst-resident: " << funcOp.getName() << " "
++                     << (resident ? "applied" : "not applied") << "\n";
++      }
++    }
++    if (!resident && std::getenv("LIBTT_D2M_PHASE_MERGE") &&
 +        !funcOp.getBody().empty()) {
 +      while (mergePackCopyPhases(funcOp)) {
 +      }
@@ -1653,22 +2139,28 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
    SmallVector<mlir::Attribute> kernelConfigs(threads.size());
    for (const auto [i, thread] : llvm::enumerate(threads)) {
      const d2m::ThreadAttr threadAttr = mlir::cast<d2m::ThreadAttr>(thread);
-@@ -337,12 +388,9 @@ static SmallVector<mlir::Attribute> createKernelDescriptors(
+@@ -335,14 +386,14 @@ static SmallVector<mlir::Attribute> createKernelDescriptors(
+     switch (threadAttr.getThreadType()) {
+     case d2m::ThreadType::Compute: {
        // TODO (vtangTT) #5032: support lowering to different compute configs.
++      // libtt: kernels kept in DST across phases (DstResidentRewriter) use
++      // the whole DST (full sync).
++      bool fullSync = kernelFunc && kernelFunc->hasAttr("libtt.dst_full_sync");
        kernelConfigs[i] = builder.getAttr<ttnn::ComputeKernelAttr>(
            kernelSymbol, coreRangeSet,
 -          /*math_fidelity*/ convertMathFidelity(mathFidelity),
 -          /*fp32DestAccum*/ false,
-+          /*math_fidelity*/ convertMathFidelity(mathFidelity), fp32DestAccum,
-           /*dst_full_sync_en*/ false,
+-          /*dst_full_sync_en*/ false,
 -          /*unpack_to_dest_mode*/
 -          ArrayRef<ttnn::ComputeKernelUnpackToDestMode>{
 -              ttnn::ComputeKernelUnpackToDestMode::Default},
++          /*math_fidelity*/ convertMathFidelity(mathFidelity), fp32DestAccum,
++          /*dst_full_sync_en*/ fullSync,
 +          /*unpack_to_dest_mode*/ unpackToDestModes,
            /*bfp8_pack_precise*/ false,
            /*math_approx_mode*/ false, kernelCRTArgs, kernelCTArgs);
        break;
-@@ -729,7 +777,8 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
+@@ -729,7 +780,8 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
    const auto arch = ttcore::getOpChipDescAttr(op).getArch().getValue();
    SmallVector<mlir::Attribute> kernelDescriptors = createKernelDescriptors(
        rewriter, op.getThreads(), coreRangeSet, opSymTable, mathFidelity,
@@ -1678,7 +2170,7 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
  
    ttnn::ProgramAttr program = ttnn::ProgramAttr::get(
        ctx, kernelDescriptors, cbDescriptors, semaphoreDescriptors);
-@@ -1105,6 +1154,55 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
+@@ -1105,6 +1157,55 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
  // Entry Point
  // ===----------------------------------------------------------------------===//
  
@@ -1734,7 +2226,7 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
  LogicalResult runD2MToTTNNConversion(ModuleOp moduleOp,
                                       ttmetal::MathFidelity mathFidelity) {
    DenseMap<Value, Value> valueMapping;
-@@ -1123,6 +1221,9 @@ LogicalResult runD2MToTTNNConversion(ModuleOp moduleOp,
+@@ -1123,6 +1224,9 @@ LogicalResult runD2MToTTNNConversion(ModuleOp moduleOp,
    if (failed(cleanupAndVerify(moduleOp, valueMapping))) {
      return failure();
    }
@@ -4696,7 +5188,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
      for (int64_t i = 0, n = computeOp.getNumDstScratchSlices(); i < n; ++i) {
        setDstScratchIndex(computeOp, dstAllocator.allocateScratch(),
                           outermostInnerComputeLoop);
-@@ -288,8 +369,36 @@ static void dataCopyGenerate(PatternRewriter &rewriter, Location loc, Value dst,
+@@ -288,8 +369,43 @@ static void dataCopyGenerate(PatternRewriter &rewriter, Location loc, Value dst,
      auto insertionPointAfterLoopNest = rewriter.saveInsertionPoint();
  
      rewriter.setInsertionPoint(loopNestOrOp);
@@ -4714,12 +5206,19 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
 +        }
 +      }
 +      SmallVector<DstAccess> hoisted, inPlace;
++      llvm::SmallPtrSet<Operation *, 8> inPlaceOps;
 +      for (const DstAccess &load : copyInfo.loads) {
 +        bool acc =
 +            !load.isAffine() ||
 +            stored.contains(
 +                mlir::cast<affine::AffineLoadOp>(load.op).getMemref());
-+        (acc ? hoisted : inPlace).push_back(load);
++        if (acc) {
++          hoisted.push_back(load);
++        } else if (inPlaceOps.insert(load.op).second) {
++          // A value read twice (v * v) is loaded once in place; its uses
++          // share that slice.
++          inPlace.push_back(load);
++        }
 +      }
 +      emitDstCopyNest(rewriter, loopNestOrOp, dst, hoisted,
 +                      /*isLoadSide=*/true, /*cloneLoopNest=*/true,
@@ -4735,7 +5234,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
  
      rewriter.restoreInsertionPoint(insertionPointAfterLoopNest);
      emitDstCopyNest(rewriter, loopNestOrOp, dst, copyInfo.stores,
-@@ -355,9 +464,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -355,9 +471,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
            return WalkResult::advance();
          }
  
@@ -4756,7 +5255,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          }
  
          if (loopOp->hasAttr("d2m.dst_access_inserted")) {
-@@ -375,6 +493,37 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -375,6 +500,37 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
              disableL1Acc || !hasTileMatmul(loopOp) ||
              !allTileMatmulOutputsSupportPackerL1Acc(loopOp);
  
@@ -4794,7 +5293,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          auto [copyInfos, dstIntermediates] =
              collectDstAccesses(gOp, *loopRegion, loopOp, dstCapacity);
  
-@@ -385,6 +534,7 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -385,6 +541,7 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
                 const CopyInfoMap &ci, bool disableL1Acc) {
                dataCopyGenerate(rw, loc, dst, ci, disableL1Acc);
              });
@@ -6418,7 +6917,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
  #include "ttmlir/Target/TTKernel/TTKernelToCpp.h"
  
  #include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
-@@ -37,6 +41,47 @@
+@@ -37,6 +41,97 @@
  
  #include <set>
  
@@ -6460,13 +6959,63 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
 +sfpi_inline sfpi::vFloat bits(uint32_t b) {
 +  return sfpi::vFloat(__builtin_bit_cast(float, b));
 +}
++// In-DST tile helpers. FP32 DST lane layout: vector d (0..7) of face f holds,
++// in lane l, the face's element at row 4 * (d / 2) + l / 8, column
++// 2 * (l % 8) + d % 2; dst_reg[t * 32 + f * 8 + d] from sfpu start 0.
++sfpi_inline sfpi::vFloat rotate8(sfpi::vFloat v) {
++  return sfpi::vFloat(sfpi::subvec_shflror1(v));
++}
++// Every lane of each 8-lane subvector gets the subvector's sum.
++sfpi_inline sfpi::vFloat sum_lanes8(sfpi::vFloat v) {
++  v += rotate8(v);
++  sfpi::vFloat r = rotate8(v);
++  v += rotate8(r);
++  r = rotate8(v);
++  r = rotate8(r);
++  r = rotate8(r);
++  v += rotate8(r);
++  return v;
++}
++// dst = src (slices as template arguments: compile-time DST addresses).
++template <uint32_t src, uint32_t dst>
++inline void copy_dst() {
++  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
++  _llk_math_eltwise_sfpu_start_(0);
++#pragma GCC unroll 32
++  for (uint32_t i = 0; i < 32; ++i) {
++    sfpi::vFloat v = sfpi::dst_reg[src * 32 + i];
++    sfpi::dst_reg[dst * 32 + i] = v;
++  }
++  _llk_math_eltwise_sfpu_done_();
++}
++// dst = column 0 of src spread across each row.
++template <uint32_t src, uint32_t dst>
++inline void bcast_col0() {
++  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
++  _llk_math_eltwise_sfpu_start_(0);
++#pragma GCC unroll 2
++  for (uint32_t half = 0; half < 2; ++half) {
++#pragma GCC unroll 4
++    for (uint32_t band = 0; band < 4; ++band) {
++      sfpi::vFloat v = sfpi::dst_reg[src * 32 + 2 * half * 8 + 2 * band];
++      v_if((sfpi::vInt(sfpi::vConstTileId) & 14) != 0) { v = 0.0f; }
++      v_endif;
++      v = sum_lanes8(v);
++      sfpi::dst_reg[dst * 32 + (2 * half) * 8 + 2 * band] = v;
++      sfpi::dst_reg[dst * 32 + (2 * half) * 8 + 2 * band + 1] = v;
++      sfpi::dst_reg[dst * 32 + (2 * half + 1) * 8 + 2 * band] = v;
++      sfpi::dst_reg[dst * 32 + (2 * half + 1) * 8 + 2 * band + 1] = v;
++    }
++  }
++  _llk_math_eltwise_sfpu_done_();
++}
 +} // namespace libtt_sfpu
 +#endif)libtt";
 +
  namespace mlir::tt::ttkernel {
  
  // Class used to add includes and other boilerplate code to the generated
-@@ -63,7 +108,8 @@ public:
+@@ -63,7 +158,8 @@ public:
      }
  
      // TODO(wenbinlyuTT): make this conditional, originally from #4680.
@@ -6476,7 +7025,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
  
      const auto &headerMap = getCalleeToHeadersMap();
  
-@@ -183,6 +229,15 @@ public:
+@@ -183,6 +279,15 @@ public:
          }
        }
  
@@ -6492,7 +7041,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
        if (value.starts_with("experimental::invoke_sfpi")) {
          emitLlk(experimental_invoke_sfpi_llks_generated,
                  experimental_invoke_sfpi_llks_generated_len);
-@@ -353,7 +408,39 @@ LogicalResult translateKernelFuncToCpp(func::FuncOp entry,
+@@ -353,7 +458,39 @@ LogicalResult translateKernelFuncToCpp(func::FuncOp entry,
      return failure();
    }
    auto moduleCleanup = llvm::make_scope_exit([&]() { kernelModule->erase(); });
