@@ -537,21 +537,30 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  
      std::optional<int64_t> cIdxVal = getConstantIntValue(cIdx);
  
-@@ -1278,25 +1363,13 @@ public:
-       if (cIdxVal) {
-         Value hoistedCIdx =
-             rewriter.create<arith::ConstantIndexOp>(op->getLoc(), *cIdxVal);
+@@ -1274,29 +1359,16 @@ public:
+       setInsertionPointAfterOperands(rewriter, {cbA, outCB},
+                                      /*allowHoisting*/ true);
+       rewriter.create<ttkernel::InitSFPUOp>(op->getLoc(), cbA, outCB);
+-
+-      if (cIdxVal) {
+-        Value hoistedCIdx =
+-            rewriter.create<arith::ConstantIndexOp>(op->getLoc(), *cIdxVal);
 -        Value identityVal = rewriter.create<arith::ConstantOp>(
 -            op->getLoc(), rewriter.getI32Type(),
 -            rewriter.getI32IntegerAttr(identityInt));
 -        rewriter.create<ttkernel::FillTileInitOp>(op->getLoc());
 -        rewriter.create<ttkernel::FillTileIntOp>(op->getLoc(), hoistedCIdx,
 -                                                 identityVal);
-+        emitFill(hoistedCIdx);
-       }
+-      }
      }
  
-     if (!cIdxVal) {
+-    if (!cIdxVal) {
++    // Seed the accumulator inside the DST acquire (on the first reduction
++    // iteration). Hoisting the fill to the kernel start, even for a constant
++    // index, wrote it before tile_regs_acquire, so the reduction accumulated
++    // into an unseeded DST half (row sums of stale data).
++    (void)cIdxVal;
++    {
        ensureDominatesInsertionPoint(rewriter, cIdx);
 -      auto emitSeed = [&]() {
 -        Value identityVal = rewriter.create<arith::ConstantOp>(
@@ -565,7 +574,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  
        Value seedGuard =
            buildFirstReductionIterationGuard(rewriter, op->getLoc(), op, cIdx);
-@@ -1335,9 +1408,19 @@ public:
+@@ -1335,9 +1407,19 @@ public:
      }
  
      if constexpr (std::is_same_v<ConcreteOp, d2m::TileSFPUReduceSumOp>) {
@@ -588,7 +597,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else {
        rewriter.create<ttkernel::BinaryMaxInt32TileInitOp>(op->getLoc());
        rewriter.create<ttkernel::BinaryMaxInt32TileOp>(op->getLoc(), tempIdx,
-@@ -1423,8 +1506,13 @@ public:
+@@ -1423,8 +1505,13 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
@@ -604,7 +613,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else {
        rewriter.create<InitOp>(op->getLoc());
      }
-@@ -1439,8 +1527,11 @@ public:
+@@ -1439,8 +1526,11 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
@@ -618,7 +627,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else if constexpr (std::is_same_v<SFPUOp, ttkernel::ClampScalarTileOp>) {
        auto loc = op->getLoc();
        // The hardware clamp API takes i32 params for both int and float clamps.
-@@ -1577,9 +1668,13 @@ public:
+@@ -1577,9 +1667,13 @@ public:
                                        adaptor.getFalseValue(), dstIdx},
                                       /*allowHoisting*/ false);
        if constexpr (std::is_same_v<ConcreteOp, d2m::TileWhereOp>) {
@@ -635,7 +644,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
          rewriter.create<ttkernel::WhereTileOp>(
              op->getLoc(), adaptor.getCondition(), adaptor.getTrueValue(),
              adaptor.getFalseValue(), dstIdx, dtype);
-@@ -1629,6 +1724,17 @@ public:
+@@ -1629,6 +1723,17 @@ public:
        return emitFPUTiles(rewriter, op, adaptor, loc);
      }
  
@@ -653,7 +662,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      if (lhsFromDst) {
        // LHS from Dst, RHS from Cb (FPU - DEST_TO_SRCA)
        return emitFPUBinaryDestReuse(rewriter, op, adaptor, loc,
-@@ -1737,6 +1843,61 @@ private:
+@@ -1737,6 +1842,61 @@ private:
      return success();
    }
  
@@ -715,7 +724,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
    // One operand from Dst, use binary_dest_reuse
    LogicalResult emitFPUBinaryDestReuse(ConversionPatternRewriter &rewriter,
                                         ConcreteOp op,
-@@ -2087,12 +2248,9 @@ public:
+@@ -2087,12 +2247,9 @@ public:
  
      Value inCB = getInCB(rewriter, op);
  
@@ -1341,6 +1350,34 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
  void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
                                  TypeConverter &typeConverter) {
    addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
+diff --git a/lib/Dialect/D2M/Analysis/GridAnalysis.cpp b/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
+--- a/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
++++ b/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
+@@ -440,6 +440,24 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
+         opTarget[targetIdx] = minGridDim;
+       }
+     }
++    // libtt: loop dims listed in d2m.unsplit_dims stay on one core (whole
++    // rows per core for a merged row subgraph with an in-row reduction).
++    if (auto unsplit =
++            genericOp->getAttrOfType<ArrayAttr>("d2m.unsplit_dims")) {
++      AffineMap map = indexingMaps[operandIdx];
++      for (auto [pos, expr] : llvm::enumerate(map.getResults())) {
++        auto dimExpr = mlir::dyn_cast<AffineDimExpr>(expr);
++        if (!dimExpr || pos < rank - opTarget.size()) {
++          continue;
++        }
++        if (llvm::any_of(unsplit, [&](Attribute a) {
++              return mlir::cast<IntegerAttr>(a).getInt() ==
++                     static_cast<int64_t>(dimExpr.getPosition());
++            })) {
++          opTarget[pos - (rank - opTarget.size())] = 1;
++        }
++      }
++    }
+     perOperandTargetGrids.push_back(opTarget);
+   }
+ 
 diff --git a/lib/Dialect/D2M/IR/D2MDialect.cpp b/lib/Dialect/D2M/IR/D2MDialect.cpp
 --- a/lib/Dialect/D2M/IR/D2MDialect.cpp
 +++ b/lib/Dialect/D2M/IR/D2MDialect.cpp
@@ -1433,18 +1470,65 @@ diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
    }
  
    rewriter.create<MaskOp>(getLoc(), maybeOutput->getType(), input, *maybeOutput,
+diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+--- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
++++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <cstdlib>
+ #include "ttmlir/Dialect/D2M/Pipelines/D2MPipelines.h"
+ 
+ #include "ttmlir/Conversion/Passes.h"
+@@ -118,6 +119,18 @@ void createD2MFrontendPipeline(OpPassManager &pm,
+     gridOptOptions.ttnnMode = options.ttnnMode;
+   }
+   pm.addPass(d2m::createD2MMaterializeViewReturns());
++  // TODO(experiment): LIBTT_D2M_EARLY_FUSION=1 fuses generics before grid
++  // selection, while all still share the placeholder grid, so a reduction and
++  // the elementwise ops around it can end up in one generic.
++  if (std::getenv("LIBTT_D2M_EARLY_FUSION") &&
++      (options.enableElementwiseFusion ||
++       options.enableEltwiseReductionFusion)) {
++    pm.addPass(createCanonicalizerPassWithOptions(options));
++    d2m::D2MGenericFusionOptions earlyFusionOptions;
++    earlyFusionOptions.enableEltwiseReductionFusion =
++        options.enableEltwiseReductionFusion;
++    pm.addPass(d2m::createD2MGenericFusion(earlyFusionOptions));
++  }
+   pm.addPass(d2m::createD2MGridSelection(gridOptOptions));
+   pm.addPass(d2m::createD2MBuildTopkChain());
+   pm.addPass(createCanonicalizerPassWithOptions(options));
 diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 --- a/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 +++ b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
-@@ -9,6 +9,7 @@
+@@ -9,16 +9,24 @@
  #include "ttmlir/Dialect/D2M/Utils/Utils.h"
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 +#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
  
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/IR/IRMapping.h"
++#include "llvm/ADT/SmallPtrSet.h"
  #include "mlir/Dialect/Affine/IR/AffineOps.h"
  #include "mlir/Dialect/Linalg/IR/Linalg.h"
-@@ -115,6 +116,11 @@ static bool isValidElementwiseFusionTarget(GenericOp gOp) {
++#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/AsmState.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/Support/Casting.h"
++#include "llvm/Support/raw_ostream.h"
+ 
++#include <cstdlib>
+ #include <tuple>
+ 
+ #define DEBUG_TYPE "D2MGenericFusion"
+@@ -115,6 +123,11 @@ static bool isValidElementwiseFusionTarget(GenericOp gOp) {
    if (gOp.hasMultiUseInputOperand()) {
      return false;
    }
@@ -1456,7 +1540,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -629,6 +635,11 @@ static bool isValidReductionFusionConsumer(GenericOp gOp) {
+@@ -629,6 +642,11 @@ static bool isValidReductionFusionConsumer(GenericOp gOp) {
    if (gOp.hasMultiUseInputOperand()) {
      return false;
    }
@@ -1468,13 +1552,10 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -715,35 +726,321 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
+@@ -715,45 +733,751 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
  };
  } // namespace
  
--namespace {
--struct FuseD2MElementwiseOpsPattern : public OpRewritePattern<GenericOp> {
--  using OpRewritePattern<GenericOp>::OpRewritePattern;
 +// Elementwise DAG fusion keeps escaping producer results as additional outputs.
 +// Unlike tree fusion, shared inputs have one operand/CB and one remote load.
 +struct ElementwiseFusionPlan {
@@ -1484,11 +1565,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +  SmallVector<OpOperand *> sources;
 +  SmallVector<unsigned> keptProducerResults;
 +};
- 
--  LogicalResult matchAndRewrite(GenericOp consumer,
--                                PatternRewriter &rewriter) const final {
--    if (!isValidElementwiseFusionTarget(consumer)) {
--      return failure();
++
 +static bool isSimpleElementwiseGeneric(GenericOp op) {
 +  if (!op.isComputeOnlyForm() || !op.hasPureTensorSemantics() ||
 +      !op.isAllParallel() || op.getNumRegions() != 1 ||
@@ -1507,15 +1584,14 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +    if (!GenericOp::getOperandAlloc(op.getRegion(0),
 +                                    op.getOperandIndex(op->getOperand(i)))) {
 +      return false;
-     }
++    }
 +  }
 +  return llvm::all_of(op.getRegion(0).front(), [](Operation &nested) {
 +    return isa<tensor::EmptyOp, RemoteLoadOp, RemoteStoreOp, BlockIndexOp,
 +               linalg::GenericOp, YieldOp>(nested);
 +  });
 +}
- 
--    assert(consumer.getNumRegions() == 1u);
++
 +static FailureOr<ElementwiseFusionPlan>
 +planElementwiseFusion(GenericOp producer, GenericOp consumer) {
 +  if (!isSimpleElementwiseGeneric(producer) ||
@@ -1526,15 +1602,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +      producer.getIteratorTypes() != consumer.getIteratorTypes()) {
 +    return failure();
 +  }
- 
--    // Consumer was already validated above; only re-check the producer.
--    OpOperand *fusedOperand = nullptr;
--    for (OpOperand *use : consumer.getDpsInputOperands()) {
--      if (isElementwiseFusable(use, /*checkConsumer=*/false,
--                               /*checkProducer=*/true)) {
--        fusedOperand = use;
--        break;
--      }
++
 +  // Use a common iteration space. Reductions/permutations retain the existing
 +  // specialized fusion path below.
 +  AffineMap outputMap = consumer.getIndexingMap(
@@ -1543,19 +1611,15 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +    auto result = dyn_cast<OpResult>(input->get());
 +    if (!result || result.getOwner() != producer.getOperation()) {
 +      continue;
-     }
--    if (!fusedOperand) {
++    }
 +    if (consumer.getIndexingMap(input->getOperandNumber()) != outputMap ||
 +        producer.getIndexingMap(
 +            producer.getDpsInitOperand(result.getResultNumber())
 +                ->getOperandNumber()) != outputMap) {
-       return failure();
-     }
++      return failure();
++    }
 +  }
- 
--    auto producer = fusedOperand->get().getDefiningOp<GenericOp>();
--    assert(producer);
--    fuseOverOperand(fusedOperand, producer, consumer, rewriter);
++
 +  ElementwiseFusionPlan plan;
 +  for (auto result : producer.getResults()) {
 +    bool keep = false;
@@ -1587,7 +1651,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +    plan.inputs.push_back(value);
 +    plan.maps.push_back(map);
 +    plan.sources.push_back(input);
-     return success();
++    return success();
 +  };
 +  for (OpOperand *input : producer.getDpsInputOperands()) {
 +    if (failed(addInput(input, producer))) {
@@ -1778,12 +1842,14 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +  rewriter.eraseOp(producer);
 +}
 +
-+namespace {
-+struct FuseD2MElementwiseOpsPattern : public OpRewritePattern<GenericOp> {
-+  using OpRewritePattern<GenericOp>::OpRewritePattern;
-+
-+  LogicalResult matchAndRewrite(GenericOp consumer,
-+                                PatternRewriter &rewriter) const final {
+ namespace {
+ struct FuseD2MElementwiseOpsPattern : public OpRewritePattern<GenericOp> {
+   using OpRewritePattern<GenericOp>::OpRewritePattern;
+ 
+   LogicalResult matchAndRewrite(GenericOp consumer,
+                                 PatternRewriter &rewriter) const final {
+-    if (!isValidElementwiseFusionTarget(consumer)) {
+-      return failure();
 +    if (isSimpleElementwiseGeneric(consumer)) {
 +      for (Value input : consumer.getInputs()) {
 +        auto producer = input.getDefiningOp<GenericOp>();
@@ -1797,7 +1863,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +        fuseElementwiseDAG(producer, consumer, *plan, rewriter);
 +        return success();
 +      }
-+    }
+     }
 +    // Preserve the existing tree/permutation path for other generic forms.
 +    for (OpOperand *input : consumer.getDpsInputOperands()) {
 +      if (isElementwiseFusable(input)) {
@@ -1807,13 +1873,408 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +      }
 +    }
 +    return failure();
++  }
++};
++} // namespace
+ 
+-    assert(consumer.getNumRegions() == 1u);
++namespace {
++// libtt (experimental, LIBTT_D2M_MERGE_ROWS=1): merge the generics of one
++// function that GridSelection kept on whole rows (d2m.unsplit_dims, see
++// GridSelection) into a single generic. Each original region's linalg ops are
++// cloned in order; loads of values produced inside the group take the
++// producer's tile tensor (so values with several consumers are fine), and only
++// results used outside the group are stored. An in-row reduction then feeds
++// its broadcast epilogue within one kernel.
++static void mergeRowGroups(ModuleOp module) {
++  SmallVector<func::FuncOp> funcs;
++  module.walk([&](func::FuncOp f) { funcs.push_back(f); });
++  for (func::FuncOp func : funcs) {
++    SmallVector<GenericOp> generics;
++    for (Operation &op : func.getBody().getOps()) {
++      if (auto g = dyn_cast<GenericOp>(op)) {
++        generics.push_back(g);
++      }
++    }
++    if (generics.size() < 2 ||
++        !llvm::all_of(generics, [](GenericOp g) {
++          return g->hasAttr("d2m.unsplit_dims");
++        })) {
++      continue;
++    }
++    GenericOp first = generics.front();
++    bool uniform = llvm::all_of(generics, [&](GenericOp g) {
++      return g.getGrid() == first.getGrid() &&
++             g.getBlockFactors() == first.getBlockFactors() &&
++             g.getRegion(0).hasOneBlock() &&
++             llvm::all_of(g.getRegion(0).front(), [](Operation &op) {
++               return isa<tensor::EmptyOp, RemoteLoadOp, RemoteStoreOp,
++                          BlockIndexOp, linalg::GenericOp, YieldOp,
++                          arith::ConstantOp>(op);
++             });
++    });
++    if (!uniform) {
++      continue;
++    }
++    llvm::SmallPtrSet<Operation *, 16> group;
++    for (GenericOp g : generics) {
++      group.insert(g);
++    }
++    auto inGroup = [&](Value v) {
++      Operation *def = v.getDefiningOp();
++      return def && group.contains(def);
++    };
++    // Tiles per dim of a [grid0, grid1, shard0, shard1] operand.
++    auto tiles = [](Value v) {
++      auto s = mlir::cast<ShapedType>(v.getType()).getShape();
++      return std::make_pair(s[0] * s[2], s[1] * s[3]);
++    };
++    int64_t rows = 1, cols = 1;
++    for (GenericOp g : generics) {
++      for (Value v : g->getOperands()) {
++        rows = std::max(rows, tiles(v).first);
++        cols = std::max(cols, tiles(v).second);
++      }
++    }
++    MLIRContext *ctx = module.getContext();
++    auto mapFor = [&](Value v) {
++      auto [r, c] = tiles(v);
++      AffineExpr zero = getAffineConstantExpr(0, ctx);
++      return AffineMap::get(
++          2, 0,
++          {r == rows ? getAffineDimExpr(0, ctx) : zero,
++           c == cols ? getAffineDimExpr(1, ctx) : zero},
++          ctx);
++    };
++
++    SmallVector<Value> inputs;
++    llvm::DenseMap<Value, unsigned> inputIndex;
++    for (GenericOp g : generics) {
++      for (Value v : g.getInputs()) {
++        if (!inGroup(v) && !inputIndex.count(v)) {
++          inputIndex[v] = inputs.size();
++          inputs.push_back(v);
++        }
++      }
++    }
++    SmallVector<std::pair<GenericOp, unsigned>> escaping;
++    for (GenericOp g : generics) {
++      for (OpResult r : g->getResults()) {
++        bool escapes = llvm::any_of(r.getUsers(), [&](Operation *user) {
++          // Loads inside a group generic's region are internal uses.
++          for (Operation *anc = user; anc; anc = anc->getParentOp()) {
++            if (group.contains(anc)) {
++              return false;
++            }
++          }
++          // Leftover views and casts without uses are not real consumers.
++          if (isa<ViewLayoutOp, ttir::TTNNMetalLayoutCastOp>(user) &&
++              user->use_empty()) {
++            return false;
++          }
++          if (std::getenv("LIBTT_D2M_MERGE_DEBUG")) {
++            llvm::errs() << "merge: escaping use of result "
++                         << r.getResultNumber() << " by " << *user << "\n";
++          }
++          return true;
++        });
++        if (escapes) {
++          escaping.emplace_back(g, r.getResultNumber());
++        }
++      }
++    }
++    if (escaping.empty()) {
++      continue;
++    }
++    // The merged generic sits after the last group member, so every outside
++    // user of a group result must come after it too (a mask between two
++    // members would otherwise use a value defined later).
++    bool usersAfter = llvm::all_of(escaping, [&](auto gr) {
++      return llvm::all_of(gr.first->getResult(gr.second).getUsers(),
++                          [&](Operation *user) {
++                            Operation *anc =
++                                func.getBody().front().findAncestorOpInBlock(
++                                    *user);
++                            return !anc || group.contains(anc) ||
++                                   generics.back()->isBeforeInBlock(anc);
++                          });
++    });
++    if (!usersAfter) {
++      continue;
++    }
++    SmallVector<Value> outputs;
++    SmallVector<AffineMap> maps;
++    for (Value v : inputs) {
++      maps.push_back(mapFor(v));
++    }
++    for (auto [g, r] : escaping) {
++      Value init = g.getDpsInitOperand(r)->get();
++      outputs.push_back(init);
++      maps.push_back(mapFor(init));
++    }
+ 
+-    // Consumer was already validated above; only re-check the producer.
+-    OpOperand *fusedOperand = nullptr;
+-    for (OpOperand *use : consumer.getDpsInputOperands()) {
+-      if (isElementwiseFusable(use, /*checkConsumer=*/false,
+-                               /*checkProducer=*/true)) {
+-        fusedOperand = use;
++    IRRewriter rewriter(ctx);
++    rewriter.setInsertionPointAfter(generics.back());
++    Location loc = generics.back().getLoc();
++    auto parallel =
++        ttcore::IteratorTypeAttr::get(ctx, ttcore::IteratorType::Parallel);
++    // TODO(experiment): LIBTT_D2M_MERGE_RED_ITER=1 marks the column dim a
++    // reduction at the generic level when the group reduces over it.
++    bool groupReduces = llvm::any_of(generics, [](GenericOp g) {
++      return g.getIteratorTypesValue()[1] == ttcore::IteratorType::Reduction;
++    });
++    auto colIter = (groupReduces && std::getenv("LIBTT_D2M_MERGE_RED_ITER"))
++                       ? ttcore::IteratorTypeAttr::get(
++                             ctx, ttcore::IteratorType::Reduction)
++                       : parallel;
++    auto merged = rewriter.create<GenericOp>(
++        loc, TypeRange(ValueRange(outputs)), inputs, outputs, ValueRange{},
++        first.getGrid(), first.getBlockFactors(),
++        rewriter.getAffineMapArrayAttr(maps),
++        rewriter.getArrayAttr({parallel, colIter}), first.getThreads(),
++        first.getFabricConnectionConfigAttr(), /*regions=*/1);
++    merged->setAttr("d2m.unsplit_dims", first->getAttr("d2m.unsplit_dims"));
++
++    Block &block = merged.getRegion(0).emplaceBlock();
++    rewriter.setInsertionPointToStart(&block);
++    Value block0 = rewriter.create<BlockIndexOp>(loc, static_cast<int64_t>(0));
++    Value block1 = rewriter.create<BlockIndexOp>(loc, static_cast<int64_t>(1));
++    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
++    auto indicesFor = [&](AffineMap map) {
++      SmallVector<Value> indices;
++      for (AffineExpr e : map.getResults()) {
++        auto d = mlir::dyn_cast<AffineDimExpr>(e);
++        indices.push_back(!d ? c0 : (d.getPosition() == 0 ? block0 : block1));
++      }
++      return indices;
++    };
++    auto shardType = [](Value v) {
++      auto t = mlir::cast<RankedTensorType>(v.getType());
++      return RankedTensorType::get(t.getShape().drop_front(2),
++                                   t.getElementType());
++    };
++    llvm::DenseMap<Value, Value> loaded;
++    for (auto [i, v] : llvm::enumerate(inputs)) {
++      RankedTensorType st = shardType(v);
++      Value buffer = rewriter.create<tensor::EmptyOp>(loc, st.getShape(),
++                                                      st.getElementType());
++      loaded[v] = rewriter
++                      .create<RemoteLoadOp>(loc, st, buffer, v,
++                                            indicesFor(maps[i]))
++                      .getResult();
++    }
++
++    bool mergeFailed = false;
++    llvm::DenseMap<std::pair<Operation *, unsigned>, Value> produced;
++    IRMapping irMap;
++    for (GenericOp g : generics) {
++      for (Operation &op : g.getRegion(0).front()) {
++        if (auto bi = dyn_cast<BlockIndexOp>(op)) {
++          irMap.map(bi.getResult(), bi.getDim() == 0 ? block0 : block1);
++        } else if (auto load = dyn_cast<RemoteLoadOp>(op)) {
++          Value src = load.getMemref();
++          Value repl;
++          if (inGroup(src)) {
++            repl = produced.lookup(
++                {src.getDefiningOp(), cast<OpResult>(src).getResultNumber()});
++          } else {
++            repl = loaded.lookup(src);
++          }
++          if (!repl || repl.getType() != load.getResult().getType()) {
++            mergeFailed = true;
++            break;
++          }
++          irMap.map(load.getResult(), repl);
++        } else if (auto store = dyn_cast<RemoteStoreOp>(op)) {
++          auto outs = g.getOutputs();
++          auto it = llvm::find(outs, store.getMemref());
++          if (it == outs.end()) {
++            mergeFailed = true;
++            break;
++          }
++          produced[{g.getOperation(),
++                    static_cast<unsigned>(std::distance(outs.begin(), it))}] =
++              irMap.lookupOrDefault(store.getLocalBuffer());
++        } else if (!isa<YieldOp>(op)) {
++          rewriter.clone(op, irMap);
++        }
++      }
++      if (mergeFailed) {
+         break;
+       }
+     }
+-    if (!fusedOperand) {
+-      return failure();
++    SmallVector<Value> stored;
++    if (!mergeFailed) {
++      for (auto [k, gr] : llvm::enumerate(escaping)) {
++        Value value = produced.lookup({gr.first.getOperation(), gr.second});
++        if (!value) {
++          mergeFailed = true;
++          break;
++        }
++        stored.push_back(rewriter
++                             .create<RemoteStoreOp>(
++                                 loc, outputs[k].getType(), outputs[k],
++                                 indicesFor(maps[inputs.size() + k]), value)
++                             .getResult());
++      }
++    }
++    if (mergeFailed) {
++      rewriter.eraseOp(merged);
++      continue;
++    }
++    rewriter.create<YieldOp>(loc, stored);
++
++    // Fuse chains of all-parallel linalg ops inside the merged region (as the
++    // general-fusion branch did), so values stay in DST between operations
++    // instead of round-tripping through L1 scratch.
++    if (!std::getenv("LIBTT_D2M_NO_LINALG_FUSION")) {
++      bool changed = true;
++      // Each fusion removes a consumer, but keeping a multi-use producer's
++      // value as an extra result can re-create fusable pairs; cap the rounds.
++      static const int maxRounds = [] {
++        const char *v = std::getenv("LIBTT_D2M_FUSE_ROUNDS");
++        return v ? std::atoi(v) : 64;
++      }();
++      for (int round = 0; changed && round < maxRounds; ++round) {
++        changed = false;
++        for (auto consumer :
++             llvm::make_early_inc_range(block.getOps<linalg::GenericOp>())) {
++          if (consumer.getNumReductionLoops() != 0) {
++            continue;
++          }
++          for (OpOperand &operand : consumer->getOpOperands()) {
++            auto producer = operand.get().getDefiningOp<linalg::GenericOp>();
++            // Only single-consumer producers: a shared value (e.g. the scaled
++            // input read by several epilogue ops) is computed once and kept.
++            if (!producer || producer.getNumReductionLoops() != 0 ||
++                !llvm::all_of(producer->getUsers(),
++                              [&](Operation *u) { return u == consumer; }) ||
++                !linalg::areElementwiseOpsFusable(&operand)) {
++              continue;
++            }
++            // Casts stay separate (as upstream's fusion-barrier trait does):
++            // fusing bf16->f32 tile_typecast into the next op's DST pass
++            // produced wrong values (Inkling 2's L2 clip on a BF16 input).
++            auto hasTypecast = [](linalg::GenericOp op) {
++              return llvm::any_of(op.getBody()->getOperations(),
++                                  [](Operation &o) {
++                                    return isa<TileTypecastOp>(o);
++                                  });
++            };
++            if (hasTypecast(producer) || hasTypecast(consumer)) {
++              continue;
++            }
++            // Keep the fused op's distinct tile inputs within what DST holds
++            // alongside one intermediate (4 FP32 tiles per half-sync acquire),
++            // as GenericFusion's own operand limits do; the unscheduled DST
++            // allocator does not spill.
++            llvm::SmallDenseSet<Value, 8> fusedInputs;
++            bool wide = false;
++            bool sharedInput = false;
++            for (Value in : llvm::concat<Value>(producer.getDpsInputs(),
++                                                consumer.getDpsInputs())) {
++              if (in == operand.get()) {
++                continue;
++              }
++              // A value read by both ops would share one DST slot, and an
++              // in-place unary op on one use (abs) clobbers the other
++              // (sign): the L2 clip's sign(v) read |v|.
++              if (fusedInputs.contains(in)) {
++                sharedInput = true;
++              }
++              auto st = mlir::dyn_cast<ShapedType>(in.getType());
++              auto tile = st ? mlir::dyn_cast<ttcore::TileType>(
++                                   st.getElementType())
++                             : ttcore::TileType();
++              if (!tile) {
++                continue;
++              }
++              wide |= ttcore::getNumberOfBits(tile.getDataType()) == 32;
++              fusedInputs.insert(in);
++            }
++            static const unsigned maxWide = [] {
++              const char *v = std::getenv("LIBTT_D2M_FUSE_MAX_WIDE");
++              return v ? static_cast<unsigned>(std::atoi(v)) : 2u;
++            }();
++            if (sharedInput || fusedInputs.size() > (wide ? maxWide : 7u)) {
++              continue;
++            }
++            rewriter.setInsertionPoint(consumer);
++            if (std::getenv("LIBTT_D2M_MERGE_DEBUG")) {
++              llvm::errs() << "merge: fuse operand " << operand.getOperandNumber()
++                           << " producer results " << producer->getNumResults()
++                           << " consumer operands " << consumer->getNumOperands()
++                           << "\n";
++            }
++            FailureOr<linalg::ElementwiseOpFusionResult> fusion =
++                linalg::fuseElementwiseOps(rewriter, &operand);
++            if (failed(fusion)) {
++              continue;
++            }
++            for (auto [original, replacement] : fusion->replacements) {
++              original.replaceAllUsesWith(replacement);
++            }
++            rewriter.eraseOp(consumer);
++            if (producer->use_empty()) {
++              rewriter.eraseOp(producer);
++            }
++            changed = true;
++            break;
++          }
++          if (changed) {
++            break;
++          }
++        }
++        if (std::getenv("LIBTT_D2M_MERGE_DEBUG")) {
++          llvm::errs() << "merge: linalg fusion round " << round << ", "
++                       << llvm::range_size(block.getOps<linalg::GenericOp>())
++                       << " linalg ops\n";
++        }
++      }
+     }
+ 
+-    auto producer = fusedOperand->get().getDefiningOp<GenericOp>();
+-    assert(producer);
+-    fuseOverOperand(fusedOperand, producer, consumer, rewriter);
+-    return success();
++    for (auto [k, gr] : llvm::enumerate(escaping)) {
++      gr.first->getResult(gr.second).replaceUsesWithIf(
++          merged->getResult(k), [&](OpOperand &use) {
++            for (Operation *anc = use.getOwner(); anc;
++                 anc = anc->getParentOp()) {
++              if (group.contains(anc)) {
++                return false;
++              }
++            }
++            return true;
++          });
++    }
++    for (GenericOp g : llvm::reverse(generics)) {
++      g->dropAllUses();
++      rewriter.eraseOp(g);
++    }
    }
- };
- } // namespace
-@@ -754,6 +1051,50 @@ class D2MGenericFusion
+-};
+-} // namespace
++}
+ 
+-namespace {
+ class D2MGenericFusion
+     : public tt::d2m::impl::D2MGenericFusionBase<D2MGenericFusion> {
    using D2MGenericFusionBase::D2MGenericFusionBase;
  
    void runOnOperation() override {
++    if (std::getenv("LIBTT_D2M_MERGE_ROWS")) {
++      mergeRowGroups(getOperation());
++    }
 +    // Deduplicate layout views without CSE'ing the operand tensor.empty
 +    // allocations inside generic regions: those must stay distinct CBs.
 +    SmallVector<ttir::TTNNMetalLayoutCastOp> layoutViews;
@@ -1861,6 +2322,121 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
      MLIRContext *ctx = &getContext();
      RewritePatternSet patterns(ctx);
      patterns.add<FuseD2MElementwiseOpsPattern>(ctx);
+diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
+--- a/lib/Dialect/D2M/Transforms/GridSelection.cpp
++++ b/lib/Dialect/D2M/Transforms/GridSelection.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+ 
++#include <cstdlib>
++
+ #include "ttmlir/AffineMapUtils.h"
+ #include "ttmlir/Asserts.h"
+ #include "ttmlir/Dialect/D2M/Analysis/BlockFactorAnalysis.h"
+@@ -21,6 +23,9 @@
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Utils.h"
+ 
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/Linalg/IR/Linalg.h"
++#include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/AffineMap.h"
+ #include "mlir/IR/Builders.h"
+ #include "mlir/IR/BuiltinOps.h"
+@@ -940,8 +945,92 @@ public:
+     this->ttnnMode = options.ttnnMode;
+   }
+ 
++  // libtt (experimental, LIBTT_D2M_MERGE_ROWS=1): a function whose generics
++  // are all elementwise or last-dim reductions over one 2-D tile space, with
++  // at least one reduction, gets d2m.unsplit_dims = [1] on every generic so
++  // each core holds whole rows; GenericFusion then merges them into one.
++  static bool isRowMergeCandidate(GenericOp g) {
++    if (!g.isComputeOnlyForm() || !g.hasPureTensorSemantics() ||
++        g.getNumRegions() != 1 || !g.getRegion(0).hasOneBlock() ||
++        !g.getAdditionalArgs().empty() || g.getIndexingMapsValue().empty() ||
++        g.getIndexingMapsValue().front().getNumDims() != 2) {
++      return false;
++    }
++    auto iters = g.getIteratorTypesValue();
++    if (iters.size() != 2 || iters[0] != ttcore::IteratorType::Parallel) {
++      return false;
++    }
++    return llvm::all_of(g.getRegion(0).front(), [](Operation &op) {
++      return isa<tensor::EmptyOp, RemoteLoadOp, RemoteStoreOp, BlockIndexOp,
++                 linalg::GenericOp, YieldOp, arith::ConstantOp>(op);
++    });
++  }
++
++  static void annotateRowMergeCandidates(ModuleOp module) {
++    module.walk([](func::FuncOp func) {
++      SmallVector<GenericOp> generics;
++      for (Operation &op : func.getBody().getOps()) {
++        if (auto g = dyn_cast<GenericOp>(op)) {
++          generics.push_back(g);
++        }
++      }
++      if (generics.size() < 2 || !llvm::all_of(generics, isRowMergeCandidate)) {
++        return;
++      }
++      bool hasReduction = llvm::any_of(generics, [](GenericOp g) {
++        return g.getIteratorTypesValue()[1] == ttcore::IteratorType::Reduction;
++      });
++      if (!hasReduction) {
++        return;
++      }
++      auto tiles = [](Value v) -> std::optional<std::pair<int64_t, int64_t>> {
++        auto t = dyn_cast<RankedTensorType>(v.getType());
++        if (!t || t.getRank() != 4 ||
++            !isa<ttcore::TileType>(t.getElementType())) {
++          return std::nullopt;
++        }
++        auto s = t.getShape();
++        return std::make_pair(s[0] * s[2], s[1] * s[3]);
++      };
++      int64_t rows = 1, cols = 1;
++      for (GenericOp g : generics) {
++        for (Value v : g->getOperands()) {
++          auto t = tiles(v);
++          if (!t) {
++            return;
++          }
++          rows = std::max(rows, t->first);
++          cols = std::max(cols, t->second);
++        }
++      }
++      for (GenericOp g : generics) {
++        for (Value v : g->getOperands()) {
++          auto t = *tiles(v);
++          if ((t.first != rows && t.first != 1) ||
++              (t.second != cols && t.second != 1)) {
++            return;
++          }
++        }
++      }
++      Builder b(func.getContext());
++      // TODO(experiment): LIBTT_D2M_MERGE_ONE_CORE=1 keeps rows on one core
++      // too, so every op in the merged region has a multi-tile shard.
++      SmallVector<int64_t> unsplit = {1};
++      if (std::getenv("LIBTT_D2M_MERGE_ONE_CORE")) {
++        unsplit = {0, 1};
++      }
++      for (GenericOp g : generics) {
++        g->setAttr("d2m.unsplit_dims", b.getI64ArrayAttr(unsplit));
++      }
++    });
++  }
++
+   void runOnOperation() override {
+     ModuleOp module = getOperation();
++    if (std::getenv("LIBTT_D2M_MERGE_ROWS") ||
++        std::getenv("LIBTT_D2M_ANNOTATE_ROWS")) {
++      annotateRowMergeCandidates(module);
++    }
+ 
+     // Phase 1: Analyze all generics (no IR mutation).
+     GridAnalysis gridAnalysis(module, getDeviceGridShape(), this->ttnnMode);
 diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
@@ -2145,10 +2721,111 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp b/lib/Dialect/D
 diff --git a/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp b/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp
-@@ -1020,6 +1020,16 @@ private:
-       auto [producerMap, producerOperands] =
-           getScratchAccessMapAndOperands(producer, &getContext());
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
  
++#include "llvm/ADT/SmallBitVector.h"
+ #include "ttmlir/Dialect/D2M/IR/D2M.h"
+ #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+ #include "ttmlir/Dialect/D2M/Utils/Utils.h"
+@@ -324,6 +325,59 @@ getMissingConsumerPrefixLoops(ScratchLoopInfo &producer,
+ /// {0,4,8}. Consumer allLoops[0] step=6 must access as:
+ ///   [arg10, (arg11+arg13)/4, arg12, (arg11+arg13)%4]
+ /// instead of the wrong: [arg10, arg11/6, arg12, arg13].
++// libtt: whether `v` is (or is computed from) `iv`.
++static bool dependsOnValue(Value v, Value iv, int depth = 0) {
++  if (v == iv) {
++    return true;
++  }
++  Operation *def = v.getDefiningOp();
++  if (!def || depth > 8) {
++    return false;
++  }
++  return llvm::any_of(def->getOperands(), [&](Value operand) {
++    return dependsOnValue(operand, iv, depth + 1);
++  });
++}
++
++// libtt: scratch dimensions along which an intermediate does not vary. A
++// reduction writes its result at one index for every iteration of its
++// reduction loops; giving those loops their own scratch slots made each
++// iteration accumulate into a fresh slot. Such dims get extent 1 and index 0.
++static llvm::SmallBitVector
++getInvariantScratchDims(ArrayRef<Value> accessOperands,
++                        ArrayRef<affine::AffineStoreOp> stores) {
++  SmallVector<Value> used;
++  for (affine::AffineStoreOp store : stores) {
++    llvm::append_range(used, store.getMapOperands());
++    Value memref = store.getMemRef();
++    while (auto subview = memref.getDefiningOp<memref::SubViewOp>()) {
++      llvm::append_range(used, subview.getOffsets());
++      memref = subview.getSource();
++    }
++  }
++  llvm::SmallBitVector invariant(accessOperands.size());
++  for (auto [i, iv] : llvm::enumerate(accessOperands)) {
++    invariant[i] = llvm::none_of(
++        used, [&, iv = iv](Value u) { return dependsOnValue(u, iv); });
++  }
++  return invariant;
++}
++
++static AffineMap zeroInvariantResults(AffineMap map,
++                                      const llvm::SmallBitVector &invariant) {
++  SmallVector<AffineExpr> exprs(map.getResults());
++  if (exprs.size() != invariant.size()) {
++    return map;
++  }
++  for (unsigned i = 0; i < exprs.size(); ++i) {
++    if (invariant[i]) {
++      exprs[i] = getAffineConstantExpr(0, map.getContext());
++    }
++  }
++  return AffineMap::get(map.getNumDims(), map.getNumSymbols(), exprs,
++                        map.getContext());
++}
++
+ static FailureOr<std::pair<AffineMap, SmallVector<Value>>>
+ getConsumerScratchAccessMap(ScratchLoopInfo &producer,
+                             ScratchLoopInfo &consumer, MLIRContext *ctx) {
+@@ -999,10 +1053,24 @@ private:
+       MemRefType origType = allocInfo.allocOp.getType();
+       Type elementType = origType.getElementType();
+ 
++      // Dims the intermediate does not vary along (a reduction's reduction
++      // loops) get extent 1 and index 0.
++      llvm::SmallBitVector invariantDims = getInvariantScratchDims(
++          getScratchAccessMapAndOperands(producer, &getContext()).second,
++          allocInfo.stores);
++      SmallVector<int64_t> scratchShape(producer.scratchShape);
++      if (invariantDims.size() == scratchShape.size()) {
++        for (unsigned i = 0; i < scratchShape.size(); ++i) {
++          if (invariantDims[i]) {
++            scratchShape[i] = 1;
++          }
++        }
++      }
++
+       // Create scratch buffer type based on loop structure.
+       // Shape: [scratch_iters, gap_iters..., root_iters, inner_iters...]
+-      auto scratchMemRefType = MemRefType::get(
+-          producer.scratchShape, elementType, AffineMap(), l1Attr);
++      auto scratchMemRefType =
++          MemRefType::get(scratchShape, elementType, AffineMap(), l1Attr);
+ 
+       // Insert scratch allocation at the same location as the original alloc.
+       // This ensures proper dominance for both producer and consumer.
+@@ -1017,8 +1085,20 @@ private:
+ 
+       // Update stores in the producer loop.
+       // Use an affine map to normalize loop IVs (handling step > 1).
+-      auto [producerMap, producerOperands] =
++      auto [producerMapRaw, producerOperands] =
+           getScratchAccessMapAndOperands(producer, &getContext());
++      AffineMap producerMap =
++          zeroInvariantResults(producerMapRaw, invariantDims);
++
 +      // A fused intermediate can also escape through a remote_store. Keep its
 +      // original output write as well as the scratch copy used by later compute
 +      // loops; otherwise the data-movement kernel waits forever for that
@@ -2158,11 +2835,10 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp b/lib/Dialect/
 +        isExported |= tracesToAlloc(remoteStore.getLocalBuffer(),
 +                                    allocInfo.allocOp.getResult());
 +      });
-+
+ 
        for (auto storeOp : allocInfo.stores) {
          rewriter.setInsertionPoint(storeOp);
-         Value storedValue = storeOp.getValue();
-@@ -1028,7 +1038,9 @@ private:
+@@ -1028,7 +1108,9 @@ private:
                                                 scratchBuf, producerMap,
                                                 producerOperands);
  
@@ -2173,6 +2849,24 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp b/lib/Dialect/
        }
  
        // Rewrite loads in all consumer loops. Loads within the
+@@ -1042,7 +1124,7 @@ private:
+         if (consumerEntry.loop == allocInfo.producer) {
+           auto producerSelfMap =
+               getScratchAccessMapAndOperands(producer, &getContext());
+-          loadMap = producerSelfMap.first;
++          loadMap = zeroInvariantResults(producerSelfMap.first, invariantDims);
+           loadOperands = std::move(producerSelfMap.second);
+         } else {
+           // Skip consumers past the writer-bounded range; their scratch
+@@ -1066,7 +1148,7 @@ private:
+             return genericOp.emitOpError()
+                    << "cannot build static scratch access map for consumer";
+           }
+-          loadMap = consumerMapOr->first;
++          loadMap = zeroInvariantResults(consumerMapOr->first, invariantDims);
+           loadOperands = std::move(consumerMapOr->second);
+         }
+ 
 diff --git a/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp b/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp
 --- a/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp
 +++ b/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp
@@ -2217,6 +2911,40 @@ diff --git a/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp b/lib/Dialect/D
        assert(!llvm::is_contained(memrefType.getShape(), ShapedType::kDynamic) &&
               "scratch memrefs must be static");
        allocations.push_back(
+diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
+--- a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
++++ b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
+@@ -380,6 +380,30 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
+     return results;
+   }
+ 
++  // libtt: a merged row group (GenericFusion's mergeRowGroups) mixes per-row
++  // single-tile values (reduction results and their scalar epilogue) with
++  // whole-row values; upstream regions never mix them (this used to be an
++  // error). Run one outer iteration: each linalg op packs its whole shard,
++  // multi-tile ops in DST-sized flips and single-tile ops in one, so
++  // intermediates pass through whole-shard scratch.
++  if (!singleTileOutputValues.empty()) {
++    for (const PendingDSTPackingResult &pending : pendingResults) {
++      results.perResult.try_emplace(
++          pending.outputValue,
++          DSTPackingPerResultInfo{pending.numDstFlips, pending.numTilesPerFlip,
++                                  pending.shardSizeTiles});
++    }
++    for (Value outputValue : singleTileOutputValues) {
++      results.perResult.try_emplace(
++          outputValue, DSTPackingPerResultInfo{/*numDstFlips=*/1,
++                                               /*numTilesPerFlip=*/1,
++                                               /*numTilesPerResult=*/1});
++    }
++    results.numOuterLoopIters = 1;
++    results.numTilesPerResult = pendingResults.front().shardSizeTiles;
++    return results;
++  }
++
+   if (!singleTileOutputValues.empty()) {
+     generic.emitOpError(
+         "expected all linalg.generic outputs in a region to have shard size 1");
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
@@ -2436,7 +3164,7 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
        devicePm.addPass(tt::ttnn::createTTNNCreateD2MSubgraphs());
      }
  
-@@ -797,6 +795,15 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+@@ -797,6 +795,20 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
    ttmetal::D2MPipelineOptions ttmetalOptions;
    ttmetalOptions.ttnnMode = true;
    ttmetalOptions.enableElementwiseFusion = options.enableElementwiseFusion;
@@ -2444,6 +3172,11 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
 +  // rank, so broadcasts across leading dimensions stay affine.
 +  if (std::getenv("LIBTT_D2M_NO_COLLAPSE")) {
 +    ttmetalOptions.collapseTensors = false;
++  }
++  // TODO(experiment): with LIBTT_D2M_EXT, also fuse elementwise producers
++  // into reductions.
++  if (std::getenv("LIBTT_D2M_EXT")) {
++    ttmetalOptions.enableEltwiseReductionFusion = true;
 +  }
 +  // TODO(experiment): LIBTT_D2M_NO_MCAST=1 turns off multicast inference.
 +  if (std::getenv("LIBTT_D2M_NO_MCAST")) {
