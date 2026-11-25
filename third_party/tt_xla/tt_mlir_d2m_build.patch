@@ -959,7 +959,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -42,7 +49,396 @@ namespace mlir::tt::d2m {
+@@ -42,7 +49,576 @@ namespace mlir::tt::d2m {
  } // namespace mlir::tt::d2m
  
  namespace {
@@ -1091,7 +1091,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    ++numOps;
 +    return true;
 +  }
-+
+ 
 +  // scf.if (cond) { fill_tile_init; fill_tile(k, v) } with no else.
 +  static std::optional<std::pair<Value, ttkernel::FillTileOp>>
 +  conditionalFill(Operation *op) {
@@ -1214,7 +1214,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    builder.create(state);
 +    return true;
 +  }
- 
++
 +private:
 +  int slot(Value idx) {
 +    if (std::optional<int64_t> c = getConstantIntValue(idx)) {
@@ -1353,10 +1353,190 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +} // namespace
 +
 +namespace {
++// libtt: merge a phase that packs one tile into a CB with the next phase that
++// only copies that tile back into DST (a reduction's result feeding a per-row
++// chain). The value stays in DST: no pack, no unpack-after-pack stall, no
++// second acquire. Phase B's DST indices swap the reload slice with the packed
++// slice (a consistent renaming of B's slices).
++static std::optional<int64_t> constIndex(Value v) {
++  return getConstantIntValue(v);
++}
++
++static bool mergePackCopyPhases(func::FuncOp funcOp) {
++  Block &block = funcOp.getBody().front();
++  for (Operation &opRef : block) {
++    auto pack = dyn_cast<ttkernel::PackTileOp>(&opRef);
++    if (!pack) {
++      if (std::getenv("LIBTT_D2M_PM_DEBUG")) llvm::errs() << "phase-merge: skip at 5\n";
++      continue;
++    }
++    Value cb = pack.getOutCb();
++    std::optional<int64_t> src = constIndex(pack.getDstIndex());
++    std::optional<int64_t> outIdx = constIndex(pack.getOutIndex());
++    if (!src || !outIdx || *outIdx != 0) {
++      if (std::getenv("LIBTT_D2M_PM_DEBUG")) llvm::errs() << "phase-merge: skip at 11\n";
++      continue;
++    }
++    // Every use of the CB, by kind.
++    ttkernel::CopyTileOp copy;
++    SmallVector<Operation *> cbOps;
++    bool ok = true;
++    for (Operation *user : cb.getUsers()) {
++      if (user->getBlock() != &block && !isa<ttkernel::InitSFPUOp,
++                                             ttkernel::ComputeKernelHWStartupOp>(
++                                             user)) {
++        ok = false;
++        break;
++      }
++      if (auto c = dyn_cast<ttkernel::CopyTileOp>(user)) {
++        if (copy) {
++          ok = false;
++          break;
++        }
++        copy = c;
++      } else if (isa<ttkernel::PackTileOp>(user)) {
++        if (user != pack.getOperation()) {
++          ok = false;
++          break;
++        }
++      } else if (isa<ttkernel::PackReconfigDataFormatOp,
++                     ttkernel::CBPushBackOp, ttkernel::CBWaitFrontOp,
++                     ttkernel::CBPopFrontOp, ttkernel::CBReserveBackOp,
++                     ttkernel::ReconfigDataFormatSrcAOp,
++                     ttkernel::CopyTileInitOp>(user)) {
++        cbOps.push_back(user);
++      } else if (!isa<ttkernel::InitSFPUOp,
++                      ttkernel::ComputeKernelHWStartupOp>(user)) {
++        ok = false;
++        break;
++      }
++    }
++    if (!ok || !copy || !copy->isBeforeInBlock(&block.back()) ||
++        !pack->isBeforeInBlock(copy)) {
++      if (std::getenv("LIBTT_D2M_PM_DEBUG")) llvm::errs() << "phase-merge: skip at 49\n";
++      continue;
++    }
++    std::optional<int64_t> copyFrom = constIndex(copy.getTileIndexCb());
++    std::optional<int64_t> dstK = constIndex(copy.getTileIndexDst());
++    if (!copyFrom || *copyFrom != 0 || !dstK) {
++      if (std::getenv("LIBTT_D2M_PM_DEBUG")) llvm::errs() << "phase-merge: skip at 54\n";
++      continue;
++    }
++    // Between the pack and the copy: only phase-boundary ops.
++    SmallVector<Operation *> boundary;
++    int acquires = 0;
++    for (Operation *op = pack->getNextNode(); op && op != copy.getOperation();
++         op = op->getNextNode()) {
++      if (isa<ttkernel::TileRegsAcquireOp>(op)) {
++        ++acquires;
++        boundary.push_back(op);
++      } else if (isa<ttkernel::TileRegsReleaseOp,
++                     ttkernel::UnpackStallOnPackOp>(op)) {
++        boundary.push_back(op);
++      } else if (isa<ttkernel::CBPushBackOp, ttkernel::CBPopFrontOp,
++                     ttkernel::CBReserveBackOp, ttkernel::CBWaitFrontOp,
++                     ttkernel::ReconfigDataFormatSrcAOp,
++                     ttkernel::CopyTileInitOp>(op) ||
++                 isPure(op)) {
++        if (std::getenv("LIBTT_D2M_PM_DEBUG")) llvm::errs() << "phase-merge: skip at 72\n";
++        continue;
++      } else {
++        ok = false;
++        break;
++      }
++    }
++    if (!ok || acquires != 1) {
++      if (std::getenv("LIBTT_D2M_PM_DEBUG")) llvm::errs() << "phase-merge: skip at 79\n";
++      continue;
++    }
++    // The pack reconfig right before the pack (commit / wait come later,
++    // from TTKernelControlDstSection).
++    SmallVector<Operation *> before;
++    for (Operation *op = pack->getPrevNode(); op; op = op->getPrevNode()) {
++      if (isa<ttkernel::TileRegsCommitOp, ttkernel::TileRegsWaitOp,
++              ttkernel::PackReconfigDataFormatOp>(op)) {
++        before.push_back(op);
++        continue;
++      }
++      if (isPure(op)) {
++        continue;
++      }
++      break;
++    }
++    // Phase B: after the copy up to and including its pack; straight-line
++    // ops only (release / commit come later).
++    SmallVector<Operation *> phaseB;
++    Operation *packB = nullptr;
++    for (Operation *op = copy->getNextNode(); op; op = op->getNextNode()) {
++      if (op->getNumRegions() != 0 ||
++          isa<ttkernel::TileRegsAcquireOp, ttkernel::TileRegsReleaseOp>(op)) {
++        ok = false;
++        break;
++      }
++      phaseB.push_back(op);
++      if (isa<ttkernel::PackTileOp>(op)) {
++        packB = op;
++        break;
++      }
++    }
++    if (!ok || !packB) {
++      continue;
++    }
++    // Rename DST indices in phase B: dstK <-> src.
++    OpBuilder b(copy);
++    Value srcV = b.create<arith::ConstantIndexOp>(copy.getLoc(), *src);
++    Value dstV = b.create<arith::ConstantIndexOp>(copy.getLoc(), *dstK);
++    auto rename = [&](OpOperand &operand) {
++      std::optional<int64_t> c = constIndex(operand.get());
++      if (!c) {
++        return;
++      }
++      if (*c == *dstK) {
++        operand.set(srcV);
++      } else if (*c == *src) {
++        operand.set(dstV);
++      }
++    };
++    for (Operation *op : phaseB) {
++      if (auto c = dyn_cast<ttkernel::CopyTileOp>(op)) {
++        rename(c->getOpOperand(2));
++      } else if (isa<ttkernel::UnaryBcastTileOp>(op)) {
++        rename(op->getOpOperand(op->getNumOperands() - 1));
++      } else if (isa<ttkernel::PackTileOp>(op)) {
++        rename(op->getOpOperand(0));
++      } else if (op->hasTrait<ttkernel::TTKernelSFPUOpTrait>()) {
++        for (OpOperand &operand : op->getOpOperands()) {
++          if (operand.get().getType().isIndex()) {
++            rename(operand);
++          }
++        }
++      }
++    }
++    // Erase the boundary: commit/wait/reconfig/pack, release, stall, the
++    // acquire, and every remaining use of the CB.
++    SmallVector<Operation *> erase(before.begin(), before.end());
++    erase.push_back(pack);
++    erase.append(boundary.begin(), boundary.end());
++    erase.push_back(copy);
++    for (Operation *op : cbOps) {
++      if (!llvm::is_contained(erase, op)) {
++        erase.push_back(op);
++      }
++    }
++    for (Operation *op : erase) {
++      op->erase();
++    }
++    return true;
++  }
++  return false;
++}
++} // namespace
++
++namespace {
  struct ConvertD2MToTTKernel
      : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
  
-@@ -217,6 +613,34 @@ struct ConvertD2MToTTKernel
+@@ -217,6 +793,39 @@ struct ConvertD2MToTTKernel
        return;
      }
  
@@ -1384,6 +1564,11 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      }
 +    }
 +
++    if (std::getenv("LIBTT_D2M_PHASE_MERGE") &&
++        !funcOp.getBody().empty()) {
++      while (mergePackCopyPhases(funcOp)) {
++      }
++    }
 +    if (std::getenv("LIBTT_D2M_SFPI_FUSE")) {
 +      fuseSFPUChains(funcOp);
 +    }
