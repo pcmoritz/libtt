@@ -739,6 +739,48 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      rewriter.setInsertionPoint(insertionPoint->getBlock(), insertionPoint);
  
      // Get the tile index from the input operand.
+diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
+--- a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
++++ b/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <cstdlib>
+ #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
+ #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
+ 
+@@ -217,6 +218,30 @@ struct ConvertD2MToTTKernel
+       return;
+     }
+ 
++    // libtt: one hardware startup per kernel. Each compute op's conversion
++    // hoists its own compute_kernel_hw_startup / init_sfpu to the kernel
++    // start (a fused kernel had ten); every op still initializes itself and
++    // reconfigures its data formats before use, as tt-metal's kernels do
++    // after their single startup.
++    if (!std::getenv("LIBTT_D2M_KEEP_STARTUPS")) {
++      Operation *firstStartup = nullptr;
++      SmallVector<Operation *> redundant;
++      for (Operation &op : funcOp.getBody().front()) {
++        if (!isa<ttkernel::ComputeKernelHWStartupOp, ttkernel::InitSFPUOp>(
++                op)) {
++          continue;
++        }
++        if (!firstStartup) {
++          firstStartup = &op;
++        } else {
++          redundant.push_back(&op);
++        }
++      }
++      for (Operation *op : redundant) {
++        op->erase();
++      }
++    }
++
+     // The d2m.thread attr is kept until the end of this pass, when body
+     // rewrites have consumed nocIndex.
+     funcOp->removeAttr(d2m::ThreadAttr::name);
 diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp
 --- a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp
 +++ b/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp
@@ -1552,7 +1594,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -715,45 +733,751 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
+@@ -715,45 +733,753 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
  };
  } // namespace
  
@@ -2184,10 +2226,12 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +              if (in == operand.get()) {
 +                continue;
 +              }
-+              // A value read by both ops would share one DST slot, and an
-+              // in-place unary op on one use (abs) clobbers the other
-+              // (sign): the L2 clip's sign(v) read |v|.
-+              if (fusedInputs.contains(in)) {
++              // Each read of a shared value loads its own DST region (the
++              // regions are budgeted per tile input by the DST analysis), so
++              // ops reading the same value can fuse;
++              // LIBTT_D2M_FUSE_NO_SHARED=1 keeps them apart.
++              if (fusedInputs.contains(in) &&
++                  std::getenv("LIBTT_D2M_FUSE_NO_SHARED")) {
 +                sharedInput = true;
 +              }
 +              auto st = mlir::dyn_cast<ShapedType>(in.getType());
@@ -2914,7 +2958,30 @@ diff --git a/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp b/lib/Dialect/D
 diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 --- a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 +++ b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
-@@ -380,6 +380,30 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
+@@ -100,11 +100,21 @@ getMaxDstTilesForLinalgOp(linalg::GenericOp op,
+   }
+   // SFPU ops only get half of DST, and whatever is left is split evenly because
+   // every output must be resident simultaneously.
++  //
++  // libtt: an SFPU op loads each tile input into its own DST region (the
++  // result reuses the first), so a fused body with k tile inputs needs k
++  // regions per tile, not 2: three inputs at two tiles per flip overran FP32
++  // DST (4 tiles) into the other half.
+   int64_t coResidentTiles = op.getOutputs().size();
++  int64_t tileInputs = llvm::count_if(op.getDpsInputs(), [](Value in) {
++    auto st = mlir::dyn_cast<ShapedType>(in.getType());
++    return st && mlir::isa<ttcore::TileType>(st.getElementType());
++  });
++  int64_t sfpuRegions = std::max<int64_t>(2, tileInputs);
+   int64_t tilesOnHW =
+       (classifyLinalgExecutionClass(op) == DstExecutionClass::FPU)
+           ? static_cast<int64_t>(dstLogicalSizeTiles)
+-          : static_cast<int64_t>(dstLogicalSizeTiles) / 2;
++          : static_cast<int64_t>(dstLogicalSizeTiles) / sfpuRegions;
+   if (tilesOnHW < coResidentTiles) {
+     return std::nullopt;
+   }
+@@ -380,6 +390,30 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
      return results;
    }
  
