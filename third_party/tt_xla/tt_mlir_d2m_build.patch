@@ -2431,7 +2431,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
        TTNNToTTIRElementwiseConversionPattern<
            mlir::tt::ttnn::LogicalRightShiftOp,
            mlir::tt::ttir::LogicalRightShiftOp>,
-@@ -429,10 +627,209 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
+@@ -429,10 +627,210 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
  
  namespace mlir::tt {
  
@@ -2540,7 +2540,8 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +    if (auto reshape = mlir::dyn_cast<mlir::tt::ttir::ReshapeOp>(op)) {
 +      auto in = mlir::cast<RankedTensorType>(reshape.getInput().getType());
 +      auto out = mlir::cast<RankedTensorType>(reshape.getType());
-+      if (!mlir::isa<BlockArgument>(reshape.getInput()) || out.getRank() != 3) {
++      if (!mlir::isa<BlockArgument>(reshape.getInput()) || out.getRank() != 3 ||
++          in.getRank() == 0) {
 +        bailAt(43); return false;
 +      }
 +      int64_t inRows = in.getRank() == 2 ? in.getDimSize(0) : 1;
@@ -5346,7 +5347,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      auto out = reshape.getResult().getType();
 +      auto heads = in.getRank() == 3 ? in : out;
 +      auto flat = in.getRank() == 3 ? out : in;
-+      if (heads.getRank() == 3 && flat.getRank() <= 2) {
++      if (heads.getRank() == 3 && flat.getRank() <= 2 && flat.getRank() >= 1) {
 +        int64_t t = heads.getDimSize(0), h = heads.getDimSize(1),
 +                d = heads.getDimSize(2);
 +        int64_t rows = flat.getRank() == 2 ? flat.getDimSize(0) : 1;
@@ -5358,7 +5359,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          return true;
 +        }
 +      }
-+      return false;
++      // Otherwise the single-element rule below.
 +    }
 +    if (auto reshape = dyn_cast<ReshapeOp>(op)) {
 +      return reshape.getInput().getType().getNumElements() == 1 &&
@@ -5530,7 +5531,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      for (Operation &op : *block) {
        if (fusionSet.contains(&op)) {
          fusionGroup.push_back(&op);
-@@ -179,6 +402,77 @@ public:
+@@ -179,6 +402,80 @@ public:
    void runOnOperation() final {
      ModuleOp moduleOp = getOperation();
  
@@ -5544,6 +5545,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      moduleOp.walk([&](ReshapeOp r) {
 +        auto in = cast<RankedTensorType>(r.getInput().getType());
 +        auto out = cast<RankedTensorType>(r.getResult().getType());
++        if (in.getRank() == 0) {
++          return;
++        }
 +        int64_t t = in.getShape().back();
 +        if (!(in.getNumElements() == t && t <= 32 && out.getRank() == 3 &&
 +              out.getShape() == ArrayRef<int64_t>{t, 1, 1} && t > 1 &&
@@ -5608,7 +5612,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      ElementwiseFusionAnalysis analysis(moduleOp);
      auto fusionGroups = analysis.getFusionGroups();
      if (fusionGroups.empty()) {
-@@ -216,8 +510,16 @@ private:
+@@ -216,8 +513,16 @@ private:
        }
      }
  
@@ -5627,7 +5631,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (outputs.empty()) {
        TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
                     "Fusion group {} has no external outputs", groupIdx);
-@@ -229,7 +531,7 @@ private:
+@@ -229,7 +534,7 @@ private:
      Operation *lastInputDefiner = nullptr;
      for (Value v : inputs) {
        Operation *defOp = v.getDefiningOp();
@@ -5636,7 +5640,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
          lastInputDefiner = defOp;
        }
-@@ -244,14 +546,27 @@ private:
+@@ -244,14 +549,27 @@ private:
      // Get device for creating empty output buffers for DPS.
      auto device = utils::getOrInsertDevice(rewriter, firstOp);
      llvm::SmallVector<Type> inputTypes;
@@ -5667,7 +5671,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        outputTypes.push_back(tensorType);
  
        auto shapeAttr =
-@@ -289,7 +604,23 @@ private:
+@@ -289,7 +607,23 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -5692,7 +5696,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +637,20 @@ private:
+@@ -306,12 +640,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(
