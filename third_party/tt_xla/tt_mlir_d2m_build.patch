@@ -1653,7 +1653,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                 [&](std::size_t index, bool dropped) { dims[index] = dropped; });
  
      bool reduceSecondToLast = dims[rank - 2]; // "C" in tile terminology
-@@ -5493,6 +5507,153 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5493,6 +5507,221 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
  #include "ttmlir/Conversion/Passes.h.inc"
  
  namespace {
@@ -1721,6 +1721,74 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      outer.erase();
 +      innerMul.erase();
 +      break;
++    }
++  }
++}
++
++
++
++// libtt: give each user of a cheap elementwise value its own copy (TTIR,
++// before D2M), so producers shared by a row reduction and an elementwise
++// epilogue become separate generics: the reduction's copy stays on whole rows
++// while the epilogue's copy can spread over the columns (LIBTT_D2M_MERGE_SPREAD).
++static void rematerializeSharedElementwise(ModuleOp module) {
++  auto cheap = [](Operation *op) {
++    if (op->getNumResults() != 1 || op->getNumRegions() != 0) {
++      return false;
++    }
++    if (!mlir::isa<ttir::TypecastOp, ttir::MultiplyOp, ttir::AddOp,
++                   ttir::SubtractOp, ttir::AbsOp, ttir::NegOp>(op)) {
++      return false;
++    }
++    auto t = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
++    return t && llvm::all_of(op->getOperands(), [](Value v) {
++             Operation *def = v.getDefiningOp();
++             return !def || mlir::isa<BlockArgument>(v) ||
++                    mlir::isa<ttir::TypecastOp, ttir::MultiplyOp, ttir::AddOp,
++                              ttir::SubtractOp, ttir::AbsOp, ttir::NegOp,
++                              ttir::FullOp, ttir::ReshapeOp>(def);
++           });
++  };
++  // Only functions with a reduction: elsewhere copies would just split one
++  // elementwise kernel into several.
++  llvm::SmallPtrSet<Operation *, 4> reducingFuncs;
++  module.walk([&](Operation *op) {
++    if (mlir::isa<ttir::SumOp, ttir::MeanOp, ttir::MaxOp>(op)) {
++      if (auto f = op->getParentOfType<func::FuncOp>()) {
++        reducingFuncs.insert(f);
++      }
++    }
++  });
++  int budget = 32;
++  bool changed = true;
++  while (changed && budget > 0) {
++    changed = false;
++    SmallVector<Operation *> ops;
++    module.walk([&](Operation *op) {
++      auto f = op->getParentOfType<func::FuncOp>();
++      if (f && reducingFuncs.contains(f) && cheap(op)) {
++        ops.push_back(op);
++      }
++    });
++    for (Operation *op : llvm::reverse(ops)) {
++      SmallVector<Operation *> users;
++      for (Operation *u : op->getResult(0).getUsers()) {
++        if (!llvm::is_contained(users, u)) {
++          users.push_back(u);
++        }
++      }
++      if (users.size() < 2) {
++        continue;
++      }
++      for (Operation *u : llvm::drop_begin(users)) {
++        if (budget-- <= 0) {
++          break;
++        }
++        OpBuilder b(u);
++        Operation *clone = b.clone(*op);
++        u->replaceUsesOfWith(op->getResult(0), clone->getResult(0));
++        changed = true;
++      }
 +    }
 +  }
 +}
@@ -1807,13 +1875,16 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  class TTIRToD2MPass final
      : public mlir::tt::impl::TTIRToD2MBase<TTIRToD2MPass> {
  public:
-@@ -5521,6 +5682,10 @@ public:
+@@ -5521,6 +5750,13 @@ public:
    void runOnOperation() override {
      MLIRContext *ctx = &getContext();
      ModuleOp module = getOperation();
 +    if (std::getenv("LIBTT_D2M_ALGEBRA")) {
 +      simplifySignMinAbs(module);
 +      reassociateRowFactors(module);
++    }
++    if (std::getenv("LIBTT_D2M_MERGE_SPREAD")) {
++      rematerializeSharedElementwise(module);
 +    }
  
      TypeConverter typeConverter;
@@ -2014,12 +2085,49 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
  template <typename SrcOp, typename DestOp>
  class TTNNToTTIROpConversionPattern : public mlir::OpConversionPattern<SrcOp> {
    using mlir::OpConversionPattern<SrcOp>::OpConversionPattern;
-@@ -31,8 +111,37 @@ public:
+@@ -31,8 +111,74 @@ public:
      auto outputType = mlir::cast<mlir::RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResult().getType()));
  
 -    rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
 -                                        adaptor.getOperands());
++    // libtt: a binary op on FP32 operands with a BF16 result computes in FP32
++    // and narrows afterwards (D2M would otherwise pick its BF16 FPU path).
++    if constexpr (std::is_same_v<DestOp, mlir::tt::ttir::MultiplyOp> ||
++                  std::is_same_v<DestOp, mlir::tt::ttir::AddOp> ||
++                  std::is_same_v<DestOp, mlir::tt::ttir::SubtractOp>) {
++      bool fp32In = llvm::all_of(adaptor.getOperands(), [](mlir::Value v) {
++        auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
++        return t && t.getElementType().isF32();
++      });
++      mlir::ArrayAttr lhs, rhs, post;
++      if (auto binary =
++              mlir::dyn_cast<mlir::tt::ttnn::ElementwiseBinaryActivations>(
++                  srcOp.getOperation())) {
++        lhs = binary.getInputTensorAActivations();
++        rhs = binary.getInputTensorBActivations();
++        post = binary.getActivations();
++      }
++      bool expandable = mlir::tt::canExpandTTNNActivations(lhs) &&
++                        mlir::tt::canExpandTTNNActivations(rhs) &&
++                        mlir::tt::canExpandTTNNActivations(post);
++      if (fp32In && expandable && outputType.getElementType().isBF16()) {
++        mlir::Location loc = srcOp.getLoc();
++        auto wide = mlir::RankedTensorType::get(
++            outputType.getShape(), rewriter.getF32Type(),
++            outputType.getEncoding());
++        llvm::SmallVector<mlir::Value> operands(adaptor.getOperands());
++        operands[0] = applyActivations(rewriter, loc, operands[0], lhs);
++        operands[1] = applyActivations(rewriter, loc, operands[1], rhs);
++        mlir::Value result =
++            rewriter.create<DestOp>(loc, wide, operands).getResult();
++        result = applyActivations(rewriter, loc, result, post);
++        rewriter.replaceOpWithNewOp<mlir::tt::ttir::TypecastOp>(
++            srcOp, outputType, result);
++        return mlir::success();
++      }
++    }
++
 +    if (auto binary = mlir::dyn_cast<mlir::tt::ttnn::ElementwiseBinaryActivations>(
 +            srcOp.getOperation())) {
 +      mlir::ArrayAttr lhs = binary.getInputTensorAActivations();
@@ -2054,7 +2162,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
  
      return mlir::success();
    }
-@@ -71,6 +180,38 @@ public:
+@@ -71,6 +217,38 @@ public:
                    })))
              : nullptr;
  
@@ -2093,7 +2201,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
      rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType, adaptor.getInput(),
                                          srcOp.getKeepDim(), dimArgAttr);
  
-@@ -242,12 +383,29 @@ public:
+@@ -242,12 +420,29 @@ public:
      auto outputType = mlir::cast<mlir::RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResult().getType()));
  
@@ -2124,7 +2232,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
          /*layout=*/mlir::tt::ttcore::MetalLayoutAttr{});
  
      return mlir::success();
-@@ -398,8 +556,7 @@ addElementwiseBinaryOpsConversionPatterns(mlir::MLIRContext *ctx,
+@@ -398,8 +593,7 @@ addElementwiseBinaryOpsConversionPatterns(mlir::MLIRContext *ctx,
        TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::BitwiseXorOp,
                                               mlir::tt::ttir::BitwiseXorOp>,
        TTNNToTTIRElementwiseConversionPattern<
@@ -2134,7 +2242,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
        TTNNToTTIRElementwiseConversionPattern<
            mlir::tt::ttnn::LogicalRightShiftOp,
            mlir::tt::ttir::LogicalRightShiftOp>,
-@@ -429,6 +586,17 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
+@@ -429,6 +623,17 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
  
  namespace mlir::tt {
  
@@ -2379,7 +2487,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -715,45 +735,838 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
+@@ -715,45 +735,878 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
  };
  } // namespace
  
@@ -2725,14 +2833,36 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +    }
 +    if (generics.size() < 2 ||
 +        !llvm::all_of(generics, [](GenericOp g) {
-+          return g->hasAttr("d2m.unsplit_dims");
++          return g->hasAttr("d2m.unsplit_dims") ||
++                 g->hasAttr("d2m.row_merge_member");
 +        })) {
 +      continue;
 +    }
++    // The merged grid is the largest member grid; members on one core per
++    // row (grid [R, 1]) are recomputed on every core of their row.
 +    GenericOp first = generics.front();
++    for (GenericOp g : generics) {
++      if (g.getGrid().getGridVolume() > first.getGrid().getGridVolume()) {
++        first = g;
++      }
++    }
++    ArrayRef<int64_t> mergedGrid = first.getGrid().getShape();
++    auto gridFits = [&](GenericOp g) {
++      ArrayRef<int64_t> shape = g.getGrid().getShape();
++      if (shape.size() != mergedGrid.size()) {
++        return false;
++      }
++      for (auto [a, b] : llvm::zip(shape, mergedGrid)) {
++        if (a != b && a != 1) {
++          return false;
++        }
++      }
++      return true;
++    };
 +    bool uniform = llvm::all_of(generics, [&](GenericOp g) {
-+      return g.getGrid() == first.getGrid() &&
-+             g.getBlockFactors() == first.getBlockFactors() &&
++      return gridFits(g) &&
++             (g.getGrid() != first.getGrid() ||
++              g.getBlockFactors() == first.getBlockFactors()) &&
 +             g.getRegion(0).hasOneBlock() &&
 +             llvm::all_of(g.getRegion(0).front(), [](Operation &op) {
 +               return isa<tensor::EmptyOp, RemoteLoadOp, RemoteStoreOp,
@@ -2764,9 +2894,20 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +      }
 +    }
 +    MLIRContext *ctx = module.getContext();
++    const bool spreadGroup = llvm::any_of(
++        generics, [&](GenericOp g) { return g.getGrid() != first.getGrid(); });
 +    auto mapFor = [&](Value v) {
-+      auto [r, c] = tiles(v);
 +      AffineExpr zero = getAffineConstantExpr(0, ctx);
++      if (spreadGroup) {
++        // By the operand's own grid: a dim it does not split is block 0.
++        auto shape = mlir::cast<ShapedType>(v.getType()).getShape();
++        return AffineMap::get(
++            2, 0,
++            {shape[0] == mergedGrid[0] ? getAffineDimExpr(0, ctx) : zero,
++             shape[1] == mergedGrid[1] ? getAffineDimExpr(1, ctx) : zero},
++            ctx);
++      }
++      auto [r, c] = tiles(v);
 +      return AffineMap::get(
 +          2, 0,
 +          {r == rows ? getAffineDimExpr(0, ctx) : zero,
@@ -2866,7 +3007,9 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +        rewriter.getAffineMapArrayAttr(maps),
 +        rewriter.getArrayAttr({parallel, colIter}), first.getThreads(),
 +        first.getFabricConnectionConfigAttr(), /*regions=*/1);
-+    merged->setAttr("d2m.unsplit_dims", first->getAttr("d2m.unsplit_dims"));
++    if (Attribute unsplit = first->getAttr("d2m.unsplit_dims")) {
++      merged->setAttr("d2m.unsplit_dims", unsplit);
++    }
 +
 +    Block &block = merged.getRegion(0).emplaceBlock();
 +    rewriter.setInsertionPointToStart(&block);
@@ -2903,7 +3046,12 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +    for (GenericOp g : generics) {
 +      for (Operation &op : g.getRegion(0).front()) {
 +        if (auto bi = dyn_cast<BlockIndexOp>(op)) {
-+          irMap.map(bi.getResult(), bi.getDim() == 0 ? block0 : block1);
++          // A member not split along a dim the merged grid splits sees block
++          // 0 there (its whole extent on every core).
++          int64_t dim = bi.getDim();
++          bool split = g.getGrid().getShape()[dim] == mergedGrid[dim];
++          irMap.map(bi.getResult(),
++                    !split ? c0 : (dim == 0 ? block0 : block1));
 +        } else if (auto load = dyn_cast<RemoteLoadOp>(op)) {
 +          Value src = load.getMemref();
 +          Value repl;
@@ -3258,7 +3406,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Tran
  #include "mlir/IR/AffineMap.h"
  #include "mlir/IR/Builders.h"
  #include "mlir/IR/BuiltinOps.h"
-@@ -940,8 +945,92 @@ public:
+@@ -940,8 +945,143 @@ public:
      this->ttnnMode = options.ttnnMode;
    }
  
@@ -3336,8 +3484,59 @@ diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Tran
 +      if (std::getenv("LIBTT_D2M_MERGE_ONE_CORE")) {
 +        unsplit = {0, 1};
 +      }
++      // LIBTT_D2M_MERGE_SPREAD=1: only members that reduce over the columns
++      // (or have a single column) stay on one core per row; elementwise
++      // members spread over the columns, and the merged kernel recomputes
++      // each row's reductions on every core of that row.
++      const bool spread = std::getenv("LIBTT_D2M_MERGE_SPREAD") != nullptr;
++      // Members feeding a reduction (directly or through other members, also
++      // through views) must stay on whole rows.
++      llvm::SmallPtrSet<Operation *, 16> feedsReduction;
++      for (GenericOp g : llvm::reverse(generics)) {
++        bool feeds = false;
++        SmallVector<Value> work(g->getResults().begin(),
++                                g->getResults().end());
++        llvm::SmallPtrSet<Operation *, 16> seen;
++        while (!work.empty() && !feeds) {
++          Value v = work.pop_back_val();
++          for (Operation *user : v.getUsers()) {
++            if (!seen.insert(user).second) {
++              continue;
++            }
++            Operation *anc = func.getBody().front().findAncestorOpInBlock(
++                *user);
++            auto ug = anc ? dyn_cast<GenericOp>(anc) : GenericOp();
++            if (ug && ug != g) {
++              if (ug.getIteratorTypesValue()[1] ==
++                      ttcore::IteratorType::Reduction ||
++                  feedsReduction.contains(ug)) {
++                feeds = true;
++              }
++            } else if (!ug && user->getNumResults() > 0) {
++              for (Value r : user->getResults()) {
++                work.push_back(r);
++              }
++            }
++          }
++        }
++        if (feeds) {
++          feedsReduction.insert(g);
++        }
++      }
 +      for (GenericOp g : generics) {
-+        g->setAttr("d2m.unsplit_dims", b.getI64ArrayAttr(unsplit));
++        bool keepRow = true;
++        if (spread &&
++            g.getIteratorTypesValue()[1] != ttcore::IteratorType::Reduction &&
++            !feedsReduction.contains(g)) {
++          keepRow = llvm::all_of(g->getOperands(), [&](Value v) {
++            return tiles(v)->second == 1;
++          });
++        }
++        if (keepRow) {
++          g->setAttr("d2m.unsplit_dims", b.getI64ArrayAttr(unsplit));
++        } else {
++          g->setAttr("d2m.row_merge_member", b.getUnitAttr());
++        }
 +      }
 +    });
 +  }
@@ -4489,7 +4688,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  class ElementwiseFusionAnalysis {
  public:
    using FusionGroup = llvm::SmallVector<Operation *>;
-@@ -44,24 +59,177 @@ public:
+@@ -44,24 +59,191 @@ public:
      if (!op) {
        return false;
      }
@@ -4616,13 +4815,27 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +        return false;
 +      }
 +    }
++    // libtt (EXT): with FP32 operands the op runs on the SFPU in FP32 DST
++    // and only the pack narrows to BF16 (no FPU destination reuse).
++    auto fp32Operands = [](Operation *o) {
++      return llvm::all_of(o->getOperands(), [](Value v) {
++        auto t = dyn_cast<RankedTensorType>(v.getType());
++        return t && t.getElementType().isF32();
++      });
++    };
 +    if (isa<AddOp, SubtractOp, MultiplyOp, DivideOp>(op) &&
 +        cast<RankedTensorType>(op->getResult(0).getType())
 +            .getElementType()
-+            .isBF16()) {
++            .isBF16() &&
++        !(extended && fp32Operands(op))) {
 +      // The FPU destination-reuse path does not preserve mixed register
 +      // state across a following widening cast.
 +      return false;
++    }
++    // libtt experiment: LIBTT_D2M_VIEWS=1 lets reshapes and permutes in
++    // (D2M lowers them as views).
++    if (isa<ReshapeOp, PermuteOp>(op) && std::getenv("LIBTT_D2M_VIEWS")) {
++      return true;
 +    }
 +    if (auto reshape = dyn_cast<ReshapeOp>(op)) {
 +      return reshape.getInput().getType().getNumElements() == 1 &&
@@ -4675,7 +4888,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
-@@ -69,13 +237,28 @@ public:
+@@ -69,13 +251,28 @@ public:
    }
  
  private:
@@ -4710,7 +4923,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            return false;
          }
        }
-@@ -89,13 +272,16 @@ private:
+@@ -89,13 +286,16 @@ private:
      llvm::SmallVector<Operation *> exitOps;
      rootOp->walk([&](Block *block) {
        for (Operation &op : llvm::reverse(*block)) {
@@ -4728,7 +4941,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        FusionGroup group = buildFusionGroup(exitOp);
  
        if (group.size() >= 2) {
-@@ -119,41 +305,40 @@ private:
+@@ -119,41 +319,40 @@ private:
      }
    }
  
@@ -4794,7 +5007,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      for (Operation &op : *block) {
        if (fusionSet.contains(&op)) {
          fusionGroup.push_back(&op);
-@@ -216,8 +401,16 @@ private:
+@@ -216,8 +415,16 @@ private:
        }
      }
  
@@ -4813,7 +5026,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (outputs.empty()) {
        TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
                     "Fusion group {} has no external outputs", groupIdx);
-@@ -229,7 +422,7 @@ private:
+@@ -229,7 +436,7 @@ private:
      Operation *lastInputDefiner = nullptr;
      for (Value v : inputs) {
        Operation *defOp = v.getDefiningOp();
@@ -4822,7 +5035,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
          lastInputDefiner = defOp;
        }
-@@ -244,14 +437,27 @@ private:
+@@ -244,14 +451,27 @@ private:
      // Get device for creating empty output buffers for DPS.
      auto device = utils::getOrInsertDevice(rewriter, firstOp);
      llvm::SmallVector<Type> inputTypes;
@@ -4853,7 +5066,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        outputTypes.push_back(tensorType);
  
        auto shapeAttr =
-@@ -289,7 +495,21 @@ private:
+@@ -289,7 +509,21 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -4876,7 +5089,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +526,20 @@ private:
+@@ -306,12 +540,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(
