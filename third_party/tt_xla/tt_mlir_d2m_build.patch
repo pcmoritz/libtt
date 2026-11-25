@@ -13,6 +13,57 @@ diff --git a/include/ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h b/include/ttmlir/
  } // namespace mlir::tt
  
  #endif // TTMLIR_CONVERSION_TTNNTOTTIR_TTNNTOTTIR_H
+diff --git a/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h b/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h
+--- a/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h
++++ b/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h
+@@ -316,6 +316,17 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
+ 
+ bool isDstScopeIV(Value iv, Operation *linalgRoot);
+ 
++// libtt: loop IVs DST indices must not depend on: the reduction loops of the
++// root being processed when its reduction reads a value computed in DST
++// (elementwise producers fused into the reduction). Those operands are loaded
++// per reduction iteration into fixed slices instead of one slice per reduced
++// tile hoisted ahead of the loop.
++llvm::DenseSet<Value> &excludedDstIVs();
++
++// libtt: a tile_sfpu_reduce_* whose reduced operand is computed in the same
++// loop nest (not loaded from a CB).
++bool isFusedSFPUReduction(Operation *op);
++
+ std::tuple<AffineMap, SmallVector<Value>, AffineMap, SmallVector<Value>>
+ buildIndices(PatternRewriter &rewriter, Location loc,
+              const mlir::IRMapping &irMapper, const DstAccess &access,
+diff --git a/include/ttmlir/Dialect/D2M/Utils/DstRegisterAnalysis.h b/include/ttmlir/Dialect/D2M/Utils/DstRegisterAnalysis.h
+--- a/include/ttmlir/Dialect/D2M/Utils/DstRegisterAnalysis.h
++++ b/include/ttmlir/Dialect/D2M/Utils/DstRegisterAnalysis.h
+@@ -5,6 +5,7 @@
+ #ifndef TTMLIR_DIALECT_D2M_UTILS_DSTREGISTERANALYSIS_H
+ #define TTMLIR_DIALECT_D2M_UTILS_DSTREGISTERANALYSIS_H
+ 
++#include "mlir/Dialect/Linalg/IR/Linalg.h"
+ #include "mlir/IR/Operation.h"
+ #include "mlir/IR/Value.h"
+ #include "llvm/ADT/DenseMap.h"
+@@ -15,6 +16,18 @@ class GenericOp;
+ 
+ namespace mlir::tt::d2m::utils {
+ 
++/// libtt: DST slices one tile of a linalg tile body needs at once under the
++/// unscheduled DST allocator (D2MInsertDstRegisterAccessUnscheduled): one per
++/// CB-loaded operand use (loads are hoisted ahead of the body and never
++/// freed), one per fresh intermediate while it is live, plus scratch slices.
++int64_t estimateDstSlicesPerTile(linalg::GenericOp op);
++
++/// libtt: half-sync DST capacity in tiles for the widest tile type a linalg
++/// tile body touches (the unscheduled allocator sizes by the region's widest
++/// type, not by the outputs).
++unsigned getDstCapacityTilesForBody(linalg::GenericOp op,
++                                    unsigned maxDstPhysicalSizeTiles = 0);
++
+ struct DSTPackingPerResultInfo {
+   int64_t numDstFlips = 0;
+   int64_t numTilesPerFlip = 0;
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
@@ -396,7 +447,61 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  #include "mlir/IR/Builders.h"
  #include "mlir/IR/BuiltinTypes.h"
  #include "mlir/IR/MLIRContext.h"
-@@ -501,8 +502,41 @@ static Value getOutCB(ConversionPatternRewriter &rewriter, Operation *op) {
+@@ -32,6 +33,7 @@
+ #include "llvm/ADT/SmallPtrSet.h"
+ 
+ #include "llvm/Support/LogicalResult.h"
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstdint>
+ #include <memory>
+@@ -436,6 +438,45 @@ static Value buildFirstReductionIterationGuard(OpBuilder &rewriter,
+   return guard;
+ }
+ 
++// libtt: true on the last iteration of every enclosing loop that does not
++// index the accumulator (the reduction loops); a null Value when there are
++// none. Fails unless those loops have constant bounds and steps.
++static FailureOr<Value> buildLastReductionIterationGuard(OpBuilder &rewriter,
++                                                         Location loc,
++                                                         Operation *op,
++                                                         Value dstIndex) {
++  Value guard;
++  for (Operation *loop : getEnclosingLoops(op)) {
++    Value loopIV = getSingleBlockLoopIV(loop);
++    if (!loopIV || valueDependsOn(dstIndex, loopIV)) {
++      continue;
++    }
++    std::optional<int64_t> lb, ub, step;
++    if (auto affineFor = dyn_cast<affine::AffineForOp>(loop)) {
++      if (affineFor.hasConstantBounds()) {
++        lb = affineFor.getConstantLowerBound();
++        ub = affineFor.getConstantUpperBound();
++        step = affineFor.getStepAsInt();
++      }
++    } else if (auto scfFor = dyn_cast<scf::ForOp>(loop)) {
++      lb = getConstantIntValue(scfFor.getLowerBound());
++      ub = getConstantIntValue(scfFor.getUpperBound());
++      step = getConstantIntValue(scfFor.getStep());
++    }
++    if (!lb || !ub || !step || *step <= 0 || *ub <= *lb) {
++      return failure();
++    }
++    int64_t last = *lb + ((*ub - *lb - 1) / *step) * *step;
++    Value lastValue = rewriter.create<arith::ConstantIndexOp>(loc, last);
++    Value isLast = rewriter.create<arith::CmpIOp>(
++        loc, arith::CmpIPredicate::eq, loopIV, lastValue);
++    guard = guard ? rewriter.create<arith::AndIOp>(loc, guard, isLast)
++                        .getResult()
++                  : isLast;
++  }
++  return guard;
++}
++
+ // Remapped L1 CB for a tile loaded from L1; null if the value is not an L1 load
+ // (including DST-only producers such as tile_fill).
+ static Value tryGetL1CbFromTensorShardLoad(ConversionPatternRewriter &rewriter,
+@@ -501,8 +542,41 @@ static Value getOutCB(ConversionPatternRewriter &rewriter, Operation *op) {
    return getRemappedFirstL1Cb(rewriter, op, /*forInput=*/false);
  }
  
@@ -438,7 +543,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
    if (auto affineLoad = operand.getDefiningOp<affine::AffineLoadOp>()) {
      return ttcore::getMemorySpace(affineLoad.getMemRef()) ==
             ttcore::MemorySpace::RegisterDst;
-@@ -962,7 +996,16 @@ using IntComputeOpMap = OpMap<
+@@ -962,7 +1036,16 @@ using IntComputeOpMap = OpMap<
    std::pair<d2m::TileSubOp,        std::pair<ttkernel::SubIntTileInitOp,          ttkernel::SubIntTileOp>>,
    std::pair<d2m::TileMulOp,        std::pair<ttkernel::MulIntTileInitOp,          ttkernel::MulIntTileOp>>,
    std::pair<d2m::TileMaximumOp,    std::pair<ttkernel::BinaryMaxInt32TileInitOp,  ttkernel::BinaryMaxInt32TileOp>>,
@@ -456,7 +561,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  >;
  // clang-format on
  
-@@ -993,6 +1036,18 @@ template <typename Op>
+@@ -993,6 +1076,18 @@ template <typename Op>
  constexpr bool needsDtypeArg = std::is_same_v<Op, ttkernel::MulIntTileInitOp> ||
                                 std::is_same_v<Op, ttkernel::AddIntTileOp> ||
                                 std::is_same_v<Op, ttkernel::SubIntTileOp> ||
@@ -475,7 +580,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
                                 std::is_same_v<Op, ttkernel::MulIntTileOp>;
  
  namespace {
-@@ -1198,10 +1253,22 @@ public:
+@@ -1198,10 +1293,22 @@ public:
        auto cb = getCB(rewriter, op.getInput());
        auto dstIdx = getDstIdxFromResult(op.getResult());
        ensureDominatesInsertionPoint(rewriter, dstIdx);
@@ -499,7 +604,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else if constexpr (arity == 2) {
        auto dstIdx = getDstIdxFromResult(op.getResult());
        ensureDominatesInsertionPoint(rewriter, dstIdx);
-@@ -1254,10 +1321,11 @@ public:
+@@ -1254,18 +1361,47 @@ public:
        break;
      }
  
@@ -509,11 +614,25 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
 +    // reductions, see TTIRToD2M) seed, combine and reduce in FP32.
      const auto inTileType = mlir::cast<ttcore::TileType>(op.getA().getType());
      ttcore::DataType dataFormat = inTileType.getDataType();
+-
+-    Value cbA = getCB(rewriter, op.getA());
 +    const bool isFloat = dataFormat == ttcore::DataType::Float32;
- 
-     Value cbA = getCB(rewriter, op.getA());
++
++    // libtt: the reduced operand may be computed in DST (fused producers);
++    // then it is reduced in place instead of copied from its CB.
++    bool aInDst = false;
++    if (auto load = op.getA().template getDefiningOp<affine::AffineLoadOp>()) {
++      aInDst = ttcore::getMemorySpace(load.getMemRef()) ==
++               ttcore::MemorySpace::RegisterDst;
++    } else if (auto mload =
++                   op.getA().template getDefiningOp<memref::LoadOp>()) {
++      aInDst = ttcore::getMemorySpace(mload.getMemRef()) ==
++               ttcore::MemorySpace::RegisterDst;
++    }
      Value outCB = getOutCB(rewriter, op);
-@@ -1266,6 +1334,23 @@ public:
++    Value cbA = aInDst ? outCB : getCB(rewriter, op.getA());
+     Value cIdx = adaptor.getC();
+ 
      int32_t identityInt = (reduceType == ttkernel::ReduceType::Max)
                                ? std::numeric_limits<int32_t>::min()
                                : 0;
@@ -537,7 +656,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  
      std::optional<int64_t> cIdxVal = getConstantIntValue(cIdx);
  
-@@ -1274,29 +1359,16 @@ public:
+@@ -1274,29 +1410,16 @@ public:
        setInsertionPointAfterOperands(rewriter, {cbA, outCB},
                                       /*allowHoisting*/ true);
        rewriter.create<ttkernel::InitSFPUOp>(op->getLoc(), cbA, outCB);
@@ -574,7 +693,57 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  
        Value seedGuard =
            buildFirstReductionIterationGuard(rewriter, op->getLoc(), op, cIdx);
-@@ -1335,9 +1407,19 @@ public:
+@@ -1317,33 +1440,77 @@ public:
+                              "d2m-insert-dst-register-access before lowering");
+     }
+     Value tempIdx =
+-        rewriter.create<arith::ConstantIndexOp>(op->getLoc(), scratchIdxVal);
+-
+-    rewriter.create<ttkernel::CopyTileInitOp>(op->getLoc(), cbA);
+-    rewriter.create<ttkernel::CopyTileOp>(op->getLoc(), cbA, adaptor.getA(),
+-                                          tempIdx);
+-    rewriter.create<ttkernel::SFPUReduceInitOp>(op->getLoc(), reduceType,
+-                                                dataFormat);
++        aInDst ? adaptor.getA()
++               : rewriter.create<arith::ConstantIndexOp>(op->getLoc(),
++                                                         scratchIdxVal)
++                     .getResult();
++
++    if (!aInDst) {
++      rewriter.create<ttkernel::CopyTileInitOp>(op->getLoc(), cbA);
++      rewriter.create<ttkernel::CopyTileOp>(op->getLoc(), cbA, adaptor.getA(),
++                                            tempIdx);
++    }
+     SmallVector<ttkernel::ReduceDim> sfpuDims =
+         (kernelReduceDim == ttkernel::ReduceDim::Scalar)
+             ? SmallVector<ttkernel::ReduceDim>{ttkernel::ReduceDim::Col,
+                                                ttkernel::ReduceDim::Row}
+             : SmallVector<ttkernel::ReduceDim>{kernelReduceDim};
+-    for (ttkernel::ReduceDim dim : sfpuDims) {
+-      rewriter.create<ttkernel::SFPUReduceTileOp>(op->getLoc(), tempIdx,
+-                                                  reduceType, dataFormat, dim);
++    auto emitReduce = [&](Value idx) {
++      rewriter.create<ttkernel::SFPUReduceInitOp>(op->getLoc(), reduceType,
++                                                  dataFormat);
++      for (ttkernel::ReduceDim dim : sfpuDims) {
++        rewriter.create<ttkernel::SFPUReduceTileOp>(op->getLoc(), idx,
++                                                    reduceType, dataFormat,
++                                                    dim);
++      }
++    };
++
++    // libtt: sum and max are elementwise across the reduced tiles, so
++    // accumulate whole tiles and reduce within the tile once, on the last
++    // reduction iteration, instead of an SFPU tile reduction per input tile
++    // (a 128-wide row: four reductions -> one). LIBTT_D2M_REDUCE_EACH=1
++    // keeps the per-tile reduction.
++    FailureOr<Value> lastGuard =
++        std::getenv("LIBTT_D2M_REDUCE_EACH")
++            ? FailureOr<Value>(failure())
++            : buildLastReductionIterationGuard(rewriter, op->getLoc(), op,
++                                               cIdx);
++    if (failed(lastGuard)) {
++      emitReduce(tempIdx);
      }
  
      if constexpr (std::is_same_v<ConcreteOp, d2m::TileSFPUReduceSumOp>) {
@@ -597,7 +766,25 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else {
        rewriter.create<ttkernel::BinaryMaxInt32TileInitOp>(op->getLoc());
        rewriter.create<ttkernel::BinaryMaxInt32TileOp>(op->getLoc(), tempIdx,
-@@ -1423,8 +1505,13 @@ public:
+                                                       cIdx, cIdx);
+     }
+ 
++    if (succeeded(lastGuard)) {
++      if (*lastGuard) {
++        auto ifOp = rewriter.create<scf::IfOp>(op->getLoc(), *lastGuard,
++                                               /*withElseRegion=*/false);
++        OpBuilder::InsertionGuard guard(rewriter);
++        rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
++        emitReduce(cIdx);
++      } else {
++        emitReduce(cIdx);
++      }
++    }
++
+     rewriter.eraseOp(op);
+     return success();
+   }
+@@ -1423,8 +1590,13 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
@@ -613,7 +800,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else {
        rewriter.create<InitOp>(op->getLoc());
      }
-@@ -1439,8 +1526,11 @@ public:
+@@ -1439,8 +1611,11 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
@@ -627,7 +814,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else if constexpr (std::is_same_v<SFPUOp, ttkernel::ClampScalarTileOp>) {
        auto loc = op->getLoc();
        // The hardware clamp API takes i32 params for both int and float clamps.
-@@ -1577,9 +1667,13 @@ public:
+@@ -1577,9 +1752,13 @@ public:
                                        adaptor.getFalseValue(), dstIdx},
                                       /*allowHoisting*/ false);
        if constexpr (std::is_same_v<ConcreteOp, d2m::TileWhereOp>) {
@@ -644,7 +831,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
          rewriter.create<ttkernel::WhereTileOp>(
              op->getLoc(), adaptor.getCondition(), adaptor.getTrueValue(),
              adaptor.getFalseValue(), dstIdx, dtype);
-@@ -1629,6 +1723,17 @@ public:
+@@ -1629,6 +1808,17 @@ public:
        return emitFPUTiles(rewriter, op, adaptor, loc);
      }
  
@@ -662,7 +849,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      if (lhsFromDst) {
        // LHS from Dst, RHS from Cb (FPU - DEST_TO_SRCA)
        return emitFPUBinaryDestReuse(rewriter, op, adaptor, loc,
-@@ -1737,6 +1842,61 @@ private:
+@@ -1737,6 +1927,61 @@ private:
      return success();
    }
  
@@ -724,7 +911,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
    // One operand from Dst, use binary_dest_reuse
    LogicalResult emitFPUBinaryDestReuse(ConversionPatternRewriter &rewriter,
                                         ConcreteOp op,
-@@ -2087,12 +2247,9 @@ public:
+@@ -2087,12 +2332,9 @@ public:
  
      Value inCB = getInCB(rewriter, op);
  
@@ -742,15 +929,365 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
 diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
 --- a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
 +++ b/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,13 @@
  //
  // SPDX-License-Identifier: Apache-2.0
  
++#include <string>
++#include <map>
++#include "mlir/Dialect/Utils/StaticValueUtils.h"
++#include "mlir/Interfaces/SideEffectInterfaces.h"
++#include "llvm/ADT/Hashing.h"
++#include "llvm/Support/FormatVariadic.h"
 +#include <cstdlib>
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -217,6 +218,30 @@ struct ConvertD2MToTTKernel
+@@ -42,7 +49,343 @@ namespace mlir::tt::d2m {
+ } // namespace mlir::tt::d2m
+ 
+ namespace {
++// libtt: fuse runs of elementwise SFPU tile ops into one SFPI function.
++//
++// tt-metal's SFPU LLKs each make a full pass over DST (load, op, store for
++// every row of the tile); a chain of N ops is N passes. A run of supported
++// ops between other kernel calls (copies, broadcasts, packs, control flow)
++// becomes one function that loads each DST tile once per row, applies the
++// whole chain in SFPU registers and stores each written tile once. Only for
++// FP32 DST (32-bit CBs), where the per-op LLKs compute and store in FP32 too.
++class SFPUChainEmitter {
++public:
++  // Returns false if `op` cannot be part of a chain.
++  bool add(Operation *op) {
++    auto un = [&](Value idx, const char *fmt) {
++      int k = slot(idx);
++      std::string x = read(k);
++      write(k, llvm::formatv(fmt, x).str());
++    };
++    auto bin = [&](Value i0, Value i1, Value out, const char *fmt) {
++      std::string x = read(slot(i0));
++      std::string y = read(slot(i1));
++      write(slot(out), llvm::formatv(fmt, x, y).str());
++    };
++    auto scalar = [&](Value idx, Value p, const char *fmt) {
++      int k = slot(idx);
++      std::string x = read(k);
++      std::string c = "libtt_sfpu::bits(" + param(p) + ")";
++      write(k, llvm::formatv(fmt, x, c).str());
++    };
++    auto select = [&](int out, const std::string &code, const std::string &t) {
++      lines.push_back(code);
++      assign(out, t);
++    };
++    if (auto m = dyn_cast<ttkernel::MulBinaryTilesOp>(op)) {
++      bin(m.getDst0Index(), m.getDst1Index(), m.getOdstIndex(), "{0} * {1}");
++    } else if (auto m = dyn_cast<ttkernel::AddBinaryTilesOp>(op)) {
++      bin(m.getDst0Index(), m.getDst1Index(), m.getOdstIndex(), "{0} + {1}");
++    } else if (auto m = dyn_cast<ttkernel::SubBinaryTilesOp>(op)) {
++      bin(m.getDst0Index(), m.getDst1Index(), m.getOdstIndex(), "{0} - {1}");
++    } else if (auto m = dyn_cast<ttkernel::BinaryMaxTileOp>(op)) {
++      std::string x = read(slot(m.getDst0Index()));
++      std::string y = read(slot(m.getDst1Index()));
++      std::string t = fresh();
++      select(slot(m.getOdstIndex()),
++             llvm::formatv("sfpi::vFloat {0} = {1}; v_if({1} < {2}) {{ {0} = "
++                           "{2}; } v_endif;",
++                           t, x, y)
++                 .str(),
++             t);
++    } else if (auto m = dyn_cast<ttkernel::BinaryMinTileOp>(op)) {
++      std::string x = read(slot(m.getDst0Index()));
++      std::string y = read(slot(m.getDst1Index()));
++      std::string t = fresh();
++      select(slot(m.getOdstIndex()),
++             llvm::formatv("sfpi::vFloat {0} = {1}; v_if({2} < {1}) {{ {0} = "
++                           "{2}; } v_endif;",
++                           t, x, y)
++                 .str(),
++             t);
++    } else if (auto m = dyn_cast<ttkernel::MulUnaryTileOp>(op)) {
++      scalar(m.getDst0Index(), m.getParam(), "{0} * {1}");
++    } else if (auto m = dyn_cast<ttkernel::DivUnaryTileOp>(op)) {
++      // The host passes the reciprocal (tt-metal's DIV mode multiplies).
++      scalar(m.getDst0Index(), m.getParam(), "{0} * {1}");
++    } else if (auto m = dyn_cast<ttkernel::AddUnaryTileOp>(op)) {
++      scalar(m.getDst0Index(), m.getParam(), "{0} + {1}");
++    } else if (auto m = dyn_cast<ttkernel::SubUnaryTileOp>(op)) {
++      scalar(m.getDst0Index(), m.getParam(), "{0} - {1}");
++    } else if (auto m = dyn_cast<ttkernel::AbsTileOp>(op)) {
++      un(m.getDst0Index(), "sfpi::abs({0})");
++    } else if (isa<ttkernel::NegativeTileOp>(op)) {
++      un(op->getOperand(0), "-{0}");
++    } else if (auto m = dyn_cast<ttkernel::RsqrtTileOp>(op)) {
++      un(m.getTileIndex(), "libtt_sfpu::rsqrt({0})");
++    } else if (isa<ttkernel::SqrtTileOp>(op)) {
++      un(op->getOperand(0), "libtt_sfpu::sqrt({0})");
++    } else if (isa<ttkernel::RecipTileOp>(op)) {
++      un(op->getOperand(0), "libtt_sfpu::recip({0})");
++    } else if (auto m = dyn_cast<ttkernel::SignTileOp>(op)) {
++      int k = slot(m.getTileIndex());
++      std::string x = read(k);
++      std::string t = fresh();
++      select(k,
++             llvm::formatv("sfpi::vFloat {0} = 0.0f; v_if({1} > 0.0f) {{ {0} "
++                           "= 1.0f; } v_elseif({1} < 0.0f) {{ {0} = -1.0f; } "
++                           "v_endif;",
++                           t, x)
++                 .str(),
++             t);
++    } else if (auto m = dyn_cast<ttkernel::ClampScalarTileOp>(op)) {
++      int k = slot(m.getDstIndex());
++      std::string x = read(k);
++      std::string lo = "libtt_sfpu::bits(" + param(m.getMinParam()) + ")";
++      std::string hi = "libtt_sfpu::bits(" + param(m.getMaxParam()) + ")";
++      std::string t = fresh();
++      select(k,
++             llvm::formatv("sfpi::vFloat {0} = {1}; v_if({0} < {2}) {{ {0} = "
++                           "{2}; } v_endif; v_if({0} > {3}) {{ {0} = {3}; } "
++                           "v_endif;",
++                           t, x, lo, hi)
++                 .str(),
++             t);
++    } else if (auto m = dyn_cast<ttkernel::FillTileOp>(op)) {
++      int k = slot(m.getDstIndex());
++      std::string t = fresh();
++      select(k,
++             llvm::formatv("sfpi::vFloat {0} = sfpi::vFloat({1});", t,
++                           param(m.getValue()))
++                 .str(),
++             t);
++    } else {
++      return false;
++    }
++    ++numOps;
++    return true;
++  }
++
++  static bool isInit(Operation *op) {
++    return isa<ttkernel::MulBinaryTilesInitOp, ttkernel::AddBinaryTilesInitOp,
++               ttkernel::SubBinaryTilesInitOp, ttkernel::BinaryMaxTileInitOp,
++               ttkernel::BinaryMinTileInitOp,
++               ttkernel::BinopWithScalarTileInitOp, ttkernel::AbsTileInitOp,
++               ttkernel::NegativeTileInitOp, ttkernel::SignTileInitOp,
++               ttkernel::RsqrtTileInitOp, ttkernel::SqrtTileInitOp,
++               ttkernel::RecipTileInitOp, ttkernel::ClampScalarTileInitOp,
++               ttkernel::FillTileInitOp>(op);
++  }
++
++  int getNumOps() const { return numOps; }
+ 
++  // Emits the call before `before`; false if the chain is too large.
++  bool emit(Operation *before) {
++    if (slotValues.size() > 8 || params.size() > 8 || numOps > 32) {
++      return false;
++    }
++    std::string sig;
++    SmallVector<Value> args;
++    for (auto [k, v] : llvm::enumerate(slotValues)) {
++      sig += (k ? ", " : "") + llvm::formatv("uint32_t d{0}", k).str();
++      args.push_back(v);
++    }
++    for (auto [k, v] : llvm::enumerate(params)) {
++      sig += (sig.empty() ? "" : ", ") +
++             llvm::formatv("{0} p{1}",
++                           v.getType().isF32() ? "float" : "uint32_t", k)
++                 .str();
++      args.push_back(v);
++    }
++    std::string body;
++    for (const std::string &l : lines) {
++      body += "      " + l + "\n";
++    }
++    for (auto [k, var] : current) {
++      if (written.contains(k)) {
++        body +=
++            llvm::formatv("      sfpi::dst_reg[d{0} * 32] = {1};\n", k, var)
++                .str();
++      }
++    }
++    std::string fn =
++        llvm::formatv("ALWI void NAME({0}) {{\n"
++                      "  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, "
++                      "DST_ACCUM_MODE>();\n"
++                      "  _llk_math_eltwise_sfpu_start_(0);\n"
++                      "#pragma GCC unroll 0\n"
++                      "  for (int face = 0; face < 4; face++) {{\n"
++                      "#pragma GCC unroll 0\n"
++                      "    for (int row = 0; row < 8; row++) {{\n"
++                      "{1}"
++                      "      sfpi::dst_reg++;\n"
++                      "    }\n"
++                      "    _llk_math_eltwise_sfpu_inc_dst_face_addr_();\n"
++                      "  }\n"
++                      "  _llk_math_eltwise_sfpu_done_();\n"
++                      "}\n",
++                      sig, body)
++            .str();
++    std::string name =
++        llvm::formatv("chain_{0:x}",
++                      static_cast<uint64_t>(llvm::hash_value(fn)))
++            .str();
++    size_t pos = fn.find("NAME");
++    fn.replace(pos, 4, name);
++    std::string def = "#ifdef TRISC_MATH\nnamespace libtt_sfpu {\n" + fn +
++                      "} // namespace libtt_sfpu\n#endif";
++    std::string call = "MATH((libtt_sfpu::" + name + "(";
++    for (size_t i = 0; i < args.size(); ++i) {
++      call += i ? ", {}" : "{}";
++    }
++    call += ")));";
++    OpBuilder builder(before);
++    OperationState state(before->getLoc(),
++                         emitc::VerbatimOp::getOperationName());
++    state.addOperands(args);
++    state.addAttribute("value", builder.getStringAttr(call));
++    state.addAttribute("libtt.sfpu_def", builder.getStringAttr(def));
++    builder.create(state);
++    return true;
++  }
++
++private:
++  int slot(Value idx) {
++    if (std::optional<int64_t> c = getConstantIntValue(idx)) {
++      auto [it, inserted] = constSlots.try_emplace(*c, slotValues.size());
++      if (inserted) {
++        slotValues.push_back(idx);
++      }
++      return it->second;
++    }
++    auto [it, inserted] = valueSlots.try_emplace(idx, slotValues.size());
++    if (inserted) {
++      slotValues.push_back(idx);
++    }
++    return it->second;
++  }
++  std::string param(Value v) {
++    auto [it, inserted] = paramIndex.try_emplace(v, params.size());
++    if (inserted) {
++      params.push_back(v);
++    }
++    return "p" + std::to_string(it->second);
++  }
++  std::string fresh() { return "t" + std::to_string(numTemps++); }
++  std::string read(int k) {
++    auto it = current.find(k);
++    if (it != current.end()) {
++      return it->second;
++    }
++    std::string t = fresh();
++    lines.push_back(
++        llvm::formatv("sfpi::vFloat {0} = sfpi::dst_reg[d{1} * 32];", t, k)
++            .str());
++    current[k] = t;
++    return t;
++  }
++  void write(int k, const std::string &expr) {
++    std::string t = fresh();
++    lines.push_back(llvm::formatv("sfpi::vFloat {0} = {1};", t, expr).str());
++    assign(k, t);
++  }
++  void assign(int k, const std::string &t) {
++    current[k] = t;
++    written.insert(k);
++  }
++
++  SmallVector<Value> slotValues;
++  llvm::DenseMap<int64_t, int> constSlots;
++  llvm::DenseMap<Value, int> valueSlots;
++  SmallVector<Value> params;
++  llvm::DenseMap<Value, int> paramIndex;
++  std::map<int, std::string> current;
++  llvm::DenseSet<int> written;
++  SmallVector<std::string> lines;
++  int numTemps = 0;
++  int numOps = 0;
++};
++
++static bool usesFp32Dst(func::FuncOp funcOp) {
++  bool fp32 = false;
++  auto visit = [&](Type t) {
++    if (auto cb = dyn_cast<ttkernel::CBType>(t)) {
++      if (auto tile = dyn_cast<ttcore::TileType>(cb.getElementType())) {
++        fp32 |= ttcore::getNumberOfBits(tile.getDataType()) == 32;
++      }
++    }
++  };
++  funcOp.walk([&](Operation *op) {
++    for (Type t : op->getResultTypes()) {
++      visit(t);
++    }
++  });
++  for (Type t : funcOp.getArgumentTypes()) {
++    visit(t);
++  }
++  return fp32;
++}
++
++static void fuseSFPUChains(func::FuncOp funcOp) {
++  const bool debug = std::getenv("LIBTT_D2M_SFPI_DEBUG") != nullptr;
++  if (!usesFp32Dst(funcOp)) {
++    if (debug) {
++      llvm::errs() << "sfpi-fuse: " << funcOp.getName() << " not fp32\n";
++    }
++    return;
++  }
++  SmallVector<Block *> blocks;
++  funcOp.walk([&](Block *b) { blocks.push_back(b); });
++  for (Block *block : blocks) {
++    SmallVector<Operation *> run;
++    auto flush = [&]() {
++      if (run.empty()) {
++        return;
++      }
++      SFPUChainEmitter emitter;
++      Operation *last = nullptr;
++      for (Operation *op : run) {
++        if (!SFPUChainEmitter::isInit(op)) {
++          emitter.add(op);
++          last = op;
++        }
++      }
++      if (debug) {
++        llvm::errs() << "sfpi-fuse: " << funcOp.getName() << " run of "
++                     << run.size() << " ops, " << emitter.getNumOps()
++                     << " fusable\n";
++      }
++      if (last && emitter.getNumOps() >= 2 &&
++          emitter.emit(last->getNextNode())) {
++        // Inits after the last fused op belong to whatever follows.
++        for (Operation *op : run) {
++          if (op == last || op->isBeforeInBlock(last)) {
++            op->erase();
++          }
++        }
++      }
++      run.clear();
++    };
++    for (Operation &op : llvm::make_early_inc_range(*block)) {
++      if (SFPUChainEmitter::isInit(&op)) {
++        run.push_back(&op);
++        continue;
++      }
++      SFPUChainEmitter probe;
++      if (probe.add(&op)) {
++        run.push_back(&op);
++        continue;
++      }
++      if (isPure(&op) && op.getNumRegions() == 0) {
++        continue;
++      }
++      flush();
++    }
++    flush();
++  }
++}
++} // namespace
++
++namespace {
+ struct ConvertD2MToTTKernel
+     : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
+ 
+@@ -217,6 +560,34 @@ struct ConvertD2MToTTKernel
        return;
      }
  
@@ -776,6 +1313,10 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      for (Operation *op : redundant) {
 +        op->erase();
 +      }
++    }
++
++    if (std::getenv("LIBTT_D2M_SFPI_FUSE")) {
++      fuseSFPUChains(funcOp);
 +    }
 +
      // The d2m.thread attr is kept until the end of this pass, when body
@@ -878,7 +1419,15 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-@@ -377,7 +377,32 @@ protected:
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <cstdlib>
+ #include "ttmlir/Conversion/TTIRToD2M/TTIRToD2M.h"
+ 
+ #include "ttmlir/AffineMapUtils.h"
+@@ -377,7 +378,32 @@ protected:
          return unitReblockingView.getResult();
        }
        // For DRAM operands, we can return the metal cast result directly.
@@ -912,7 +1461,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      }
  
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
-@@ -880,45 +905,6 @@ protected:
+@@ -880,45 +906,6 @@ protected:
  } // namespace
  
  namespace {
@@ -958,7 +1507,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  // ----------------------------------------------------------------------------
  //
  // Rewrite elementwise ops by emitting a matching D2M tile version of the op
-@@ -929,11 +915,12 @@ class D2MNamedElementwiseRewriter final
+@@ -929,11 +916,12 @@ class D2MNamedElementwiseRewriter final
        D2MNamedRewriterCommon {
  
  public:
@@ -976,7 +1525,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
        : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
          D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                 ttnnMode, collapseTensors,
-@@ -1186,21 +1173,6 @@ private:
+@@ -1186,21 +1174,6 @@ private:
        auto diff = bbBuilder.create<d2m::TileSubOp>(loc, resultTypes,
                                                     ValueRange{nezA, nezB});
        yield = bbBuilder.create<d2m::TileNezOp>(loc, resultTypes, diff);
@@ -998,7 +1547,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      } else {
        yield = bbBuilder.create<TileOp>(loc, resultTypes, operands);
      }
-@@ -2091,11 +2063,12 @@ class D2MNamedTileReduceRewriter final
+@@ -2091,11 +2064,12 @@ class D2MNamedTileReduceRewriter final
        D2MNamedRewriterCommon {
  
  public:
@@ -1016,7 +1565,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
        : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
          D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                 ttnnMode, collapseTensors,
-@@ -2141,7 +2114,22 @@ private:
+@@ -2141,7 +2115,22 @@ private:
        return rewriter.notifyMatchFailure(
            op, "integer tile reduction is not supported for this op");
      }
@@ -1040,7 +1589,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      SmallVector<mlir::Value> newInputs(origInputs.begin(), origInputs.end());
      if (hasScaler) {
        newInputs.emplace_back(this->createScaler(rewriter, loc, inputTensorType,
-@@ -2221,6 +2209,7 @@ private:
+@@ -2221,6 +2210,7 @@ private:
                  yield = bbBuilder.create<FloatTileOp>(
                      loc, resultType, aArg, bArg, cArg, reduceDimAttr);
                } else {
@@ -1048,7 +1597,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                  if constexpr (kIntSupported) {
                    yield = bbBuilder.create<IntTileOp>(loc, resultType, aArg,
                                                        cArg, reduceDimAttr);
-@@ -2262,7 +2251,7 @@ private:
+@@ -2262,7 +2252,7 @@ private:
    static SmallVector<mlir::AffineMap>
    getAffineMapsArray(mlir::OpBuilder &builder, ConcreteOp op, std::size_t arity,
                       std::size_t rank, bool hasScaler) {
@@ -1057,7 +1606,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  
      mlir::AffineExpr zero =
          mlir::getAffineConstantExpr(0, builder.getContext());
-@@ -2293,7 +2282,7 @@ private:
+@@ -2293,7 +2283,7 @@ private:
    static SmallVector<mlir::Attribute>
    getIteratorTypesArray(mlir::OpBuilder &builder, ConcreteOp op,
                          std::size_t rank) {
@@ -1066,7 +1615,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  
      auto parallel = ttcore::IteratorTypeAttr::get(
          builder.getContext(), ttcore::IteratorType::Parallel);
-@@ -2327,12 +2316,36 @@ private:
+@@ -2327,12 +2317,36 @@ private:
      return 1.0;
    }
  
@@ -1104,6 +1653,171 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                 [&](std::size_t index, bool dropped) { dims[index] = dropped; });
  
      bool reduceSecondToLast = dims[rank - 2]; // "C" in tile terminology
+@@ -5493,6 +5507,153 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+ #include "ttmlir/Conversion/Passes.h.inc"
+ 
+ namespace {
++
++
++// libtt: (A * f) * g == A * (f * g) when f and g are both constant along
++// A's last dim (per-row factors, e.g. an L2 clip's factor and a per-token
++// scale): the row factors combine on the reduced shape once instead of
++// scaling every element of A twice, and the epilogue reads one row operand.
++static void reassociateRowFactors(ModuleOp module) {
++  SmallVector<ttir::MultiplyOp> candidates;
++  module.walk([&](ttir::MultiplyOp op) { candidates.push_back(op); });
++  auto isRowFactor = [](Value v, RankedTensorType full) {
++    auto t = mlir::cast<RankedTensorType>(v.getType());
++    return t.getRank() == full.getRank() && t.getShape().back() == 1 &&
++           full.getShape().back() > 1;
++  };
++  for (ttir::MultiplyOp outer : candidates) {
++    auto outType = mlir::cast<RankedTensorType>(outer.getType());
++    if (!outType.getElementType().isF32()) {
++      continue;
++    }
++    for (auto [inner, g] : {std::pair(outer.getLhs(), outer.getRhs()),
++                            std::pair(outer.getRhs(), outer.getLhs())}) {
++      auto innerMul = inner.getDefiningOp<ttir::MultiplyOp>();
++      if (!innerMul || !innerMul->hasOneUse() || !isRowFactor(g, outType) ||
++          inner.getType() != outer.getType()) {
++        continue;
++      }
++      Value a, f;
++      if (isRowFactor(innerMul.getRhs(), outType)) {
++        a = innerMul.getLhs();
++        f = innerMul.getRhs();
++      } else if (isRowFactor(innerMul.getLhs(), outType)) {
++        a = innerMul.getRhs();
++        f = innerMul.getLhs();
++      } else {
++        continue;
++      }
++      if (a.getType() != outType) {
++        continue;
++      }
++      auto fType = mlir::cast<RankedTensorType>(f.getType());
++      auto gType = mlir::cast<RankedTensorType>(g.getType());
++      if (!fType.getElementType().isF32() || !gType.getElementType().isF32()) {
++        continue;
++      }
++      SmallVector<int64_t> shape;
++      bool ok = true;
++      for (auto [x, y] : llvm::zip(fType.getShape(), gType.getShape())) {
++        if (x != y && x != 1 && y != 1) {
++          ok = false;
++        }
++        shape.push_back(std::max(x, y));
++      }
++      if (!ok) {
++        continue;
++      }
++      OpBuilder b(outer);
++      auto fgType = RankedTensorType::get(shape, outType.getElementType(),
++                                          outType.getEncoding());
++      Value fg = b.create<ttir::MultiplyOp>(outer.getLoc(), fgType, f, g);
++      Value result = b.create<ttir::MultiplyOp>(outer.getLoc(), outType, a, fg);
++      outer.getResult().replaceAllUsesWith(result);
++      outer.erase();
++      innerMul.erase();
++      break;
++    }
++  }
++}
++
++
++// libtt: sign(v) * min(|v|, C * |v * R|) == v * min(1, C * |R|), since
++// min(a, k a) = a min(1, k) for a = |v| >= 0 and sign(v) |v| = v. The left form
++// is how models write an L2 clip (Inkling 2); the right one computes a per-row
++// factor once (R, C broadcast along the reduced dims) instead of four
++// elementwise ops over the whole row, and needs fewer DST inputs per tile.
++static void simplifySignMinAbs(ModuleOp module) {
++  SmallVector<ttir::MultiplyOp> candidates;
++  module.walk([&](ttir::MultiplyOp op) { candidates.push_back(op); });
++  auto otherOf = [](Value pair0, Value pair1, Value known) -> Value {
++    return pair0 == known ? pair1 : (pair1 == known ? pair0 : Value());
++  };
++  for (ttir::MultiplyOp out : candidates) {
++    Value v, minVal;
++    for (auto [a, b] : {std::pair(out.getLhs(), out.getRhs()),
++                        std::pair(out.getRhs(), out.getLhs())}) {
++      if (auto sign = a.getDefiningOp<ttir::SignOp>()) {
++        v = sign.getInput();
++        minVal = b;
++        break;
++      }
++    }
++    auto minOp = minVal ? minVal.getDefiningOp<ttir::MinimumOp>()
++                        : ttir::MinimumOp();
++    if (!minOp) {
++      continue;
++    }
++    Value t;
++    for (auto [a, b] : {std::pair(minOp.getLhs(), minOp.getRhs()),
++                        std::pair(minOp.getRhs(), minOp.getLhs())}) {
++      auto absV = a.getDefiningOp<ttir::AbsOp>();
++      if (absV && absV.getInput() == v) {
++        t = b;
++        break;
++      }
++    }
++    auto tMul = t ? t.getDefiningOp<ttir::MultiplyOp>() : ttir::MultiplyOp();
++    if (!tMul) {
++      continue;
++    }
++    Value c, n;
++    for (auto [a, b] : {std::pair(tMul.getLhs(), tMul.getRhs()),
++                        std::pair(tMul.getRhs(), tMul.getLhs())}) {
++      if (auto absN = b.getDefiningOp<ttir::AbsOp>()) {
++        c = a;
++        n = absN.getInput();
++        break;
++      }
++    }
++    auto nMul = n ? n.getDefiningOp<ttir::MultiplyOp>() : ttir::MultiplyOp();
++    if (!nMul) {
++      continue;
++    }
++    Value r = otherOf(nMul.getLhs(), nMul.getRhs(), v);
++    if (!r) {
++      continue;
++    }
++    auto rType = mlir::cast<RankedTensorType>(r.getType());
++    auto outType = mlir::cast<RankedTensorType>(out.getType());
++    if (!rType.getElementType().isF32() || !outType.getElementType().isF32()) {
++      continue;
++    }
++    OpBuilder b(out);
++    Location loc = out.getLoc();
++    Value absR = b.create<ttir::AbsOp>(loc, rType, r);
++    Value scaled = b.create<ttir::MultiplyOp>(loc, rType, c, absR);
++    // min(1, x) as a clamp: a splat constant into ttir.minimum is not
++    // scalarized and has no layout inside a D2M subgraph.
++    Value factor = b.create<ttir::ClampScalarOp>(
++        loc, rType, scaled,
++        b.getF32FloatAttr(-std::numeric_limits<float>::max()),
++        b.getF32FloatAttr(1.0f));
++    Value replacement = b.create<ttir::MultiplyOp>(loc, outType, v, factor);
++    out.getResult().replaceAllUsesWith(replacement);
++    out.erase();
++  }
++}
++
++
+ class TTIRToD2MPass final
+     : public mlir::tt::impl::TTIRToD2MBase<TTIRToD2MPass> {
+ public:
+@@ -5521,6 +5682,10 @@ public:
+   void runOnOperation() override {
+     MLIRContext *ctx = &getContext();
+     ModuleOp module = getOperation();
++    if (std::getenv("LIBTT_D2M_ALGEBRA")) {
++      simplifySignMinAbs(module);
++      reassociateRowFactors(module);
++    }
+ 
+     TypeConverter typeConverter;
+     typeConverter.addConversion([](Type t) { return t; });
 diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
 --- a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
 +++ b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
@@ -1135,7 +1849,53 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
                           std::is_same_v<SourceOp, ttkernel::MulIntTileInitOp> ||
                           std::is_same_v<SourceOp, ttkernel::MulIntTileOp>) {
        SmallVector<Attribute, 1> template_args;
-@@ -2756,6 +2770,18 @@ public:
+@@ -2068,6 +2082,26 @@ private:
+ };
+ } // namespace
+ 
++namespace {
++// libtt: rebuild an emitc.verbatim with converted format operands.
++class LibttVerbatimOperandsRewriter
++    : public OpConversionPattern<emitc::VerbatimOp> {
++public:
++  using OpConversionPattern<emitc::VerbatimOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(emitc::VerbatimOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const final {
++    OperationState state(op.getLoc(), op->getName());
++    state.addOperands(adaptor.getOperands());
++    state.addAttributes(op->getAttrs());
++    rewriter.create(state);
++    rewriter.eraseOp(op);
++    return success();
++  }
++};
++} // namespace
++
+ namespace {
+ class TTKernelInvokeSFPIOpRewriter
+     : public OpConversionPattern<ttkernel::InvokeSFPIOp> {
+@@ -2602,6 +2636,10 @@ public:
+         // arguments. At that point it becomes legal.
+         return op.getNumArguments() == 0;
+       });
++      // libtt: verbatim calls with operands (fused SFPU chains) take their
++      // operands' converted types.
++      target.addDynamicallyLegalOp<emitc::VerbatimOp>(
++          [this](emitc::VerbatimOp op) { return typeConverter.isLegal(op); });
+     }
+ 
+     ConversionTarget target;
+@@ -2628,6 +2666,7 @@ public:
+ 
+     patterns.add<ArithConstantBF16ToF32Rewriter>(typeConverter, context,
+                                                  /*benefit=*/2);
++    patterns.add<LibttVerbatimOperandsRewriter>(typeConverter, context);
+     populateArithToEmitCPatterns(typeConverter, patterns);
+     populateSCFToEmitCConversionPatterns(patterns, typeConverter);
+     populateMemRefToEmitCTypeConversion(typeConverter);
+@@ -2756,6 +2795,18 @@ public:
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddBinaryTilesOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileInitOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileOp>,
@@ -1154,7 +1914,7 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
          TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileOp>,
          TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileInt32Op>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::DivBinaryTilesInitOp>,
-@@ -2889,6 +2915,7 @@ public:
+@@ -2889,6 +2940,7 @@ public:
          TTKernelToEmitCOpaqueRewriter<ttkernel::ExperimentalWriteColMaskTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::ExperimentalFillArangeTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::UnaryBcastInitOp>,
@@ -1512,6 +2272,26 @@ diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
    }
  
    rewriter.create<MaskOp>(getLoc(), maybeOutput->getType(), input, *maybeOutput,
+@@ -3285,6 +3295,19 @@ bool d2m::GenericOp::isNontriviallyEltwiseFused() {
+     return false;
+   }
+ 
++  // libtt: a merged row subgraph (several compute loop nests, reductions
++  // among them) is not one elementwise tree; the scheduled DST path assumes
++  // one tree per generic.
++  int64_t computeNests = 0;
++  this->getOperation()->walk([&](Operation *op) {
++    if (mlir::isa<linalg::GenericOp>(op) || op->hasAttr("d2m.linalg_root")) {
++      ++computeNests;
++    }
++  });
++  if (computeNests > 1) {
++    return false;
++  }
++
+   return true;
+ }
+ 
 diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
 --- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
 +++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
@@ -1545,7 +2325,11 @@ diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipeli
 diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 --- a/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 +++ b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
-@@ -9,16 +9,24 @@
+@@ -6,19 +6,29 @@
+ #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
+ #include "ttmlir/Dialect/D2M/IR/D2MTraits.h"
+ #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
++#include "ttmlir/Dialect/D2M/Utils/DstRegisterAnalysis.h"
  #include "ttmlir/Dialect/D2M/Utils/Utils.h"
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
@@ -1554,6 +2338,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +#include "mlir/Dialect/Func/IR/FuncOps.h"
 +#include "mlir/Dialect/Arith/IR/Arith.h"
 +#include "mlir/IR/IRMapping.h"
++#include "llvm/ADT/SetVector.h"
 +#include "llvm/ADT/SmallPtrSet.h"
  #include "mlir/Dialect/Affine/IR/AffineOps.h"
  #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -1570,7 +2355,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  #include <tuple>
  
  #define DEBUG_TYPE "D2MGenericFusion"
-@@ -115,6 +123,11 @@ static bool isValidElementwiseFusionTarget(GenericOp gOp) {
+@@ -115,6 +125,11 @@ static bool isValidElementwiseFusionTarget(GenericOp gOp) {
    if (gOp.hasMultiUseInputOperand()) {
      return false;
    }
@@ -1582,7 +2367,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -629,6 +642,11 @@ static bool isValidReductionFusionConsumer(GenericOp gOp) {
+@@ -629,6 +644,11 @@ static bool isValidReductionFusionConsumer(GenericOp gOp) {
    if (gOp.hasMultiUseInputOperand()) {
      return false;
    }
@@ -1594,7 +2379,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -715,45 +733,753 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
+@@ -715,45 +735,838 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
  };
  } // namespace
  
@@ -1905,7 +2690,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +        fuseElementwiseDAG(producer, consumer, *plan, rewriter);
 +        return success();
 +      }
-     }
++    }
 +    // Preserve the existing tree/permutation path for other generic forms.
 +    for (OpOperand *input : consumer.getDpsInputOperands()) {
 +      if (isElementwiseFusable(input)) {
@@ -1913,7 +2698,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +                        consumer, rewriter);
 +        return success();
 +      }
-+    }
+     }
 +    return failure();
 +  }
 +};
@@ -2177,6 +2962,52 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +    // Fuse chains of all-parallel linalg ops inside the merged region (as the
 +    // general-fusion branch did), so values stay in DST between operations
 +    // instead of round-tripping through L1 scratch.
++    // Recompute cheap elementwise values per consumer instead of passing them
++    // through scratch: a value read by several linalg ops (the scaled input
++    // of an L2 clip) is cloned next to each extra consumer, so each copy can
++    // fuse into its consumer's DST pass.
++    if (std::getenv("LIBTT_D2M_REMAT")) {
++      // Consumers first, so a producer sees the copies made of its users.
++      SmallVector<linalg::GenericOp> candidates(
++          block.getOps<linalg::GenericOp>());
++      for (linalg::GenericOp producer : llvm::reverse(candidates)) {
++        if (producer.getNumReductionLoops() != 0 ||
++            producer->getNumResults() != 1 ||
++            producer.getBody()->getOperations().size() > 4) {
++          continue;
++        }
++        // One copy per consuming op: a consumer reading the value twice
++        // (v * v) shares its copy.
++        llvm::SetVector<Operation *> linalgUsers;
++        bool otherUses = false;
++        for (OpOperand &use : producer->getResult(0).getUses()) {
++          if (isa<linalg::GenericOp>(use.getOwner())) {
++            linalgUsers.insert(use.getOwner());
++          } else {
++            otherUses = true;
++          }
++        }
++        if (linalgUsers.size() + (otherUses ? 1 : 0) < 2) {
++          continue;
++        }
++        // Keep the original for the first user (and any non-linalg use).
++        for (Operation *user :
++             llvm::drop_begin(linalgUsers.getArrayRef(), otherUses ? 0 : 1)) {
++          rewriter.setInsertionPoint(user);
++          Operation *clone = rewriter.clone(*producer);
++          for (OpOperand &operand : user->getOpOperands()) {
++            if (operand.get() == producer->getResult(0)) {
++              operand.set(clone->getResult(0));
++            }
++          }
++        }
++      }
+     }
+ 
+-    auto producer = fusedOperand->get().getDefiningOp<GenericOp>();
+-    assert(producer);
+-    fuseOverOperand(fusedOperand, producer, consumer, rewriter);
+-    return success();
 +    if (!std::getenv("LIBTT_D2M_NO_LINALG_FUSION")) {
 +      bool changed = true;
 +      // Each fusion removes a consumer, but keeping a multi-use producer's
@@ -2187,13 +3018,33 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +      }();
 +      for (int round = 0; changed && round < maxRounds; ++round) {
 +        changed = false;
++        // Merge repeated inputs (a consumer of v * v), so fusing the
++        // producer replaces both reads instead of keeping it for one.
++        {
++          RewritePatternSet dedupe(rewriter.getContext());
++          linalg::populateEraseUnusedOperandsAndResultsPatterns(dedupe);
++          SmallVector<Operation *> ops;
++          for (auto g : block.getOps<linalg::GenericOp>()) {
++            ops.push_back(g);
++          }
++          (void)applyOpPatternsGreedily(ops, std::move(dedupe));
++        }
 +        for (auto consumer :
 +             llvm::make_early_inc_range(block.getOps<linalg::GenericOp>())) {
-+          if (consumer.getNumReductionLoops() != 0) {
++          if (consumer.getNumReductionLoops() != 0 &&
++              !std::getenv("LIBTT_D2M_FUSE_INTO_REDUCE")) {
 +            continue;
 +          }
 +          for (OpOperand &operand : consumer->getOpOperands()) {
 +            auto producer = operand.get().getDefiningOp<linalg::GenericOp>();
++            // A broadcast unpacks its operand from L1 (unary_bcast), so a
++            // broadcast operand cannot become a DST intermediate.
++            if (operand.getOperandNumber() < consumer.getNumDpsInputs() &&
++                llvm::any_of(
++                    consumer.getMatchingBlockArgument(&operand).getUsers(),
++                    [](Operation *u) { return isa<TileBcastOp>(u); })) {
++              continue;
++            }
 +            // Only single-consumer producers: a shared value (e.g. the scaled
 +            // input read by several epilogue ops) is computed once and kept.
 +            if (!producer || producer.getNumReductionLoops() != 0 ||
@@ -2211,7 +3062,11 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +                                    return isa<TileTypecastOp>(o);
 +                                  });
 +            };
-+            if (hasTypecast(producer) || hasTypecast(consumer)) {
++            // Casts fuse too (an earlier corruption was the DST overflow the
++            // per-input region budget fixed); LIBTT_D2M_NO_FUSE_CASTS=1 keeps
++            // them apart.
++            if ((hasTypecast(producer) || hasTypecast(consumer)) &&
++                std::getenv("LIBTT_D2M_NO_FUSE_CASTS")) {
 +              continue;
 +            }
 +            // Keep the fused op's distinct tile inputs within what DST holds
@@ -2244,11 +3099,13 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +              wide |= ttcore::getNumberOfBits(tile.getDataType()) == 32;
 +              fusedInputs.insert(in);
 +            }
-+            static const unsigned maxWide = [] {
-+              const char *v = std::getenv("LIBTT_D2M_FUSE_MAX_WIDE");
-+              return v ? static_cast<unsigned>(std::atoi(v)) : 2u;
-+            }();
-+            if (sharedInput || fusedInputs.size() > (wide ? maxWide : 7u)) {
++            static const char *maxWideEnv =
++                std::getenv("LIBTT_D2M_FUSE_MAX_WIDE");
++            if (sharedInput ||
++                (maxWideEnv && fusedInputs.size() >
++                                   (wide ? static_cast<unsigned>(
++                                               std::atoi(maxWideEnv))
++                                         : 7u))) {
 +              continue;
 +            }
 +            rewriter.setInsertionPoint(consumer);
@@ -2262,6 +3119,23 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +                linalg::fuseElementwiseOps(rewriter, &operand);
 +            if (failed(fusion)) {
 +              continue;
++            }
++            // Keep one tile of the fused body within DST: the unscheduled
++            // allocator neither spills nor bounds-checks (an overrun popped
++            // an empty slice stack), so undo fusions whose DST slices exceed
++            // the half-sync capacity of the body's widest type.
++            {
++              auto fusedOp = mlir::cast<linalg::GenericOp>(fusion->fusedOp);
++              int64_t slices = utils::estimateDstSlicesPerTile(fusedOp);
++              unsigned capacity = utils::getDstCapacityTilesForBody(fusedOp);
++              if (std::getenv("LIBTT_D2M_MERGE_DEBUG")) {
++                llvm::errs() << "merge: fused body needs " << slices
++                             << " DST slices of " << capacity << "\n";
++              }
++              if (slices > static_cast<int64_t>(capacity)) {
++                rewriter.eraseOp(fusedOp);
++                continue;
++              }
 +            }
 +            for (auto [original, replacement] : fusion->replacements) {
 +              original.replaceAllUsesWith(replacement);
@@ -2283,12 +3157,8 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +                       << " linalg ops\n";
 +        }
 +      }
-     }
- 
--    auto producer = fusedOperand->get().getDefiningOp<GenericOp>();
--    assert(producer);
--    fuseOverOperand(fusedOperand, producer, consumer, rewriter);
--    return success();
++    }
++
 +    for (auto [k, gr] : llvm::enumerate(escaping)) {
 +      gr.first->getResult(gr.second).replaceUsesWithIf(
 +          merged->getResult(k), [&](OpOperand &use) {
@@ -2520,7 +3390,18 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp b/
 diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
-@@ -1177,27 +1177,34 @@ cloneAffineLoopSkeleton(PatternRewriter &rewriter, Operation *loopNestOrOp) {
+@@ -73,7 +73,9 @@ collectEnclosingAffineLoopsForDstAccess(Operation *op, Operation *linalgRoot) {
+   Operation *current = op->getParentOp();
+   while (current) {
+     if (auto affineFor = dyn_cast<affine::AffineForOp>(current)) {
+-      enclosingLoops.push_back(affineFor);
++      if (!detail::excludedDstIVs().contains(affineFor.getInductionVar())) {
++        enclosingLoops.push_back(affineFor);
++      }
+       if (linalgRoot && current == linalgRoot) {
+         break;
+       }
+@@ -1177,27 +1179,34 @@ cloneAffineLoopSkeleton(PatternRewriter &rewriter, Operation *loopNestOrOp) {
  void replaceLoadWithDst(PatternRewriter &rewriter, const DstAccess &access,
                          Value dst, AffineMap dstAccessMap,
                          ValueRange dstAccessIndices) {
@@ -2566,7 +3447,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
    default:
      llvm_unreachable("replaceLoadWithDst expects a load access");
    }
-@@ -1210,13 +1217,28 @@ void replaceStoreWithDst(PatternRewriter &rewriter, const DstAccess &access,
+@@ -1210,13 +1219,28 @@ void replaceStoreWithDst(PatternRewriter &rewriter, const DstAccess &access,
    case DstAccessKind::AffineStore: {
      auto storeOp = cast<affine::AffineStoreOp>(access.op);
      Value valueToStore = storeOp.getValue();
@@ -2600,10 +3481,42 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
      }
      rewriter.replaceOpWithNewOp<affine::AffineStoreOp>(
          storeOp, valueToStore, dst, dstAccessMap, dstAccessIndices);
+@@ -1600,7 +1624,23 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
+   }
+ }
+ 
++llvm::DenseSet<Value> &excludedDstIVs() {
++  static llvm::DenseSet<Value> ivs;
++  return ivs;
++}
++
++bool isFusedSFPUReduction(Operation *op) {
++  if (!mlir::isa<d2m::TileSFPUReduceSumOp, d2m::TileSFPUReduceMaxOp>(op)) {
++    return false;
++  }
++  Operation *def = op->getOperand(0).getDefiningOp();
++  return def && !mlir::isa<affine::AffineLoadOp, memref::LoadOp>(def);
++}
++
+ bool isDstScopeIV(Value iv, Operation *linalgRoot) {
++  if (excludedDstIVs().contains(iv)) {
++    return false;
++  }
+   if (!linalgRoot) {
+     return true;
+   }
 diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
-@@ -185,13 +185,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -14,6 +14,7 @@
+ #include "mlir/Dialect/Arith/IR/Arith.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/MemRef/IR/MemRef.h"
++#include "llvm/ADT/SmallPtrSet.h"
+ #include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ 
+@@ -185,13 +186,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
      for (auto *user : computeOp->getUsers()) {
        if (auto potentialStore = mlir::dyn_cast<affine::AffineStoreOp>(user);
            notDstMemspace(potentialStore)) {
@@ -2623,7 +3536,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            bool isUnaryOp = computeOp->getNumOperands() == 1;
            bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
            bool isReduction = isTileReductionOp(computeOp);
-@@ -199,7 +202,11 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -199,7 +203,11 @@ collectDstAccesses(GenericOp gOp, Region &region,
                       "in-place DST only supported for unary, tile matmul, "
                       "reductions, and tile+scalar ops");
            dstSlice = getReusableOrFallbackDstSlice();
@@ -2636,7 +3549,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            dstSlice = getFirstInputDstSlice();
            dstAllocator.setStoreToDst();
          } else {
-@@ -210,13 +217,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -210,13 +218,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
          collectDstStoreAccess(potentialStore, copyInfos, dstSlice,
                                outermostInnerComputeLoop);
        } else if (auto scratchStore = mlir::dyn_cast<memref::StoreOp>(user)) {
@@ -2656,7 +3569,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            bool isUnaryOp = computeOp->getNumOperands() == 1;
            bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
            bool isReduction = isTileReductionOp(computeOp);
-@@ -224,7 +234,11 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -224,7 +235,11 @@ collectDstAccesses(GenericOp gOp, Region &region,
                       "in-place DST only supported for unary, tile matmul, "
                       "reductions, and tile+scalar ops");
            dstSlice = getReusableOrFallbackDstSlice();
@@ -2669,7 +3582,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            dstSlice = getFirstInputDstSlice();
            dstAllocator.setStoreToDst();
          } else {
-@@ -244,7 +258,7 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -244,7 +259,7 @@ collectDstAccesses(GenericOp gOp, Region &region,
          int dstSlice;
          if (computeOp.getDstRegInPlace() || computeOp.isScalarOperand(1)) {
            dstSlice = getReusableOrFallbackDstSlice();
@@ -2678,7 +3591,63 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            dstSlice = getFirstInputDstSlice();
          } else {
            dstSlice = static_cast<int>(dstAllocator.allocateOutput());
-@@ -355,9 +369,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -267,7 +282,15 @@ collectDstAccesses(GenericOp gOp, Region &region,
+ 
+     releaseConsumedIntermediates(computeOp, producedDstSlice);
+ 
+-    // Reserve any per-op DST scratch slices.
++    // Reserve any per-op DST scratch slices. A fused SFPU reduction reduces
++    // its DST operand in place and needs none (index 0 placeholder).
++    if (isFusedSFPUReduction(computeOp.getOperation())) {
++      computeOp->setAttr("dst_scratch_index",
++                         IntegerAttr::get(IntegerType::get(
++                                              computeOp->getContext(), 64),
++                                          0));
++      return;
++    }
+     for (int64_t i = 0, n = computeOp.getNumDstScratchSlices(); i < n; ++i) {
+       setDstScratchIndex(computeOp, dstAllocator.allocateScratch(),
+                          outermostInnerComputeLoop);
+@@ -288,8 +311,36 @@ static void dataCopyGenerate(PatternRewriter &rewriter, Location loc, Value dst,
+     auto insertionPointAfterLoopNest = rewriter.saveInsertionPoint();
+ 
+     rewriter.setInsertionPoint(loopNestOrOp);
+-    emitDstCopyNest(rewriter, loopNestOrOp, dst, copyInfo.loads,
+-                    /*isLoadSide=*/true, /*cloneLoopNest=*/true, disableL1Acc);
++    if (!excludedDstIVs().empty()) {
++      // libtt: in a fused reduction root, the accumulator (a buffer the root
++      // stores to) is still loaded ahead of the loop; the other operands are
++      // loaded where they are read, once per reduction iteration.
++      llvm::SmallPtrSet<Value, 4> stored;
++      for (const DstAccess &store : copyInfo.stores) {
++        if (store.isAffine()) {
++          stored.insert(
++              mlir::cast<affine::AffineStoreOp>(store.op).getMemref());
++        }
++      }
++      SmallVector<DstAccess> hoisted, inPlace;
++      for (const DstAccess &load : copyInfo.loads) {
++        bool acc =
++            !load.isAffine() ||
++            stored.contains(
++                mlir::cast<affine::AffineLoadOp>(load.op).getMemref());
++        (acc ? hoisted : inPlace).push_back(load);
++      }
++      emitDstCopyNest(rewriter, loopNestOrOp, dst, hoisted,
++                      /*isLoadSide=*/true, /*cloneLoopNest=*/true,
++                      disableL1Acc);
++      emitDstCopyNest(rewriter, loopNestOrOp, dst, inPlace,
++                      /*isLoadSide=*/true, /*cloneLoopNest=*/false,
++                      disableL1Acc);
++    } else {
++      emitDstCopyNest(rewriter, loopNestOrOp, dst, copyInfo.loads,
++                      /*isLoadSide=*/true, /*cloneLoopNest=*/true,
++                      disableL1Acc);
++    }
+ 
+     rewriter.restoreInsertionPoint(insertionPointAfterLoopNest);
+     emitDstCopyNest(rewriter, loopNestOrOp, dst, copyInfo.stores,
+@@ -355,9 +406,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
            return WalkResult::advance();
          }
  
@@ -2699,6 +3668,52 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          }
  
          if (loopOp->hasAttr("d2m.dst_access_inserted")) {
+@@ -375,6 +435,37 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+             disableL1Acc || !hasTileMatmul(loopOp) ||
+             !allTileMatmulOutputsSupportPackerL1Acc(loopOp);
+ 
++        // libtt: a reduction reading a DST value (fused producers): its
++        // reduction loops (those the root's stores do not index) must not
++        // index DST, see excludedDstIVs.
++        excludedDstIVs().clear();
++        bool fusedReduction =
++            loopOp->walk([](Operation *op) {
++                    return isFusedSFPUReduction(op) ? WalkResult::interrupt()
++                                                    : WalkResult::advance();
++                  })
++                .wasInterrupted();
++        if (fusedReduction) {
++          llvm::DenseSet<Value> storeIVs;
++          loopOp->walk([&](affine::AffineStoreOp store) {
++            if (ttcore::getMemorySpace(store.getMemref()) !=
++                ttcore::MemorySpace::RegisterDst) {
++              for (Value v : store.getMapOperands()) {
++                storeIVs.insert(v);
++              }
++            }
++          });
++          auto visitLoop = [&](affine::AffineForOp loop) {
++            if (!storeIVs.contains(loop.getInductionVar())) {
++              excludedDstIVs().insert(loop.getInductionVar());
++            }
++          };
++          if (auto rootFor = dyn_cast<affine::AffineForOp>(loopOp)) {
++            visitLoop(rootFor);
++          }
++          loopOp->walk([&](affine::AffineForOp loop) { visitLoop(loop); });
++        }
++
+         auto [copyInfos, dstIntermediates] =
+             collectDstAccesses(gOp, *loopRegion, loopOp, dstCapacity);
+ 
+@@ -385,6 +476,7 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+                const CopyInfoMap &ci, bool disableL1Acc) {
+               dataCopyGenerate(rw, loc, dst, ci, disableL1Acc);
+             });
++        excludedDstIVs().clear();
+ 
+         return WalkResult::advance();
+       });
 diff --git a/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp b/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp
@@ -2955,10 +3970,171 @@ diff --git a/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp b/lib/Dialect/D
        assert(!llvm::is_contained(memrefType.getShape(), ShapedType::kDynamic) &&
               "scratch memrefs must be static");
        allocations.push_back(
+diff --git a/lib/Dialect/D2M/Transforms/SFPUTileLoopFission.cpp b/lib/Dialect/D2M/Transforms/SFPUTileLoopFission.cpp
+--- a/lib/Dialect/D2M/Transforms/SFPUTileLoopFission.cpp
++++ b/lib/Dialect/D2M/Transforms/SFPUTileLoopFission.cpp
+@@ -304,6 +304,28 @@ struct D2MSFPUTileLoopFission
+       for (auto forOp : loopsToProcess) {
+         IRRewriter rewriter(ctx);
+ 
++        // libtt: a reduction reading a DST value (producers fused into it)
++        // reuses the same DST slices on every reduction iteration; splitting
++        // its loop would run all loads, then all ops, over those slices.
++        bool fusedReduction =
++            forOp
++                ->walk([](Operation *op) {
++                  if (!isa<TileSFPUReduceSumOp, TileSFPUReduceMaxOp>(op)) {
++                    return WalkResult::advance();
++                  }
++                  auto load =
++                      op->getOperand(0).getDefiningOp<affine::AffineLoadOp>();
++                  bool inDst = load && tt::ttcore::getMemorySpace(
++                                           load.getMemRef()) ==
++                                           tt::ttcore::MemorySpace::RegisterDst;
++                  return inDst ? WalkResult::interrupt()
++                               : WalkResult::advance();
++                })
++                .wasInterrupted();
++        if (fusedReduction) {
++          continue;
++        }
++
+         // Use a worklist to process all loops (original and newly created).
+         // Each fission creates a new loop that may also need fissioning.
+         SmallVector<affine::AffineForOp> worklist;
 diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 --- a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 +++ b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
-@@ -100,11 +100,21 @@ getMaxDstTilesForLinalgOp(linalg::GenericOp op,
+@@ -14,12 +14,128 @@
+ #include "mlir/Dialect/Linalg/IR/Linalg.h"
+ #include "llvm/Support/ErrorHandling.h"
+ 
++#include <cstdlib>
+ #include <limits>
+ #include <numeric>
+ #include <optional>
+ 
+ namespace mlir::tt::d2m::utils {
+ 
++int64_t estimateDstSlicesPerTile(linalg::GenericOp op) {
++  // Mirrors collectDstAccesses (Unscheduled.cpp): CB loads take a slice each
++  // (never freed; loads are hoisted ahead of the compute loop), a broadcast of
++  // a CB operand takes a slice that is never freed either, a result goes in
++  // place (an operand at its last use, or the first loaded operand) or into
++  // a fresh slice freed after its last compute use (stores keep it).
++  struct Occupant {
++    bool freeable;
++    int64_t remaining;
++  };
++  llvm::DenseMap<Value, Occupant> occupants;
++  auto countUses = [](Value v) {
++    return static_cast<int64_t>(
++        std::distance(v.getUses().begin(), v.getUses().end()));
++  };
++  int64_t live = 0;
++  int64_t peak = 0;
++  for (Operation &o : op.getBody()->without_terminator()) {
++    auto iface = mlir::dyn_cast<OperandLoadStoreRegisterOpInterface>(&o);
++    if (!iface || o.getNumResults() != 1) {
++      continue;
++    }
++    const int64_t stride =
++        std::max<int64_t>(1, iface.getDstInputSliceStride());
++    int64_t loads = 0;
++    for (int64_t idx : iface.getOperandsLoadFromDstRegister()) {
++      if (!iface.isScalarOperand(idx) &&
++          mlir::isa<BlockArgument>(o.getOperand(idx))) {
++        loads += stride;
++      }
++    }
++    const bool bcastLoad = mlir::isa<TileBcastOp>(o) &&
++                           mlir::isa<BlockArgument>(o.getOperand(0));
++    const bool inPlace =
++        iface.getDstRegInPlace() ||
++        (o.getNumOperands() > 1 && iface.isScalarOperand(1));
++    std::optional<Value> reuseFrom;
++    if (inPlace) {
++      for (int64_t idx : iface.getOperandsLoadFromDstRegister()) {
++        Value v = o.getOperand(idx);
++        auto it = occupants.find(v);
++        if (!iface.isScalarOperand(idx) && it != occupants.end() &&
++            it->second.remaining <= 1) {
++          reuseFrom = v;
++          break;
++        }
++      }
++    }
++    live += loads;
++    Occupant result{/*freeable=*/false, countUses(o.getResult(0))};
++    if (bcastLoad && loads == 0) {
++      live += 1;
++    } else if (reuseFrom) {
++      result.freeable = occupants.lookup(*reuseFrom).freeable;
++    } else if (loads == 0) {
++      result.freeable = true;
++      live += 1;
++    }
++    peak = std::max(peak, live);
++    for (Value operand : o.getOperands()) {
++      auto it = occupants.find(operand);
++      if (it == occupants.end() || --it->second.remaining > 0) {
++        continue;
++      }
++      if (it->second.freeable && !(reuseFrom && *reuseFrom == operand)) {
++        live -= 1;
++      }
++      occupants.erase(it);
++    }
++    occupants[o.getResult(0)] = result;
++    // A fused SFPU reduction (its operand computed in the body) reduces in
++    // place without a scratch slice.
++    const bool fusedReduce =
++        mlir::isa<TileSFPUReduceSumOp, TileSFPUReduceMaxOp>(o) &&
++        !mlir::isa<BlockArgument>(o.getOperand(0));
++    live += fusedReduce ? 0 : iface.getNumDstScratchSlices();
++    peak = std::max(peak, live);
++    if (std::getenv("LIBTT_D2M_DST_DEBUG")) {
++      llvm::errs() << "dst-est: " << o.getName() << " loads " << loads
++                   << " live " << live << "\n";
++    }
++  }
++  return std::max<int64_t>(peak, 1);
++}
++
++unsigned getDstCapacityTilesForBody(linalg::GenericOp op,
++                                    unsigned maxDstPhysicalSizeTiles) {
++  bool wide = false;
++  auto visit = [&](Type t) {
++    if (auto st = mlir::dyn_cast<ShapedType>(t)) {
++      t = st.getElementType();
++    }
++    if (auto tile = mlir::dyn_cast<ttcore::TileType>(t)) {
++      wide |= ttcore::getNumberOfBits(tile.getDataType()) == 32;
++    }
++  };
++  for (Value v : op->getOperands()) {
++    visit(v.getType());
++  }
++  op.getBody()->walk([&](Operation *o) {
++    for (Type t : o->getResultTypes()) {
++      visit(t);
++    }
++    for (Value v : o->getOperands()) {
++      visit(v.getType());
++    }
++  });
++  Type tileTy = wide ? Type(Float32Type::get(op.getContext()))
++                     : Type(BFloat16Type::get(op.getContext()));
++  unsigned cap = ttcore::getOpChipDescAttr(op).getDstLogicalSizeTiles(
++      tileTy, /*fullSyncEn=*/false, maxDstPhysicalSizeTiles);
++  return std::max(cap, 1u);
++}
++
++
+ namespace {
+ 
+ enum class DstExecutionClass { FPU, SFPU };
+@@ -100,11 +216,24 @@ getMaxDstTilesForLinalgOp(linalg::GenericOp op,
    }
    // SFPU ops only get half of DST, and whatever is left is split evenly because
    // every output must be resident simultaneously.
@@ -2968,20 +4144,23 @@ diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Uti
 +  // regions per tile, not 2: three inputs at two tiles per flip overran FP32
 +  // DST (4 tiles) into the other half.
    int64_t coResidentTiles = op.getOutputs().size();
-+  int64_t tileInputs = llvm::count_if(op.getDpsInputs(), [](Value in) {
-+    auto st = mlir::dyn_cast<ShapedType>(in.getType());
-+    return st && mlir::isa<ttcore::TileType>(st.getElementType());
-+  });
-+  int64_t sfpuRegions = std::max<int64_t>(2, tileInputs);
++  int64_t sfpuRegions =
++      std::max<int64_t>(2, estimateDstSlicesPerTile(op));
++  // The allocator sizes DST by the widest type in the body (an f32
++  // intermediate under a bf16 output still halves DST).
++  unsigned bodyCapacity =
++      getDstCapacityTilesForBody(op, maxDstPhysicalSizeTiles);
    int64_t tilesOnHW =
        (classifyLinalgExecutionClass(op) == DstExecutionClass::FPU)
            ? static_cast<int64_t>(dstLogicalSizeTiles)
 -          : static_cast<int64_t>(dstLogicalSizeTiles) / 2;
-+          : static_cast<int64_t>(dstLogicalSizeTiles) / sfpuRegions;
++          : static_cast<int64_t>(std::min(dstLogicalSizeTiles,
++                                          bodyCapacity)) /
++                sfpuRegions;
    if (tilesOnHW < coResidentTiles) {
      return std::nullopt;
    }
-@@ -380,6 +390,30 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
+@@ -380,6 +509,30 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
      return results;
    }
  
@@ -3964,7 +5143,66 @@ diff --git a/lib/Dialect/TTNN/Utils/TransformUtils.cpp b/lib/Dialect/TTNN/Utils/
 diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKernelToCpp.cpp
 --- a/lib/Target/TTKernel/TTKernelToCpp.cpp
 +++ b/lib/Target/TTKernel/TTKernelToCpp.cpp
-@@ -63,7 +63,8 @@ public:
+@@ -2,6 +2,10 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <cstdlib>
++#include "llvm/ADT/Hashing.h"
++#include "llvm/Support/FormatVariadic.h"
++#include "llvm/Support/MemoryBuffer.h"
+ #include "ttmlir/Target/TTKernel/TTKernelToCpp.h"
+ 
+ #include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
+@@ -37,6 +41,47 @@
+ 
+ #include <set>
+ 
++
++// libtt: helpers for fused SFPU chains (D2MToTTKernel's fuseSFPUChains), math
++// thread only. rsqrt: the SQRT_23-bits estimate with a reciprocal refinement
++// (as libtt's l2_clip kernel); recip: two Newton steps on approx_recip.
++static const char *const kLibttSfpuHelpers = R"libtt(#ifdef TRISC_MATH
++#include "sfpi.h"
++namespace libtt_sfpu {
++sfpi_inline sfpi::vFloat rsqrt_positive(sfpi::vFloat x) {
++  sfpi::vInt i = sfpi::as<sfpi::vInt>(sfpi::as<sfpi::vUInt>(x) >> 1);
++  sfpi::vFloat y = sfpi::as<sfpi::vFloat>(sfpi::vInt(0x5f1110a0) - i);
++  sfpi::vFloat xy = x * y;
++  sfpi::vFloat c = -y * xy;
++  y = y * (2.2825186f + c * (2.2533049f + c));
++  xy = x * y;
++  sfpi::vFloat one_minus_xyy = 1.0f - y * xy;
++  return one_minus_xyy * sfpi::addexp(y, -1) + y;
++}
++sfpi_inline sfpi::vFloat rsqrt(sfpi::vFloat x) {
++  sfpi::vFloat y = rsqrt_positive(x);
++  v_if(x == 0.0f) { y = sfpi::as<sfpi::vFloat>(sfpi::vInt(0x7f800000)); }
++  v_endif;
++  return y;
++}
++sfpi_inline sfpi::vFloat sqrt(sfpi::vFloat x) {
++  sfpi::vFloat y = x * rsqrt_positive(x);
++  v_if(x == 0.0f) { y = 0.0f; }
++  v_endif;
++  return y;
++}
++sfpi_inline sfpi::vFloat recip(sfpi::vFloat x) {
++  sfpi::vFloat y = sfpi::approx_recip(x);
++  y = y * (2.0f - x * y);
++  y = y * (2.0f - x * y);
++  return y;
++}
++sfpi_inline sfpi::vFloat bits(uint32_t b) {
++  return sfpi::vFloat(__builtin_bit_cast(float, b));
++}
++} // namespace libtt_sfpu
++#endif)libtt";
++
+ namespace mlir::tt::ttkernel {
+ 
+ // Class used to add includes and other boilerplate code to the generated
+@@ -63,7 +108,8 @@ public:
      }
  
      // TODO(wenbinlyuTT): make this conditional, originally from #4680.
@@ -3974,3 +5212,60 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
  
      const auto &headerMap = getCalleeToHeadersMap();
  
+@@ -183,6 +229,15 @@ public:
+         }
+       }
+ 
++      // libtt: fused SFPU chains carry their definitions.
++      if (auto def = verbatimOp->getAttrOfType<StringAttr>("libtt.sfpu_def")) {
++        for (llvm::StringRef snippet :
++             {llvm::StringRef(kLibttSfpuHelpers), def.getValue()}) {
++          if (emittedLlks.insert(snippet).second) {
++            llksToEmit.push_back(snippet);
++          }
++        }
++      }
+       if (value.starts_with("experimental::invoke_sfpi")) {
+         emitLlk(experimental_invoke_sfpi_llks_generated,
+                 experimental_invoke_sfpi_llks_generated_len);
+@@ -353,7 +408,39 @@ LogicalResult translateKernelFuncToCpp(func::FuncOp entry,
+     return failure();
+   }
+   auto moduleCleanup = llvm::make_scope_exit([&]() { kernelModule->erase(); });
+-  return emitc::translateToCpp(*kernelModule, os);
++  // libtt: LIBTT_KERNEL_DUMP_DIR=dir writes each kernel's source to
++  // dir/<hash>.cpp; LIBTT_KERNEL_OVERRIDE_DIR=dir replaces it with
++  // dir/<hash>.cpp when that exists (hand-instrumented kernels).
++  const char *dumpDir = std::getenv("LIBTT_KERNEL_DUMP_DIR");
++  const char *overrideDir = std::getenv("LIBTT_KERNEL_OVERRIDE_DIR");
++  if (!dumpDir && !overrideDir) {
++    return emitc::translateToCpp(*kernelModule, os);
++  }
++  std::string source;
++  llvm::raw_string_ostream sourceStream(source);
++  if (failed(emitc::translateToCpp(*kernelModule, sourceStream))) {
++    return failure();
++  }
++  std::string name =
++      llvm::formatv("{0:x}.cpp", static_cast<uint64_t>(llvm::hash_value(source)))
++          .str();
++  if (dumpDir) {
++    std::error_code ec;
++    llvm::raw_fd_ostream out((llvm::Twine(dumpDir) + "/" + name).str(), ec);
++    if (!ec) {
++      out << source;
++    }
++  }
++  if (overrideDir) {
++    auto buffer = llvm::MemoryBuffer::getFile(
++        (llvm::Twine(overrideDir) + "/" + name).str());
++    if (buffer) {
++      os << (*buffer)->getBuffer();
++      return success();
++    }
++  }
++  os << source;
++  return success();
+ }
+ 
+ LogicalResult translateTopLevelKernelToCpp(ModuleOp moduleOp,
