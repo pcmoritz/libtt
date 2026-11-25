@@ -2815,7 +2815,7 @@ diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipeli
 diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 --- a/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 +++ b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
-@@ -6,19 +6,29 @@
+@@ -6,19 +6,30 @@
  #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
  #include "ttmlir/Dialect/D2M/IR/D2MTraits.h"
  #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
@@ -2842,10 +2842,11 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +#include "llvm/Support/raw_ostream.h"
  
 +#include <cstdlib>
++#include <functional>
  #include <tuple>
  
  #define DEBUG_TYPE "D2MGenericFusion"
-@@ -115,6 +125,11 @@ static bool isValidElementwiseFusionTarget(GenericOp gOp) {
+@@ -115,6 +126,11 @@ static bool isValidElementwiseFusionTarget(GenericOp gOp) {
    if (gOp.hasMultiUseInputOperand()) {
      return false;
    }
@@ -2857,7 +2858,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -629,6 +644,11 @@ static bool isValidReductionFusionConsumer(GenericOp gOp) {
+@@ -629,6 +645,11 @@ static bool isValidReductionFusionConsumer(GenericOp gOp) {
    if (gOp.hasMultiUseInputOperand()) {
      return false;
    }
@@ -2869,7 +2870,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -715,45 +735,878 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
+@@ -715,45 +736,908 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
  };
  } // namespace
  
@@ -3259,8 +3260,23 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +    for (GenericOp g : generics) {
 +      group.insert(g);
 +    }
++    // A group result seen through views and layout casts (another member's
++    // grid) is still internal: reading its buffer in the same kernel would
++    // race the store.
++    auto throughViews = [&](Value v) {
++      while (Operation *def = v.getDefiningOp()) {
++        if (auto view = dyn_cast<ViewLayoutOp>(def)) {
++          v = view.getInput();
++        } else if (auto cast = dyn_cast<ttir::TTNNMetalLayoutCastOp>(def)) {
++          v = cast->getOperand(0);
++        } else {
++          break;
++        }
++      }
++      return v;
++    };
 +    auto inGroup = [&](Value v) {
-+      Operation *def = v.getDefiningOp();
++      Operation *def = throughViews(v).getDefiningOp();
 +      return def && group.contains(def);
 +    };
 +    // Tiles per dim of a [grid0, grid1, shard0, shard1] operand.
@@ -3317,10 +3333,24 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +              return false;
 +            }
 +          }
-+          // Leftover views and casts without uses are not real consumers.
-+          if (isa<ViewLayoutOp, ttir::TTNNMetalLayoutCastOp>(user) &&
-+              user->use_empty()) {
-+            return false;
++          // Leftover views and casts without uses are not real consumers;
++          // views and casts read only by group members are internal.
++          if (isa<ViewLayoutOp, ttir::TTNNMetalLayoutCastOp>(user)) {
++            std::function<bool(Operation *)> internalOnly =
++                [&](Operation *u) -> bool {
++              return llvm::all_of(u->getUsers(), [&](Operation *uu) {
++                for (Operation *anc = uu; anc; anc = anc->getParentOp()) {
++                  if (group.contains(anc)) {
++                    return true;
++                  }
++                }
++                return isa<ViewLayoutOp, ttir::TTNNMetalLayoutCastOp>(uu) &&
++                       internalOnly(uu);
++              });
++            };
++            if (internalOnly(user)) {
++              return false;
++            }
 +          }
 +          if (std::getenv("LIBTT_D2M_MERGE_DEBUG")) {
 +            llvm::errs() << "merge: escaping use of result "
@@ -3438,8 +3468,9 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +          Value src = load.getMemref();
 +          Value repl;
 +          if (inGroup(src)) {
++            Value base = throughViews(src);
 +            repl = produced.lookup(
-+                {src.getDefiningOp(), cast<OpResult>(src).getResultNumber()});
++                {base.getDefiningOp(), cast<OpResult>(base).getResultNumber()});
 +          } else {
 +            repl = loaded.lookup(src);
 +          }
