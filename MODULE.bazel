@@ -531,6 +531,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_copy_to_host_execution_lock.patch",
         "//third_party/tt_xla:tt_xla_tokens_as_empty_arrays.patch",
         "//third_party/tt_xla:tt_xla_free_donated_inputs.patch",
+        "//third_party/tt_xla:tt_xla_d2m_env.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -747,6 +748,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_matmul_epilogues.patch",
         "//third_party/tt_xla:tt_mlir_physical_layouts.patch",
         "//third_party/tt_xla:tt_mlir_cross_entropy_fw_f32.patch",
+        "//third_party/tt_xla:tt_mlir_d2m_build.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
