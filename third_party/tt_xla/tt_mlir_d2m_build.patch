@@ -961,7 +961,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -42,7 +51,1217 @@ namespace mlir::tt::d2m {
+@@ -42,7 +51,1247 @@ namespace mlir::tt::d2m {
  } // namespace mlir::tt::d2m
  
  namespace {
@@ -1133,7 +1133,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    }
 +    return std::make_pair(ifOp.getCondition(), fill);
 +  }
-+
+ 
 +  static bool isInit(Operation *op) {
 +    return isa<ttkernel::MulBinaryTilesInitOp, ttkernel::AddBinaryTilesInitOp,
 +               ttkernel::SubBinaryTilesInitOp, ttkernel::BinaryMaxTileInitOp,
@@ -1607,7 +1607,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +  };
 +
 +  std::vector<Val> vals;
- 
++
 +  static std::optional<int64_t> ci(Value v) { return getConstantIntValue(v); }
 +
 +  // DST operand roles of a TTKernel op; nullopt if unknown.
@@ -1728,9 +1728,26 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    if (internal.empty()) {
 +      return false;
 +    }
-+    // Work on a clone; replace the body only on success.
++    // (apply() runs this on a clone and keeps it only on success.)
 +    if (!unrollAndFold()) {
 +      return false;
++    }
++    // A CB is internal only if everything packed into it is read back here:
++    // the kernel's last use of it is a read. (A reduction accumulator packed,
++    // reloaded and finally packed for the consumer escapes.)
++    for (Value cb : internal) {
++      Operation *last = nullptr;
++      for (Operation &op : block) {
++        if (isa<ttkernel::PackTileOp, ttkernel::CBPushBackOp,
++                ttkernel::CBPopFrontOp, ttkernel::CopyTileOp,
++                ttkernel::UnaryBcastTileOp>(&op) &&
++            llvm::is_contained(op.getOperands(), cb)) {
++          last = &op;
++        }
++      }
++      if (!last || isa<ttkernel::PackTileOp, ttkernel::CBPushBackOp>(last)) {
++        return false;
++      }
 +    }
 +    SmallVector<Operation *> ops;
 +    for (Operation &op : block.without_terminator()) {
@@ -2169,8 +2186,21 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +        info.op->erase();
 +      }
 +    }
-+    funcOp->setAttr("libtt.dst_full_sync", b.getUnitAttr());
 +    return true;
++  }
++
++  // Rewrites a clone of `original`; on success the clone's body replaces the
++  // original's.
++  static bool apply(func::FuncOp original) {
++    func::FuncOp clone = original.clone();
++    bool ok = DstResidentRewriter{clone}.run();
++    if (ok) {
++      original.getBody().takeBody(clone.getBody());
++      original->setAttr("libtt.dst_full_sync",
++                        UnitAttr::get(original.getContext()));
++    }
++    clone.erase();
++    return ok;
 +  }
 +};
 +} // namespace
@@ -2179,7 +2209,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  struct ConvertD2MToTTKernel
      : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
  
-@@ -217,6 +1436,48 @@ struct ConvertD2MToTTKernel
+@@ -217,6 +1466,48 @@ struct ConvertD2MToTTKernel
        return;
      }
  
@@ -2210,7 +2240,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    bool resident = false;
 +    if (std::getenv("LIBTT_D2M_DST_RESIDENT") && !funcOp.getBody().empty() &&
 +        usesFp32Dst(funcOp)) {
-+      resident = DstResidentRewriter{funcOp}.run();
++      resident = DstResidentRewriter::apply(funcOp);
 +      if (std::getenv("LIBTT_D2M_SFPI_DEBUG")) {
 +        llvm::errs() << "dst-resident: " << funcOp.getName() << " "
 +                     << (resident ? "applied" : "not applied") << "\n";
@@ -3654,17 +3684,54 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
    addReductionOpsConversionPatterns(ctx, patterns, typeConverter);
    patterns.add<TTNNMatmulToTTIRMatmulConversionPattern>(typeConverter, ctx);
    patterns.add<TTNNFullOpToTTIRFullOpConversionPattern>(typeConverter, ctx);
+diff --git a/lib/Dialect/D2M/Analysis/BlockFactorAnalysis.cpp b/lib/Dialect/D2M/Analysis/BlockFactorAnalysis.cpp
+--- a/lib/Dialect/D2M/Analysis/BlockFactorAnalysis.cpp
++++ b/lib/Dialect/D2M/Analysis/BlockFactorAnalysis.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "ttmlir/Dialect/D2M/Analysis/BlockFactorAnalysis.h"
+ 
++#include <cstdlib>
++
+ #include "ttmlir/Dialect/D2M/Analysis/Allocation/Utils.h"
+ #include "ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+@@ -640,6 +642,20 @@ static SmallVector<int64_t> chooseReblockedFactors(
+     BlockFactorAnalysis::BufferSizePolicy policy,
+     ttcore::MemorySpaceAttr l1Attr, uint32_t numBuffers) {
+   const SmallVector<int64_t> shardFactors = getShardBlockFactors(genericOp);
++  // libtt: GridSelection keeps a tile reduction's reduced dims in one block
++  // (d2m.unsplit_reduction_dims); keep them: the output accumulation across blocks is
++  // not modeled (#8346/#8369) and lost partials.
++  // (Checked on the op itself: rebuilt generics drop the attribute.)
++  // A merged row generic (LIBTT_D2M_MERGE_ROWS) has parallel outer
++  // iterators and the reduction inside.
++  bool tileReduce = false;
++  genericOp->walk([&](Operation *op) {
++    StringRef name = op->getName().getStringRef();
++    tileReduce |= name.starts_with("d2m.tile_") && name.contains("reduce");
++  });
++  if (tileReduce && !std::getenv("LIBTT_D2M_SPLIT_REDUCTIONS")) {
++    return genericOp.getBlockFactorsValue();
++  }
+   switch (policy) {
+   case BlockFactorAnalysis::BufferSizePolicy::Max:
+     return genericOp.getBlockFactorsValue();
 diff --git a/lib/Dialect/D2M/Analysis/GridAnalysis.cpp b/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
 --- a/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
 +++ b/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
-@@ -440,6 +440,24 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
+@@ -440,6 +440,28 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
          opTarget[targetIdx] = minGridDim;
        }
      }
 +    // libtt: loop dims listed in d2m.unsplit_dims stay on one core (whole
 +    // rows per core for a merged row subgraph with an in-row reduction).
-+    if (auto unsplit =
-+            genericOp->getAttrOfType<ArrayAttr>("d2m.unsplit_dims")) {
++    for (StringRef attrName :
++         {"d2m.unsplit_dims", "d2m.unsplit_reduction_dims"}) {
++      auto unsplit = genericOp->getAttrOfType<ArrayAttr>(attrName);
++      if (!unsplit) {
++        continue;
++      }
 +      AffineMap map = indexingMaps[operandIdx];
 +      for (auto [pos, expr] : llvm::enumerate(map.getResults())) {
 +        auto dimExpr = mlir::dyn_cast<AffineDimExpr>(expr);
@@ -4852,7 +4919,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Tran
  #include "mlir/IR/AffineMap.h"
  #include "mlir/IR/Builders.h"
  #include "mlir/IR/BuiltinOps.h"
-@@ -940,8 +945,143 @@ public:
+@@ -940,8 +945,166 @@ public:
      this->ttnnMode = options.ttnnMode;
    }
  
@@ -4993,6 +5060,29 @@ diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Tran
 +        std::getenv("LIBTT_D2M_ANNOTATE_ROWS")) {
 +      annotateRowMergeCandidates(module);
 +    }
++    // libtt: a reduction's reduced dims stay in one block on one core, so the
++    // tile loop accumulates in DST. Split across outer blocks, the partial
++    // result round-trips through the output CB while the writer drains it,
++    // and partials get lost (sum over 5+ tiles dropped tiles).
++    module.walk([&](GenericOp g) {
++      SmallVector<int64_t> dims;
++      for (auto [i, it] : llvm::enumerate(g.getIteratorTypesValue())) {
++        if (it == ttcore::IteratorType::Reduction) {
++          dims.push_back(static_cast<int64_t>(i));
++        }
++      }
++      // Tile reductions only (not matmuls).
++      bool tileReduce = false;
++      g->walk([&](Operation *op) {
++        StringRef name = op->getName().getStringRef();
++        tileReduce |= name.starts_with("d2m.tile_") && name.contains("reduce");
++      });
++      if (!dims.empty() && tileReduce &&
++          !std::getenv("LIBTT_D2M_SPLIT_REDUCTIONS")) {
++        g->setAttr("d2m.unsplit_reduction_dims",
++                   OpBuilder(g).getI64ArrayAttr(dims));
++      }
++    });
  
      // Phase 1: Analyze all generics (no IR mutation).
      GridAnalysis gridAnalysis(module, getDeviceGridShape(), this->ttnnMode);
@@ -5046,7 +5136,41 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
        if (linalgRoot && current == linalgRoot) {
          break;
        }
-@@ -1177,27 +1179,34 @@ cloneAffineLoopSkeleton(PatternRewriter &rewriter, Operation *loopNestOrOp) {
+@@ -610,8 +612,32 @@ void setDstScratchIndex(OperandLoadStoreRegisterOpInterface computeOp,
+   TT_assertv(computeOp.getNumDstScratchSlices() == 1,
+              "setDstScratchIndex supports exactly one scratch slice");
+   Operation *op = computeOp.getOperation();
++  // libtt: the scratch tile is used within one iteration, so only loops that
++  // index the root's (non-DST) stores separate its slots; reduction loops do
++  // not (with them, a 4-tile reduction block put the scratch at DST 4, past
++  // the FP32 half-sync capacity).
++  llvm::DenseSet<Value> storeIVs;
++  linalgRoot->walk([&](affine::AffineStoreOp store) {
++    if (ttcore::getMemorySpace(store.getMemref()) !=
++        ttcore::MemorySpace::RegisterDst) {
++      for (Value v : store.getMapOperands()) {
++        storeIVs.insert(v);
++      }
++    }
++  });
++  SmallVector<affine::AffineForOp> loops;
++  for (affine::AffineForOp loop :
++       collectEnclosingAffineLoopsForDstAccess(op, linalgRoot)) {
++    if (storeIVs.contains(loop.getInductionVar())) {
++      loops.push_back(loop);
++    }
++  }
++  // Only with one output tile in flight (accumulator slices with several are
++  // strided by the reduction extent).
+   int64_t dstIndex =
+-      computeLinearizedDstSliceBaseIndex(op, scratchSlice, linalgRoot);
++      computeDstLinearizationFootprint(loops) == 1
++          ? static_cast<int64_t>(scratchSlice)
++          : computeLinearizedDstSliceBaseIndex(op, scratchSlice, linalgRoot);
+   op->setAttr("dst_scratch_index",
+               mlir::IntegerAttr::get(
+                   mlir::IntegerType::get(op->getContext(), 64), dstIndex));
+@@ -1177,27 +1203,34 @@ cloneAffineLoopSkeleton(PatternRewriter &rewriter, Operation *loopNestOrOp) {
  void replaceLoadWithDst(PatternRewriter &rewriter, const DstAccess &access,
                          Value dst, AffineMap dstAccessMap,
                          ValueRange dstAccessIndices) {
@@ -5092,7 +5216,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
    default:
      llvm_unreachable("replaceLoadWithDst expects a load access");
    }
-@@ -1210,13 +1219,28 @@ void replaceStoreWithDst(PatternRewriter &rewriter, const DstAccess &access,
+@@ -1210,13 +1243,28 @@ void replaceStoreWithDst(PatternRewriter &rewriter, const DstAccess &access,
    case DstAccessKind::AffineStore: {
      auto storeOp = cast<affine::AffineStoreOp>(access.op);
      Value valueToStore = storeOp.getValue();
@@ -5126,7 +5250,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
      }
      rewriter.replaceOpWithNewOp<affine::AffineStoreOp>(
          storeOp, valueToStore, dst, dstAccessMap, dstAccessIndices);
-@@ -1600,7 +1624,23 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
+@@ -1600,7 +1648,23 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
    }
  }
  
@@ -6292,7 +6416,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  class ElementwiseFusionAnalysis {
  public:
    using FusionGroup = llvm::SmallVector<Operation *>;
-@@ -44,24 +59,219 @@ public:
+@@ -44,24 +59,228 @@ public:
      if (!op) {
        return false;
      }
@@ -6456,6 +6580,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +                d = heads.getDimSize(2);
 +        int64_t rows = flat.getRank() == 2 ? flat.getDimSize(0) : 1;
 +        int64_t cols = flat.getShape().back();
++        // These are only views after the head-major rewrite.
++        if (!std::getenv("LIBTT_D2M_HEAD_MAJOR")) {
++          return false;
++        }
 +        if (d == 1 && h == 1 && rows == t && cols == 1 && t <= 32) {
 +          return true;
 +        }
@@ -6497,6 +6625,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +    // Row reductions over the last dimension, keeping it.
 +    if (extended && mlir::isa<MeanOp, SumOp, MaxOp>(op)) {
 +      auto input = cast<RankedTensorType>(op->getOperand(0).getType());
++      // D2M keeps a reduced row in one block (one L1 buffer): rows up to 32
++      // tiles.
++      if (input.getRank() == 0 || input.getShape().back() > 32 * 32) {
++        return false;
++      }
 +      auto dims = op->getAttrOfType<ArrayAttr>("dim_arg");
 +      auto keepDim = op->getAttrOfType<BoolAttr>("keep_dim");
 +      if (!dims || dims.size() != 1 || !keepDim || !keepDim.getValue()) {
@@ -6520,7 +6653,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
-@@ -69,13 +279,28 @@ public:
+@@ -69,13 +288,28 @@ public:
    }
  
  private:
@@ -6555,7 +6688,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            return false;
          }
        }
-@@ -89,13 +314,16 @@ private:
+@@ -89,13 +323,16 @@ private:
      llvm::SmallVector<Operation *> exitOps;
      rootOp->walk([&](Block *block) {
        for (Operation &op : llvm::reverse(*block)) {
@@ -6573,7 +6706,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        FusionGroup group = buildFusionGroup(exitOp);
  
        if (group.size() >= 2) {
-@@ -119,41 +347,40 @@ private:
+@@ -119,41 +356,40 @@ private:
      }
    }
  
@@ -6639,7 +6772,21 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      for (Operation &op : *block) {
        if (fusionSet.contains(&op)) {
          fusionGroup.push_back(&op);
-@@ -179,6 +406,81 @@ public:
+@@ -176,14 +412,175 @@ public:
+   using impl::TTNNCreateD2MSubgraphsBase<
+       TTNNCreateD2MSubgraphsPass>::TTNNCreateD2MSubgraphsBase;
+ 
++  // [T, H*D] -> [T, H, D] with T <= 32 and D % 32 == 0 (the head-major
++  // rewrite's split).
++  static bool isHeadSplit(ReshapeOp r) {
++    auto in = r.getInput().getType();
++    auto out = r.getResult().getType();
++    return in.getRank() == 2 && out.getRank() == 3 &&
++           out.getDimSize(0) == in.getDimSize(0) && out.getDimSize(0) <= 32 &&
++           out.getDimSize(2) % 32 == 0 &&
++           in.getDimSize(1) == out.getDimSize(1) * out.getDimSize(2);
++  }
++
    void runOnOperation() final {
      ModuleOp moduleOp = getOperation();
  
@@ -6718,10 +6865,91 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      }
 +    }
 +
++    // libtt (LIBTT_D2M_HEAD_MAJOR): a head split followed by a narrowing
++    // typecast (which stays on TTNN) narrows first, so the split joins the
++    // subgraph: reshape(x) -> typecast becomes typecast(x) -> reshape.
++    if (std::getenv("LIBTT_D2M_HEAD_MAJOR") && std::getenv("LIBTT_D2M_VIEWS")) {
++      IRRewriter rw(&getContext());
++      SmallVector<std::pair<ReshapeOp, TypecastOp>> swaps;
++      moduleOp.walk([&](ReshapeOp r) {
++        if (!isHeadSplit(r) || !r->hasOneUse()) {
++          return;
++        }
++        auto castOp = dyn_cast<TypecastOp>(*r->getUsers().begin());
++        if (castOp && castOp->getNumOperands() == 1 &&
++            r.getInput().getType().getElementType().isF32() &&
++            castOp.getResult().getType().getElementType().isBF16() &&
++            isa<TTNNLayoutAttr>(castOp.getResult().getType().getEncoding())) {
++          swaps.emplace_back(r, castOp);
++        }
++      });
++      for (auto [r, castOp] : swaps) {
++        auto in = r.getInput().getType();
++        auto out = castOp.getResult().getType();
++        auto narrowType = RankedTensorType::get(
++            in.getShape(), out.getElementType(),
++            TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(out.getEncoding()),
++                                    in.getShape())
++                .build());
++        rw.setInsertionPoint(castOp);
++        Operation *narrow = rw.clone(*castOp);
++        narrow->setOperand(0, r.getInput());
++        narrow->getResult(0).setType(narrowType);
++        Operation *split = rw.clone(*r);
++        split->setOperand(0, narrow->getResult(0));
++        split->getResult(0).setType(out);
++        rw.replaceOp(castOp, split->getResults());
++        rw.eraseOp(r);
++      }
++    }
++
      ElementwiseFusionAnalysis analysis(moduleOp);
-     auto fusionGroups = analysis.getFusionGroups();
+-    auto fusionGroups = analysis.getFusionGroups();
++    SmallVector<ElementwiseFusionAnalysis::FusionGroup> fusionGroups(
++        analysis.getFusionGroups().begin(), analysis.getFusionGroups().end());
      if (fusionGroups.empty()) {
-@@ -216,8 +518,16 @@ private:
+       return;
+     }
++    // The head reshapes are views only after the head-major rewrite, which
++    // needs the group's head split. Without one, boundary head reshapes stay
++    // on TTNN; a group with one in the middle is not outlined.
++    for (auto &group : fusionGroups) {
++      llvm::DenseSet<Operation *> members(group.begin(), group.end());
++      bool hasSplit = llvm::any_of(group, [](Operation *op) {
++        auto r = dyn_cast<ReshapeOp>(op);
++        return r && isHeadSplit(r);
++      });
++      if (hasSplit) {
++        continue;
++      }
++      SmallVector<Operation *> kept;
++      bool drop = false;
++      for (Operation *op : group) {
++        auto r = dyn_cast<ReshapeOp>(op);
++        if (!r || r.getInput().getType().getNumElements() == 1) {
++          kept.push_back(op);
++          continue;
++        }
++        bool source = llvm::none_of(op->getOperands(), [&](Value v) {
++          return members.contains(v.getDefiningOp());
++        });
++        bool sink = llvm::none_of(op->getUsers(), [&](Operation *u) {
++          return members.contains(u);
++        });
++        if (!source && !sink) {
++          drop = true;
++        }
++      }
++      if (drop) {
++        group.clear();
++      } else {
++        group = kept;
++      }
++    }
+ 
+     IRRewriter rewriter(&getContext());
+     for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
+@@ -216,8 +613,16 @@ private:
        }
      }
  
@@ -6740,7 +6968,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (outputs.empty()) {
        TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
                     "Fusion group {} has no external outputs", groupIdx);
-@@ -229,7 +539,7 @@ private:
+@@ -229,7 +634,7 @@ private:
      Operation *lastInputDefiner = nullptr;
      for (Value v : inputs) {
        Operation *defOp = v.getDefiningOp();
@@ -6749,7 +6977,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
          lastInputDefiner = defOp;
        }
-@@ -244,14 +554,27 @@ private:
+@@ -244,14 +649,27 @@ private:
      // Get device for creating empty output buffers for DPS.
      auto device = utils::getOrInsertDevice(rewriter, firstOp);
      llvm::SmallVector<Type> inputTypes;
@@ -6780,7 +7008,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        outputTypes.push_back(tensorType);
  
        auto shapeAttr =
-@@ -289,7 +612,23 @@ private:
+@@ -289,7 +707,23 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -6805,7 +7033,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +645,20 @@ private:
+@@ -306,12 +740,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(
