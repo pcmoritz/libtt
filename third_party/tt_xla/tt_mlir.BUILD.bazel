@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -1364,6 +1364,21 @@ cc_library(
     ],
     deps = _TTMLIR_COMMON_DEPS + ["@//tt_mlir:compiler_headers"],
     alwayslink = True,
+)
+
+# Development driver for the compiler passes (for example the D2M pipeline on
+# an exported TTNN module): bazel build -c opt @tt_mlir_src//:ttmlir_opt.
+cc_binary(
+    name = "ttmlir_opt",
+    srcs = ["@//third_party/tt_xla:tt_mlir_opt.cc"],
+    copts = _TTMLIR_COMMON_COPTS,
+    tags = ["manual"],
+    deps = [
+        ":ttmlir_compiler",
+        ":ttmlir_runtime",
+        "@llvm-project//mlir:MlirOptLib",
+        "@llvm-project//mlir:Transforms",
+    ],
 )
 
 cc_library(
