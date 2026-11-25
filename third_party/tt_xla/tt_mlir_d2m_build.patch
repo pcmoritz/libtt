@@ -3224,7 +3224,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  
    return true;
  }
-@@ -715,45 +736,908 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
+@@ -715,45 +736,929 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
  };
  } // namespace
  
@@ -3535,7 +3535,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +        fuseElementwiseDAG(producer, consumer, *plan, rewriter);
 +        return success();
 +      }
-+    }
+     }
 +    // Preserve the existing tree/permutation path for other generic forms.
 +    for (OpOperand *input : consumer.getDpsInputOperands()) {
 +      if (isElementwiseFusable(input)) {
@@ -3543,7 +3543,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +                        consumer, rewriter);
 +        return success();
 +      }
-     }
++    }
 +    return failure();
 +  }
 +};
@@ -3796,10 +3796,31 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +                                   t.getElementType());
 +    };
 +    llvm::DenseMap<Value, Value> loaded;
++    const bool mcastRows = spreadGroup && mergedGrid.size() == 2 &&
++                           mergedGrid[1] > 1 &&
++                           std::getenv("LIBTT_D2M_SPREAD_MCAST");
 +    for (auto [i, v] : llvm::enumerate(inputs)) {
 +      RankedTensorType st = shardType(v);
 +      Value buffer = rewriter.create<tensor::EmptyOp>(loc, st.getShape(),
 +                                                      st.getElementType());
++      // libtt: an operand every core of a row reads (a member kept on whole
++      // rows) is read once per row and multicast along it (low-level form:
++      // from this core's row, all columns).
++      AffineMap map = maps[i];
++      bool rowReplicated =
++          mcastRows && mlir::isa<AffineDimExpr>(map.getResult(0)) &&
++          mlir::isa<AffineConstantExpr>(map.getResult(1));
++      if (rowReplicated) {
++        SmallVector<Value> start{rewriter.create<CoreIndexOp>(loc, 0), c0};
++        SmallVector<Value> shape{
++            rewriter.create<arith::ConstantIndexOp>(loc, 1),
++            rewriter.create<arith::ConstantIndexOp>(loc, mergedGrid[1])};
++        loaded[v] = rewriter
++                        .create<RemoteLoadOp>(loc, buffer, v, indicesFor(map),
++                                              start, shape)
++                        .getResult();
++        continue;
++      }
 +      loaded[v] = rewriter
 +                      .create<RemoteLoadOp>(loc, st, buffer, v,
 +                                            indicesFor(maps[i]))
