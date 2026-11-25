@@ -796,7 +796,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      rewriter.eraseOp(op);
      return success();
    }
-@@ -1423,8 +1590,13 @@ public:
+@@ -1423,8 +1590,16 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
@@ -804,29 +804,33 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
 -                                                    outDtype);
 +      // D2M uses a normal BF16 CB, so unpack has already widened this tile.
 +      // The patched TTNN BF16->FP32 helper expects raw UInt16 CB data instead.
-+      if (inDtype != ttcore::DataType::BFloat16 ||
-+          outDtype != ttcore::DataType::Float32) {
++      // libtt: same-format "casts" (an FP32 value in a BF16-encoded tensor,
++      // narrowed by the pack) are no-ops.
++      if ((inDtype != ttcore::DataType::BFloat16 ||
++           outDtype != ttcore::DataType::Float32) &&
++          inDtype != outDtype) {
 +        rewriter.create<ttkernel::TypecastTileInitOp>(op->getLoc(), inDtype,
 +                                                      outDtype);
 +      }
      } else {
        rewriter.create<InitOp>(op->getLoc());
      }
-@@ -1439,8 +1611,11 @@ public:
+@@ -1439,8 +1614,12 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
 -      rewriter.create<ttkernel::TypecastTileOp>(
 -          op->getLoc(), adaptor.getInput(), inDtype, outDtype);
-+      if (inDtype != ttcore::DataType::BFloat16 ||
-+          outDtype != ttcore::DataType::Float32) {
++      if ((inDtype != ttcore::DataType::BFloat16 ||
++           outDtype != ttcore::DataType::Float32) &&
++          inDtype != outDtype) {
 +        rewriter.create<ttkernel::TypecastTileOp>(
 +            op->getLoc(), adaptor.getInput(), inDtype, outDtype);
 +      }
      } else if constexpr (std::is_same_v<SFPUOp, ttkernel::ClampScalarTileOp>) {
        auto loc = op->getLoc();
        // The hardware clamp API takes i32 params for both int and float clamps.
-@@ -1577,9 +1752,13 @@ public:
+@@ -1577,9 +1756,13 @@ public:
                                        adaptor.getFalseValue(), dstIdx},
                                       /*allowHoisting*/ false);
        if constexpr (std::is_same_v<ConcreteOp, d2m::TileWhereOp>) {
@@ -843,7 +847,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
          rewriter.create<ttkernel::WhereTileOp>(
              op->getLoc(), adaptor.getCondition(), adaptor.getTrueValue(),
              adaptor.getFalseValue(), dstIdx, dtype);
-@@ -1629,6 +1808,17 @@ public:
+@@ -1629,6 +1812,17 @@ public:
        return emitFPUTiles(rewriter, op, adaptor, loc);
      }
  
@@ -861,7 +865,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      if (lhsFromDst) {
        // LHS from Dst, RHS from Cb (FPU - DEST_TO_SRCA)
        return emitFPUBinaryDestReuse(rewriter, op, adaptor, loc,
-@@ -1737,6 +1927,61 @@ private:
+@@ -1737,6 +1931,61 @@ private:
      return success();
    }
  
@@ -923,7 +927,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
    // One operand from Dst, use binary_dest_reuse
    LogicalResult emitFPUBinaryDestReuse(ConversionPatternRewriter &rewriter,
                                         ConcreteOp op,
-@@ -2087,12 +2332,9 @@ public:
+@@ -2087,12 +2336,9 @@ public:
  
      Value inCB = getInCB(rewriter, op);
  
@@ -955,7 +959,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -42,7 +49,343 @@ namespace mlir::tt::d2m {
+@@ -42,7 +49,396 @@ namespace mlir::tt::d2m {
  } // namespace mlir::tt::d2m
  
  namespace {
@@ -1068,11 +1072,64 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +                           param(m.getValue()))
 +                 .str(),
 +             t);
++    } else if (auto guarded = conditionalFill(op)) {
++      // if (cond) fill(k, v): the slice keeps its value unless cond (a
++      // reduction's first-iteration seed).
++      auto [cond, fill] = *guarded;
++      int k = slot(fill.getDstIndex());
++      std::string x = read(k);
++      std::string t = fresh();
++      select(k,
++             llvm::formatv("sfpi::vFloat {0} = {1}; if ({2}) {{ {0} = "
++                           "sfpi::vFloat({3}); }",
++                           t, x, param(cond), param(fill.getValue()))
++                 .str(),
++             t);
 +    } else {
 +      return false;
 +    }
 +    ++numOps;
 +    return true;
++  }
++
++  // scf.if (cond) { fill_tile_init; fill_tile(k, v) } with no else.
++  static std::optional<std::pair<Value, ttkernel::FillTileOp>>
++  conditionalFill(Operation *op) {
++    auto ifOp = dyn_cast<scf::IfOp>(op);
++    if (!ifOp || ifOp->getNumResults() != 0 || !ifOp.getElseRegion().empty()) {
++      return std::nullopt;
++    }
++    ttkernel::FillTileOp fill;
++    for (Operation &inner : ifOp.getThenRegion().front()) {
++      if (auto f = dyn_cast<ttkernel::FillTileOp>(inner)) {
++        if (fill) {
++          return std::nullopt;
++        }
++        fill = f;
++      } else if (!isa<ttkernel::FillTileInitOp, scf::YieldOp>(inner) &&
++                 !(isPure(&inner) && inner.getNumRegions() == 0)) {
++        return std::nullopt;
++      }
++    }
++    if (!fill) {
++      return std::nullopt;
++    }
++    // The index and value must be visible outside the if; constants made
++    // inside move before it.
++    for (Value v : fill->getOperands()) {
++      Operation *def = v.getDefiningOp();
++      if (def && ifOp->isAncestor(def) &&
++          !def->hasTrait<OpTrait::ConstantLike>()) {
++        return std::nullopt;
++      }
++    }
++    for (Value v : fill->getOperands()) {
++      Operation *def = v.getDefiningOp();
++      if (def && ifOp->isAncestor(def)) {
++        def->moveBefore(ifOp);
++      }
++    }
++    return std::make_pair(ifOp.getCondition(), fill);
 +  }
 +
 +  static bool isInit(Operation *op) {
@@ -1087,7 +1144,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +  }
 +
 +  int getNumOps() const { return numOps; }
- 
++
 +  // Emits the call before `before`; false if the chain is too large.
 +  bool emit(Operation *before) {
 +    if (slotValues.size() > 8 || params.size() > 8 || numOps > 32) {
@@ -1157,7 +1214,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    builder.create(state);
 +    return true;
 +  }
-+
+ 
 +private:
 +  int slot(Value idx) {
 +    if (std::optional<int64_t> c = getConstantIntValue(idx)) {
@@ -1299,7 +1356,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  struct ConvertD2MToTTKernel
      : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
  
-@@ -217,6 +560,34 @@ struct ConvertD2MToTTKernel
+@@ -217,6 +613,34 @@ struct ConvertD2MToTTKernel
        return;
      }
  
