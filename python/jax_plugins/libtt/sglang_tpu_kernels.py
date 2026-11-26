@@ -28,6 +28,10 @@ or FP8, as loaded.
 
 # Users per TTNN paged decode attention call.
 MAX_DECODE_USERS = 32
+# Tokens that run as decode users when the decode kernel is the only TTNN kernel for the attention (a learned
+# relative bias or per-token sinks): each reads its sequence up to its position, where gathering every sequence's
+# pages for every token took ~5 ms per layer for a 64-token prefill.
+MAX_DECODE_ROUTE_TOKENS = 256
 # Tokens per TTNN paged cache update, one core each.
 MAX_UPDATE_USERS = 32
 
@@ -36,11 +40,17 @@ KV_POOL_MODULE = "sglang_tpu.kv_pool"
 FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
 GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
 MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
+MAMBA_STATE_ROWS_MODULE = "sglang_tpu.mamba_state_rows"
+INKLING_SCONV_MODULE = "sglang_tpu.attention_inkling_sconv_pallas"
 KV_FUSED_ROPE_WRITE_MODULE = "sglang_tpu.kv_fused_rope_write"
 BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_worker"
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
 FUSED_MOE_MODULE = "sglang_tpu.moe.pallas.fused_moe_op"
 FP8_MOE_FUSED_RS_MODULE = "sglang_tpu.fp8_moe_fused_rs"
+FP4_MOE_MODULE = "sglang_tpu.fp4_moe"
+INKLING2_ATTN_RES_MODULE = "sglang_tpu.inkling2_attn_res"
+INKLING2_L2_CLIP_MODULE = "sglang_tpu.inkling2_l2_clip"
+INKLING2_ROUTE_MODULE = "sglang_tpu.inkling2_route"
 
 
 def _ragged_paged_attention(module):
@@ -60,6 +70,9 @@ def _ragged_paged_attention(module):
         distribution,  # i32[3]: decode, prefill and mixed sequence ranges
         custom_mask,
         attention_sink=None,
+        rel_r=None,  # [tokens, q_heads, rel_dim]
+        rel_proj=None,  # [rel_dim, extent]
+        token_sink=None,  # [tokens, q_heads]
         *,
         causal=1,
         sm_scale=1.0,
@@ -144,18 +157,28 @@ def _ragged_paged_attention(module):
         # speculative verify: each token attends up to its own position, so
         # a sequence's window stays causal, where the chunked kernel pads
         # every sequence's queries to a chunk of 128 rows.
+        decode_only = rel_proj is not None or token_sink is not None
         if (
-            tokens <= max(seqs, MAX_DECODE_USERS)
+            tokens <= max(seqs, MAX_DECODE_ROUTE_TOKENS if decode_only else MAX_DECODE_USERS)
             and cache_heads == kv_heads
             and causal
             and soft_cap is None
             and attention_sink is None
+            and (rel_proj is None) == (rel_r is None)
             and q_scale is None
             and k_scale is None
             and v_scale is None
         ):
             out = _paged_decode(
-                queries, cache, user_pages, user_positions, sm_scale, sliding_window
+                queries,
+                cache,
+                user_pages,
+                user_positions,
+                sm_scale,
+                sliding_window,
+                rel_r=rel_r,
+                rel_proj=rel_proj,
+                token_sink=token_sink,
             )
             return out.astype(out_dtype or queries.dtype), cache
         # Otherwise each sequence is a user of TTNN's chunked paged attention,
@@ -167,6 +190,8 @@ def _ragged_paged_attention(module):
             and causal
             and soft_cap is None
             and attention_sink is None
+            and rel_proj is None
+            and token_sink is None
             and sliding_window is None
             and q_scale is None
             and k_scale is None
@@ -219,8 +244,15 @@ def _ragged_paged_attention(module):
         if sliding_window is not None:
             allowed = allowed & (position[:, None] - key_pos[None, :] < sliding_window)
         scores = scores.reshape(kv_heads, group, tokens, -1)
+        if rel_proj is not None:
+            scores = scores + _relative_bias(rel_r, rel_proj, position, key_pos).reshape(
+                kv_heads, group, tokens, -1
+            )
         scores = jnp.where(allowed[None, None], scores, mask_value)
-        if attention_sink is not None:
+        if token_sink is not None:
+            sink = token_sink.astype(jnp.float32).T.reshape(kv_heads, group, tokens, 1)
+            probs = jax.nn.softmax(jnp.concatenate([sink, scores], axis=-1), axis=-1)[..., 1:]
+        elif attention_sink is not None:
             sink = jnp.broadcast_to(
                 jnp.asarray(attention_sink, jnp.float32).reshape(kv_heads, group, 1, 1),
                 (kv_heads, group, tokens, 1),
@@ -235,6 +267,30 @@ def _ragged_paged_attention(module):
         return out, cache
 
     return ragged_paged_attention
+
+
+def _relative_bias(rel_r, rel_proj, positions, key_positions):
+    """[q_heads, tokens, keys] learned relative-position logits.
+
+    A token at position p and a key at position j get rel_r[token] .
+    rel_proj[:, p - j] while 0 <= p - j < extent, and nothing beyond it. Each
+    (token, key) pair gathers its column of rel_proj as a row of rel_proj.T, an
+    embedding lookup, and a batched matmul over the tokens takes the products.
+    """
+    import jax.numpy as jnp
+
+    extent = rel_proj.shape[1]
+    distance = positions[:, None] - key_positions[None, :]
+    columns = jnp.take(
+        rel_proj.astype(jnp.float32).T, jnp.clip(distance, 0, extent - 1), axis=0
+    )
+    bias = jnp.einsum(
+        "thf,tkf->htk",
+        rel_r.astype(jnp.float32),
+        columns,
+        preferred_element_type=jnp.float32,
+    )
+    return jnp.where(((distance >= 0) & (distance < extent))[None], bias, 0.0)
 
 
 def _prefill_chunk(page_size):
@@ -288,8 +344,23 @@ def _paged_prefill(queries, cache, table, q_starts, prefixes, seq, positions, li
     return out[:, :, cache_head_dim : cache_head_dim + head_dim]
 
 
-def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_window):
-    """Each token as a TTNN decode user, attending to its sequence up to its position."""
+def _paged_decode(
+    queries,
+    cache,
+    page_table,
+    positions,
+    sm_scale,
+    sliding_window,
+    rel_r=None,
+    rel_proj=None,
+    token_sink=None,
+):
+    """Each token as a TTNN decode user, attending to its sequence up to its position.
+
+    A learned relative-position bias (rel_r . rel_proj[:, distance]) goes to the kernel as its causal window bias,
+    and per-token sinks as its sink per user and head. The kernel scales scores inside its exponent, the bias and
+    sinks with them, where these are added to scaled scores: both are divided by sm_scale.
+    """
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -300,28 +371,109 @@ def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_windo
     cache_head_dim = cache.shape[-1] // 2
     q = jnp.pad(queries, ((0, 0), (0, 0), (0, cache_head_dim - head_dim))).astype(cache.dtype)
     window = {} if sliding_window is None else {"sliding_window_size": np.int32(sliding_window)}
+    # tt.window_bias forms each chunk's bias (and sink tiles) in one program from a table computed once.
+    fused_bias = rel_proj is not None and rel_proj.shape[0] == 16 and q_heads <= 32 and MAX_DECODE_USERS <= 32
+    table = _window_bias_table(rel_proj, sm_scale) if fused_bias else None
+    bias = None if rel_proj is None or fused_bias else _decode_window_bias(rel_r, rel_proj, positions, sm_scale)
+    sink = None
+    if token_sink is not None and not fused_bias:
+        # [users, 1, heads, 32] with each sink in column 0, as TTNN's per-head sink tile.
+        sink = token_sink.astype(jnp.bfloat16) * jnp.bfloat16(1 / sm_scale)
+        sink = jnp.pad(sink[:, None, :, None], ((0, 0), (0, 0), (0, 0), (0, 31)))
     outputs = []
     for start in range(0, tokens, MAX_DECODE_USERS):
-        users = q[None, start : start + MAX_DECODE_USERS]
+        chunk = slice(start, start + MAX_DECODE_USERS)
+        users = q[None, chunk]
+        operands = [users, cache, cache, page_table[chunk]]
+        chunk_bias = None if bias is None else bias[chunk]
+        chunk_sink = None if sink is None else sink[chunk]
+        if fused_bias:
+            chunk_bias, chunk_sink = _window_bias_call(
+                rel_r[chunk], table, positions[chunk], None if token_sink is None else token_sink[chunk], sm_scale
+            )
+        if chunk_bias is not None:
+            operands.append(chunk_bias)
+        operands.append(positions[chunk])
+        if chunk_sink is not None:
+            operands.append(chunk_sink)
         outputs.append(
             jax.ffi.ffi_call(
                 "tt.paged_scaled_dot_product_attention_decode",
                 jax.ShapeDtypeStruct(users.shape, users.dtype),
             )(
-                users,
-                cache,
-                cache,
-                page_table[start : start + MAX_DECODE_USERS],
-                positions[start : start + MAX_DECODE_USERS],
+                *operands,
                 is_causal=True,
-                has_attention_mask=False,
+                has_attention_mask=chunk_bias is not None,
                 has_cur_pos_tensor=True,
-                has_attention_sink=False,
+                has_attention_sink=chunk_sink is not None,
                 scale=np.float32(sm_scale),
                 **window,
             )
         )
     return jnp.concatenate(outputs, axis=1)[0, :, :, :head_dim]
+
+
+def _decode_window_bias(rel_r, rel_proj, positions, sm_scale):
+    """[tokens, 1, q_heads, width] BF16 window bias of TTNN's causal decode.
+
+    The kernel's window is width / 32 key tiles ending at the tile of each user's position p: column j is the key at
+    first + j, first = 32 * max(0, p // 32 + 1 - width / 32), whose bias is rel_r . rel_proj[:, p - first - j] for
+    distances in [0, extent). width covers the extent behind any position in a tile. Each (token, column) gathers its
+    column of rel_proj as a row of rel_proj.T, which has a row of zeros appended for the other columns, and a matmul
+    per token takes the products. The kernel scales the bias with the scores, so it is divided by sm_scale.
+    """
+    import jax.numpy as jnp
+
+    # rel_proj is a weight: what follows from it alone (the scaled, transposed and padded table) runs once.
+    rel_proj = _mark_weight(rel_proj)
+    extent = rel_proj.shape[1]
+    window_tiles = -(-extent // 32) + 1
+    width = 32 * window_tiles
+    first = 32 * jnp.maximum(positions // 32 + 1 - window_tiles, 0)
+    distance = (positions - first)[:, None] - jnp.arange(width, dtype=jnp.int32)[None, :]
+    rows = jnp.where((distance >= 0) & (distance < extent), distance, extent)
+    table = jnp.pad(rel_proj.astype(jnp.float32).T / sm_scale, ((0, 1), (0, 0)))
+    columns = table.at[rows].get(mode="promise_in_bounds")
+    bias = jnp.einsum(
+        "thf,twf->thw", rel_r.astype(jnp.float32), columns, preferred_element_type=jnp.float32
+    )
+    return bias.astype(jnp.bfloat16)[:, None]
+
+
+def _window_bias_table(rel_proj, sm_scale):
+    """[2W, rel_dim] FP32 for tt.window_bias: row W - 1 - d holds distance d's column of rel_proj / sm_scale, zero
+    where d is outside [0, extent). A key tile's 32 window columns are then 32 consecutive rows. W is
+    `_decode_window_bias`'s width; the table depends on the weight alone, so it is computed once."""
+    import jax.numpy as jnp
+
+    rel_proj = _mark_weight(rel_proj)
+    extent = rel_proj.shape[1]
+    width = 32 * (-(-extent // 32) + 1)
+    distance = width - 1 - jnp.arange(2 * width, dtype=jnp.int32)
+    valid = (distance >= 0) & (distance < extent)
+    rows = (rel_proj.astype(jnp.float32).T / sm_scale)[jnp.clip(distance, 0, extent - 1)]
+    return jnp.where(valid[:, None], rows, jnp.float32(0))
+
+
+def _window_bias_call(rel_r, table, positions, sink, sm_scale):
+    """tt.window_bias for up to 32 tokens: `_decode_window_bias`'s bias [tokens, 1, q_heads, W] from rel_r
+    [tokens, q_heads, 16] and `_window_bias_table`'s table and, with sink [tokens, q_heads], the kernel's sink tiles
+    [tokens, 1, q_heads, 32] (sink / sm_scale in column 0), in one program."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    tokens, heads, rel_dim = rel_r.shape
+    width = table.shape[0] // 2
+    results = [jax.ShapeDtypeStruct((tokens, 1, heads, width), jnp.bfloat16)]
+    operands = [rel_r.reshape(tokens, heads * rel_dim).astype(jnp.bfloat16), table, positions.astype(jnp.int32)]
+    if sink is not None:
+        operands.append(sink.astype(jnp.bfloat16))
+        results.append(jax.ShapeDtypeStruct((tokens, 1, heads, 32), jnp.bfloat16))
+    outs = jax.ffi.ffi_call("tt.window_bias", tuple(results))(
+        *operands, heads=np.int64(heads), sink_scale=np.float32(1 / sm_scale), has_sink=sink is not None
+    )
+    return outs[0], (outs[1] if sink is not None else None)
 
 
 def patch_rpa_v3(module):
@@ -418,6 +570,212 @@ def patch_gdn(module):
     from jax_plugins.libtt import sglang_tpu_gdn
 
     module.fused_conv1d_gdn = sglang_tpu_gdn.fused_conv1d_gdn
+
+
+def patch_mamba_state_rows(module):
+    """Row reads and writes of a state pool (Inkling's short-convolution windows)
+    without Pallas: a gather of the rows, and TTNN's in-place state-pool update,
+    which writes whole slots and skips slot 0, SGLang's padding slot, where the
+    Pallas kernel skips the rows that aren't live."""
+    import functools
+
+    @functools.cache
+    def state_row_read_op():
+        import jax
+        import jax.numpy as jnp
+        import torch
+        from torch_tpu._internal import pallas
+
+        # torch_tpu's jax_op reads the signature's annotations.
+        def read_rows(pool: jax.Array, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+            # The callers clamp the rows to the pool.
+            flat = pool.reshape(pool.shape[0], -1)
+            out = flat.at[rows].get(mode="promise_in_bounds")
+            return pool, out.reshape(rows.shape[0], *pool.shape[1:])
+
+        op = pallas.jax_op("sglang::tpu_state_row_read", read_rows, donate_argnums=(0,))
+
+        @op.register_fake
+        def fake(pool, rows):
+            return torch.empty_like(pool), pool.new_empty((rows.shape[0], *pool.shape[1:]))
+
+        return op
+
+    @functools.cache
+    def state_row_write_op():
+        import jax
+        import jax.numpy as jnp
+        import torch
+        from torch_tpu._internal import pallas
+
+        from jax_plugins.libtt import sglang_tpu_gdn
+
+        def write_rows(pool: jax.Array, rows: jax.Array, live: jax.Array, new: jax.Array) -> jax.Array:
+            return sglang_tpu_gdn._write_rows(pool, jnp.where(live != 0, rows, 0), new)
+
+        op = pallas.jax_op("sglang::tpu_state_row_write", write_rows, donate_argnums=(0,))
+
+        @op.register_fake
+        def fake(pool, rows, live, new):
+            return torch.empty_like(pool)
+
+        return op
+
+    module.state_row_read_op = state_row_read_op
+    module.state_row_write_op = state_row_write_op
+
+
+def patch_inkling_sconv(module):
+    """Inkling's short convolutions: a decode step runs on TTNN's causal conv
+    update, without its SiLU, which reads and updates each request's window in
+    the pool in place (`[slots, channels, 3]`, see
+    `sglang_tpu_gdn.patch_mamba_pool`). With the model's decode weight the
+    residual and the scale are folded in; global layers' K and V add each row's
+    dynamic taps (per head) in the kernel, which scales the result. The rest
+    (extends and verifies) convolve in torch, as in SGLang-TorchTPU."""
+    import functools
+
+    import torch
+
+    backend = module.TpuInklingSconvBackend
+    torch_decode = backend._xla_sconv_decode
+
+    @functools.cache
+    def conv_update_op(out_dtype="float32"):
+        import jax
+        import jax.numpy as jnp
+        from torch_tpu._internal import pallas
+
+        from jax_plugins.libtt import sglang_tpu_gdn
+
+        def conv_update(
+            state: jax.Array, x: jax.Array, weight: jax.Array, slots: jax.Array, initial: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            outputs = []
+            for start in range(0, x.shape[0], sglang_tpu_gdn.MAX_ROWS):
+                rows = slice(start, start + sglang_tpu_gdn.MAX_ROWS)
+                state, out = jax.ffi.ffi_call(
+                    "tt.causal_conv1d_update",
+                    (
+                        jax.ShapeDtypeStruct(state.shape, state.dtype),
+                        jax.ShapeDtypeStruct(x[rows].shape, jnp.dtype(out_dtype)),
+                    ),
+                    input_output_aliases={0: 0},
+                    vmap_method="sequential",
+                )(state, x[rows], weight, slots[rows], initial[rows], apply_silu=False)
+                outputs.append(out)
+            return state, jnp.concatenate(outputs)
+
+        op = pallas.jax_op(f"libtt::inkling_conv_update_{out_dtype}", conv_update, donate_argnums=(0,))
+
+        @op.register_fake
+        def fake(state, x, weight, slots, initial):
+            return torch.empty_like(state), x.new_empty(x.shape, dtype=getattr(torch, out_dtype))
+
+        return op
+
+    @functools.cache
+    def dynamic_conv_update_op(head_dim, kernel_size):
+        """conv_update_op's BF16 form with each row's dynamic taps ([rows, heads * kernel_size], lag order) added to
+        the weight's and the result scaled by (2 * kernel_size + 1)^-0.5, the model's scale with dynamic weights."""
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from torch_tpu._internal import pallas
+
+        from jax_plugins.libtt import sglang_tpu_gdn
+
+        output_scale = (2 * kernel_size + 1) ** -0.5
+
+        def conv_update(
+            state: jax.Array, x: jax.Array, weight: jax.Array, slots: jax.Array, initial: jax.Array, dyn: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            outputs = []
+            for start in range(0, x.shape[0], sglang_tpu_gdn.MAX_ROWS):
+                rows = slice(start, start + sglang_tpu_gdn.MAX_ROWS)
+                state, out = jax.ffi.ffi_call(
+                    "tt.causal_conv1d_update",
+                    (
+                        jax.ShapeDtypeStruct(state.shape, state.dtype),
+                        jax.ShapeDtypeStruct(x[rows].shape, jnp.bfloat16),
+                    ),
+                    input_output_aliases={0: 0},
+                    vmap_method="sequential",
+                )(
+                    state,
+                    x[rows],
+                    weight,
+                    slots[rows],
+                    initial[rows],
+                    dyn[rows],
+                    apply_silu=False,
+                    has_dynamic_weight=True,
+                    head_dim=np.int64(head_dim),
+                    output_scale=np.float32(output_scale),
+                )
+                outputs.append(out)
+            return state, jnp.concatenate(outputs)
+
+        op = pallas.jax_op(
+            f"libtt::inkling_dynamic_conv_update_{head_dim}_{kernel_size}", conv_update, donate_argnums=(0,)
+        )
+
+        @op.register_fake
+        def fake(state, x, weight, slots, initial, dyn):
+            return torch.empty_like(state), x.new_empty(x.shape, dtype=torch.bfloat16)
+
+        return op
+
+    def _xla_sconv_decode(self, x, *, state, weight, dyn, use_residual, decode_weight=None):
+        # Dynamic taps need the model's decode weight (static taps in tap order with the residual), at most 8 heads
+        # of whole tiles.
+        dynamic_ok = (
+            dyn is not None
+            and decode_weight is not None
+            and use_residual
+            and dyn.shape[1] * dyn.shape[2] <= 32
+            and dyn.shape[2] == 4
+            and (x.shape[1] // dyn.shape[1]) % 32 == 0
+        )
+        if (dyn is not None and not dynamic_ok) or state.dim() != 3 or self._track_end is not None:
+            return torch_decode(
+                self, x, state=state, weight=weight, dyn=dyn, use_residual=use_residual, decode_weight=decode_weight
+            )
+        num_seqs, dim = x.shape
+        # Padding rows (index -1) go to slot 0, which the kernel never writes.
+        slots = torch.where(self._state_indices[:num_seqs] >= 0, self._state_indices[:num_seqs], 0)
+        initial = (self._seq_lens[:num_seqs] > 1).to(torch.bfloat16)
+        if dyn is not None:
+            heads, kernel_size = dyn.shape[1], dyn.shape[2]
+            pool, conv = dynamic_conv_update_op(dim // heads, kernel_size)(
+                state,
+                x.to(torch.bfloat16),
+                decode_weight.to(torch.bfloat16),
+                slots.to(torch.int32),
+                initial,
+                dyn.reshape(num_seqs, heads * kernel_size).to(torch.bfloat16),
+            )
+            state.copy_(pool)
+            return conv.to(x.dtype)
+        kernel_size = weight.shape[-1]
+        if decode_weight is not None and use_residual:
+            # The model's weight with the residual tap and the scale folded in: the
+            # kernel's output is the result.
+            pool, conv = conv_update_op("bfloat16")(
+                state, x.to(torch.bfloat16), decode_weight.to(torch.bfloat16), slots.to(torch.int32), initial
+            )
+            state.copy_(pool)
+            return conv.to(x.dtype)
+        pool, conv = conv_update_op()(
+            state, x.to(torch.bfloat16), weight.reshape(dim, kernel_size), slots.to(torch.int32), initial
+        )
+        state.copy_(pool)
+        acc = conv + x.float() if use_residual else conv
+        return (acc * (kernel_size + int(use_residual)) ** -0.5).to(x.dtype)
+
+    backend._xla_sconv_decode = _xla_sconv_decode
+    module.libtt_conv_update_op = conv_update_op  # for tests
+    module.libtt_dynamic_conv_update_op = dynamic_conv_update_op
 
 
 def patch_mamba_pool(module):
@@ -545,6 +903,50 @@ def _fp8_scales(w13, w13_scale, w2_scale):
     return scale13[:, : gate_up // 2], scale13[:, gate_up // 2 :], scales(w2_scale, k)
 
 
+def _mark_weight(w):
+    """`w`, marked as a weight (a parameter of the program): ops that depend on weights alone run once, in the
+    weight preparation."""
+    import jax
+
+    return jax.ffi.ffi_call("tt.weight_dtype_override", jax.ShapeDtypeStruct(w.shape, w.dtype))(
+        w, **{"ttcore.weight_dtype": "bf16"}
+    )
+
+
+def _nvfp4_dequant(packed, scale):
+    """BF16 [experts, k, n] experts from NVFP4 ones as SGLang-TorchTPU keeps them packed for its TPU kernels: uint8
+    [experts, k / 2, n], two E2M1 codes per byte along k (the even row in the low nibble), and a scale per block of
+    rows and column with the global scale folded in ([experts, blocks, 1, n]). E2M1 code s e1 e0 m is (-1)^s m / 2
+    for e = 0 and (-1)^s (1 + m / 2) 2^(e - 1) otherwise.
+
+    Everything runs in BF16 on [experts, k / 2, n] planes, which holds the bytes, the codes and the E2M1 values
+    exactly (the scaled values round to BF16 once, as they would from FP32): the nibbles are floor(b / 16) and
+    b - 16 floor(b / 16), each plane is decoded and scaled, and the two interleave along k at the end. Integer bit
+    operations and FP32 would take [experts, k, n] tensors of 4 bytes per value."""
+    import jax.numpy as jnp
+
+    experts, half_k, n = packed.shape
+    blocks = scale.shape[1]
+    scale = scale.astype(jnp.bfloat16)
+    byte = packed.astype(jnp.bfloat16)
+    high = jnp.floor(byte * 0.0625)
+
+    def decode(code):
+        negative = code >= 8
+        code = jnp.where(negative, code - 8, code)
+        exponent = jnp.floor(code * 0.5)
+        mantissa = code - 2 * exponent
+        power = jnp.where(exponent == 1, 1.0, jnp.where(exponent == 2, 2.0, 4.0)).astype(jnp.bfloat16)
+        magnitude = jnp.where(exponent == 0, 0.5 * mantissa, (1.0 + 0.5 * mantissa) * power)
+        value = jnp.where(negative, -magnitude, magnitude)
+        return (value.reshape(experts, blocks, -1, n) * scale).reshape(experts, half_k, n)
+
+    # [experts, k / 2, 2n]: row j holds rows 2j and 2j + 1 side by side, which a row-major reshape interleaves (a
+    # stacked [experts, k / 2, 2, n] would pad its size-2 axis to a tile's 32 rows).
+    planes = jnp.concatenate([decode(byte - 16 * high), decode(high)], axis=-1)
+    return planes.reshape(experts, 2 * half_k, n)
+
+
 def _fused_moe_jax(
     hidden_states,
     w1,
@@ -569,7 +971,8 @@ def _fused_moe_jax(
     gather_permute_with_sc_combine=0,
 ):
     """The fused MoE op on TTNN's fused MoE kernel (tt.fused_moe_ep), with the
-    experts in BF16 or FP8, as loaded.
+    experts in BF16 or FP8, as loaded, or NVFP4 (packed, with block scales),
+    which run as BFP4.
 
     FP8 experts come with SGLang-TorchTPU's channelwise runtime scales, one per
     expert and output column. The kernel reads the FP8 weights as they are and
@@ -583,16 +986,35 @@ def _fused_moe_jax(
     the layer's all-reduce adds them up. Like the Pallas kernel, it reads the
     router's global expert ids. w1 holds each expert's gate and up projections
     side by side, [experts, hidden, 2 * intermediate].
+
+    The experts are SiLU-gated, or SiTU-gated with activation_name
+    "situ:{beta}:{linear_beta}" (Inkling 2): beta * tanh(g / beta) * sigmoid(g)
+    * linear_beta * tanh(u / linear_beta) for gate g and up u.
     """
     import jax
     import jax.numpy as jnp
+    import numpy as np
     import torch.distributed as dist
 
+    activation = {}
+    if activation_name.startswith("situ:"):
+        beta, linear_beta = activation_name.split(":")[1:]
+        if linear_beta == "none":
+            raise NotImplementedError("SiTU MoE on Tenstorrent takes an up softcap (linear_beta)")
+        activation = dict(
+            activation="situ", activation_beta=np.float32(beta), activation_limit=np.float32(linear_beta)
+        )
+    elif activation_name != "silu":
+        raise NotImplementedError(f"MoE on Tenstorrent runs SiLU or SiTU experts, not {activation_name}")
     extras = (w1_bias, w2_bias, w1_channel_scale, w2_channel_scale)
-    if activation_name != "silu" or no_combine or w_quant_bits or any(e is not None for e in extras):
-        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 SiLU experts without biases, combined")
+    if no_combine or w_quant_bits or any(e is not None for e in extras):
+        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 experts without biases, combined")
+    nvfp4 = w1.dtype == w2.dtype == jnp.uint8
     fp8 = w1.dtype == w2.dtype == jnp.float8_e4m3fn
-    if fp8:
+    if nvfp4:
+        if w1_scale is None or w2_scale is None or w1_scale.ndim != 4 or w2_scale.ndim != 4:
+            raise NotImplementedError("NVFP4 MoE on Tenstorrent takes packed E2M1 experts with block scales")
+    elif fp8:
         if w1_scale is None or w2_scale is None or w1_scale.shape[1] != 1 or w2_scale.shape[1] != 1:
             raise NotImplementedError(
                 "FP8 MoE on Tenstorrent takes channelwise scales: pass --tpu-fp8-runtime channelwise"
@@ -616,12 +1038,20 @@ def _fused_moe_jax(
             w, **{"ttcore.weight_dtype": "bf16"}
         )
 
-    w1, w2 = weight(w1), weight(w2)
     fused_moe_ep = jax.ffi.ffi_call("tt.fused_moe_ep", jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype))
+    if nvfp4:
+        # NVFP4 experts map to BFP4, TT's 4-bit block format: decoded once, in the weight preparation (the packed
+        # codes and their scales are marked as weights first), then prepared by the kernel as BFP4. BFP4 shares one
+        # exponent per 16 values of a tile row and has 3-bit mantissas, so this re-encodes the weights.
+        w1 = _nvfp4_dequant(weight(w1), weight(w1_scale))
+        w2 = _nvfp4_dequant(weight(w2), weight(w2_scale))
+        operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
+        return fused_moe_ep(*operands, weight_dtype="bfp4", **activation)
+    w1, w2 = weight(w1), weight(w2)
     operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
     if fp8:
-        return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)))
-    return fused_moe_ep(*operands, weight_dtype="bf16")
+        return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)), **activation)
+    return fused_moe_ep(*operands, weight_dtype="bf16", **activation)
 
 
 def patch_fused_moe(module):
@@ -643,15 +1073,407 @@ def patch_fp8_moe_fused_rs(module):
     module.prepare_fp8_fused_rs = prepare_fp8_fused_rs
 
 
+def patch_fp4_moe(module):
+    """SGLang-TorchTPU keeps NVFP4 experts packed with SGLANG_TPU_INKLING2_NVFP4_EXPERTS for its Pallas kernels,
+    which take this rank's local expert ids (or the fused-RS kernel). Here they run on the fused MoE op like FP8
+    experts: global expert ids, TTNN's fused MoE kernel (NVFP4 as BFP4) and the layer's all-reduce."""
+    import torch
+
+    from sglang.srt.runtime_context import get_parallel
+
+    def unmet_tpu_nvfp4_fused_rs_requirements(*args, **kwargs):
+        return ["Tenstorrent runs the fused MoE kernel followed by an all-reduce"]
+
+    def apply_tpu_nvfp4_moe(
+        *,
+        layer,
+        dispatch_output,
+        activation,
+        apply_router_weight_on_input,
+        no_combine=False,
+        use_fused_rs=False,
+        swiglu_limit=None,
+    ):
+        if apply_router_weight_on_input or use_fused_rs:
+            raise NotImplementedError("NVFP4 MoE on Tenstorrent runs the fused MoE op, router weights on the output")
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        global_num_experts = expert_group_offset = 0
+        ep_size, ep_rank = get_parallel().moe_ep_size, get_parallel().moe_ep_rank
+        if ep_size > 1:
+            global_num_experts = layer.num_local_experts * ep_size
+            expert_group_offset = ep_rank * layer.num_local_experts
+        if swiglu_limit is not None:
+            if activation != "silu":
+                raise ValueError("TPU clamped MoE requires silu activation")
+            activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+        output = module.fused_moe_call(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+            topk=int(topk_ids.shape[-1]),
+            activation=module.pallas_moe_activation(activation, layer),
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            no_combine=no_combine,
+            global_num_experts=global_num_experts,
+            expert_group_offset=expert_group_offset,
+        )
+        return module.StandardCombineInput(hidden_states=output)
+
+    prepare = module.prepare_tpu_nvfp4_moe_weights
+
+    def prepare_tpu_nvfp4_moe_weights(layer, group_size=module.TPU_NVFP4_GROUP_SIZE, **kwargs):
+        # The Pallas kernels' K and N alignment (512) would pad Inkling 2's intermediate size 1152 to 1536; the
+        # fused MoE kernel needs whole scale blocks only.
+        kwargs.setdefault("align_to", group_size)
+        return prepare(layer, group_size=group_size, **kwargs)
+
+    module.prepare_tpu_nvfp4_moe_weights = prepare_tpu_nvfp4_moe_weights
+    module.unmet_tpu_nvfp4_fused_rs_requirements = unmet_tpu_nvfp4_fused_rs_requirements
+    module.can_use_tpu_nvfp4_fused_rs = lambda *args, **kwargs: False
+    module.apply_tpu_nvfp4_moe = apply_tpu_nvfp4_moe
+
+
+def patch_inkling2_attn_res(module):
+    """Inkling 2's block attention residuals for decode steps: up to four tokens and eight
+    sources run on `ttnn::experimental::attn_res` (the `tt.attn_res` call), one program where
+    the stack, its RMS norm, the logits matmul, the softmax over the sources, the weighted sum
+    and the next norm took eleven. Both upstream's fused form with the RMS norm that follows
+    (its Pallas prefill kernel `inkling2_attn_res_norm`) and the mixture alone
+    (`attn_res_tpu`: the later loop passes, the loop messages and the final output). And the
+    loop-message controller (`loop_mix_tpu`) on `ttnn::experimental::loop_mix` (`tt.loop_mix`):
+    the RMS norms, the down, gain and forget matmuls, the tanh gates and the mix in one program.
+    Larger batches keep upstream's XLA path; the Pallas kernel itself only runs on TPUs."""
+    import functools
+    from typing import Optional
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+
+    max_tokens, max_sources = 4, 8
+
+    def supports_attn_res_norm(tokens: int, num_sources: int) -> bool:
+        return tokens <= max_tokens and num_sources <= max_sources
+
+    def attn_res_call(sources, addend, queries, norm_weights, *, normalize, eps_res, eps_norm=0.0):
+        """[Q, T, W]: BF16 normed mixtures with norm weights, else the FP32 mixtures."""
+        tokens, width = sources[0].shape
+        operands = [
+            *(s.astype(jnp.bfloat16) for s in sources),
+            *([addend] if addend is not None else []),
+            queries.astype(jnp.float32),
+            *([norm_weights.astype(jnp.float32)] if norm_weights is not None else []),
+        ]
+        dtype = jnp.bfloat16 if norm_weights is not None else jnp.float32
+        return jax.ffi.ffi_call("tt.attn_res", jax.ShapeDtypeStruct((queries.shape[0], tokens, width), dtype))(
+            *operands,
+            num_sources=np.int64(len(sources)),
+            has_addend=addend is not None,
+            has_weight=norm_weights is not None,
+            normalize=bool(normalize),
+            eps_res=np.float32(eps_res),
+            eps_norm=np.float32(eps_norm),
+        )
+
+    def attn_res_norm_jax(sources, addend, queries, norm_weights, *, normalize, eps_res, eps_norm):
+        return attn_res_call(
+            sources, addend, queries, norm_weights, normalize=normalize, eps_res=eps_res, eps_norm=eps_norm
+        )
+
+    @functools.cache
+    def register_inkling2_attn_res_op():
+        from torch_tpu._internal import pallas
+
+        # Upstream's signature: ten source slots, unused ones None.
+        def _op(
+            s0: jax.Array,
+            s1: Optional[jax.Array],
+            s2: Optional[jax.Array],
+            s3: Optional[jax.Array],
+            s4: Optional[jax.Array],
+            s5: Optional[jax.Array],
+            s6: Optional[jax.Array],
+            s7: Optional[jax.Array],
+            s8: Optional[jax.Array],
+            s9: Optional[jax.Array],
+            addend: Optional[jax.Array],
+            queries: jax.Array,
+            norm_weights: jax.Array,
+            normalize: bool,
+            eps_res: float,
+            eps_norm: float,
+        ) -> jax.Array:
+            sources = [s for s in (s0, s1, s2, s3, s4, s5, s6, s7, s8, s9) if s is not None]
+            return attn_res_norm_jax(
+                sources, addend, queries, norm_weights, normalize=normalize, eps_res=eps_res, eps_norm=eps_norm
+            )
+
+        op = pallas.jax_op("libtt::inkling2_attn_res_norm", _op)
+
+        @op.register_fake
+        def fake(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, addend, queries, norm_weights, normalize, eps_res, eps_norm):
+            return s0.new_empty((queries.shape[0], *s0.shape), dtype=torch.bfloat16)
+
+        return op
+
+    @functools.cache
+    def mixture_op():
+        from torch_tpu._internal import pallas
+
+        def _op(
+            s0: jax.Array,
+            s1: Optional[jax.Array],
+            s2: Optional[jax.Array],
+            s3: Optional[jax.Array],
+            s4: Optional[jax.Array],
+            s5: Optional[jax.Array],
+            s6: Optional[jax.Array],
+            s7: Optional[jax.Array],
+            addend: Optional[jax.Array],
+            query_rows: jax.Array,
+            normalize: bool,
+            eps_res: float,
+        ) -> jax.Array:
+            sources = [s for s in (s0, s1, s2, s3, s4, s5, s6, s7) if s is not None]
+            return attn_res_call(sources, addend, query_rows, None, normalize=normalize, eps_res=eps_res)
+
+        op = pallas.jax_op("libtt::inkling2_attn_res", _op)
+
+        @op.register_fake
+        def fake(s0, s1, s2, s3, s4, s5, s6, s7, addend, query_rows, normalize, eps_res):
+            return s0.new_empty((query_rows.shape[0], *s0.shape), dtype=torch.float32)
+
+        return op
+
+    def attn_res_tpu(sources, addend, query_rows, *, normalize, eps_res):
+        slots = list(sources) + [None] * (max_sources - len(sources))
+        return mixture_op()(*slots, addend, query_rows, bool(normalize), float(eps_res))
+
+    def supports_loop_mix(tokens: int, num_queries: int) -> bool:
+        return tokens <= max_tokens and num_queries <= 3
+
+    def loop_mix_call(dest, messages, down, gain, forget, norm_weight, eps, eps_norm):
+        operands = [
+            dest.astype(jnp.float32),
+            messages.astype(jnp.float32),
+            down.astype(jnp.bfloat16),
+            gain.astype(jnp.bfloat16),
+            forget.astype(jnp.bfloat16),
+        ]
+        if norm_weight is None:
+            results = jax.ShapeDtypeStruct(messages.shape, jnp.float32)
+        else:
+            operands.append(norm_weight.astype(jnp.float32))
+            results = tuple(jax.ShapeDtypeStruct(messages.shape[1:], jnp.bfloat16) for _ in range(messages.shape[0]))
+        return jax.ffi.ffi_call("tt.loop_mix", results)(
+            *operands,
+            epsilon=np.float32(eps),
+            has_norm=norm_weight is not None,
+            eps_norm=np.float32(eps_norm),
+        )
+
+    @functools.cache
+    def loop_mix_op():
+        from torch_tpu._internal import pallas
+
+        def _op(
+            dest: jax.Array, messages: jax.Array, down: jax.Array, gain: jax.Array, forget: jax.Array, eps: float
+        ) -> jax.Array:
+            return loop_mix_call(dest, messages, down, gain, forget, None, eps, 0.0)
+
+        op = pallas.jax_op("libtt::inkling2_loop_mix", _op)
+
+        @op.register_fake
+        def fake(dest, messages, down, gain, forget, eps):
+            return torch.empty_like(messages, dtype=torch.float32)
+
+        return op
+
+    @functools.cache
+    def loop_mix_normed_op(num_queries):
+        from torch_tpu._internal import pallas
+
+        def _op(
+            dest: jax.Array,
+            messages: jax.Array,
+            down: jax.Array,
+            gain: jax.Array,
+            forget: jax.Array,
+            norm_weight: jax.Array,
+            eps: float,
+            eps_norm: float,
+        ) -> tuple[jax.Array, ...]:
+            return tuple(loop_mix_call(dest, messages, down, gain, forget, norm_weight, eps, eps_norm))
+
+        op = pallas.jax_op(f"libtt::inkling2_loop_mix_normed_{num_queries}", _op)
+
+        @op.register_fake
+        def fake(dest, messages, down, gain, forget, norm_weight, eps, eps_norm):
+            return tuple(messages.new_empty(messages.shape[1:], dtype=torch.bfloat16) for _ in range(num_queries))
+
+        return op
+
+    def loop_mix_tpu(dest, messages, down_t, gain_t, forget_t, *, eps, norm_weight=None, eps_norm=None):
+        if norm_weight is None:
+            return loop_mix_op()(dest, messages, down_t, gain_t, forget_t, float(eps))
+        return loop_mix_normed_op(messages.shape[0])(
+            dest, messages, down_t, gain_t, forget_t, norm_weight, float(eps), float(eps_norm)
+        )
+
+    module.supports_attn_res_norm = supports_attn_res_norm
+    module.attn_res_norm_jax = attn_res_norm_jax
+    module.supports_loop_mix = supports_loop_mix
+    module.loop_mix_tpu = loop_mix_tpu
+    module.register_inkling2_attn_res_op = register_inkling2_attn_res_op
+    module.supports_attn_res = supports_attn_res_norm
+    module.attn_res_tpu = attn_res_tpu
+
+
+def patch_inkling2_l2_clip(module):
+    """Inkling 2's per-head L2 clips of its queries, keys and relative projections, and its
+    attention output gate (an infinite threshold and a sigmoid gate), on
+    `ttnn::experimental::l2_clip` (the `tt.l2_clip` call): one program where the typecast, the
+    scale, the RMS norm and the abs, minimum, sign and tau products took seven, reading its
+    columns (and the gate's) in place from the projection."""
+    import functools
+    from typing import Optional
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+
+    def supports_l2_clip(tokens: int) -> bool:
+        return True
+
+    @functools.cache
+    def l2_clip_op():
+        from torch_tpu._internal import pallas
+
+        def _op(
+            x: jax.Array,
+            scale: Optional[jax.Array],
+            row_scale: Optional[jax.Array],
+            gate: Optional[jax.Array],
+            group: int,
+            threshold: float,
+            eps: float,
+            offset: int,
+            width: int,
+            gate_offset: int,
+        ) -> jax.Array:
+            operands = [x]
+            if scale is not None:
+                operands.append(scale.astype(jnp.float32))
+            if row_scale is not None:
+                operands.append(row_scale.astype(jnp.float32).reshape(-1, 1))
+            if gate is not None:
+                operands.append(gate)
+            return jax.ffi.ffi_call("tt.l2_clip", jax.ShapeDtypeStruct((*x.shape[:-1], width), x.dtype))(
+                *operands,
+                group=np.int64(group),
+                offset=np.int64(offset),
+                width=np.int64(width),
+                threshold=np.float32(threshold),
+                epsilon=np.float32(eps),
+                has_scale=scale is not None,
+                has_row_scale=row_scale is not None,
+                has_gate=gate is not None,
+                gate_offset=np.int64(gate_offset),
+            )
+
+        op = pallas.jax_op("libtt::inkling2_l2_clip", _op)
+
+        @op.register_fake
+        def fake(x, scale, row_scale, gate, group, threshold, eps, offset, width, gate_offset):
+            return x.new_empty((*x.shape[:-1], width))
+
+        return op
+
+    def l2_clip_tpu(
+        x, *, group, threshold, eps, scale=None, row_scale=None, offset=0, width=None, gate=None, gate_offset=0
+    ):
+        width = x.shape[-1] - offset if width is None else width
+        return l2_clip_op()(
+            x, scale, row_scale, gate, int(group), float(threshold), float(eps), int(offset), int(width), int(gate_offset)
+        )
+
+    module.supports_l2_clip = supports_l2_clip
+    module.l2_clip_tpu = l2_clip_tpu
+
+
+def patch_inkling2_route(module):
+    """Inkling 2's router selection for decode steps (up to four tokens) on
+    `ttnn::experimental::moe_route` (the `tt.moe_route` call): the sigmoid, the top k of score
+    + bias, the selected scores' renormalization and the padding rows' masks in one program
+    where the add, the top k, the one-hot gather and the sums, divide, multiply and wheres took
+    thirteen."""
+    import functools
+    from typing import Optional
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+
+    def supports_route(tokens: int, num_experts: int, top_k: int) -> bool:
+        return tokens <= 4 and num_experts % 32 == 0 and num_experts <= 256 and top_k <= 16
+
+    @functools.cache
+    def route_op():
+        from torch_tpu._internal import pallas
+
+        def _op(
+            logits: jax.Array, bias: jax.Array, num_valid: Optional[jax.Array], top_k: int, scale: float
+        ) -> tuple[jax.Array, jax.Array]:
+            tokens = logits.shape[0]
+            operands = [logits.astype(jnp.float32), bias]
+            if num_valid is not None:
+                operands.append(num_valid.astype(jnp.int32).reshape(1))
+            return jax.ffi.ffi_call(
+                "tt.moe_route",
+                (
+                    jax.ShapeDtypeStruct((tokens, top_k), jnp.float32),
+                    jax.ShapeDtypeStruct((tokens, top_k), jnp.int32),
+                ),
+            )(*operands, k=np.int64(top_k), scale=np.float32(scale), has_num_valid=num_valid is not None)
+
+        op = pallas.jax_op("libtt::inkling2_route", _op)
+
+        @op.register_fake
+        def fake(logits, bias, num_valid, top_k, scale):
+            shape = (logits.shape[0], top_k)
+            return logits.new_empty(shape, dtype=torch.float32), logits.new_empty(shape, dtype=torch.int32)
+
+        return op
+
+    def route_tpu(logits, bias, top_k, scale, num_valid=None):
+        return route_op()(logits, bias, num_valid, int(top_k), float(scale))
+
+    module.supports_route = supports_route
+    module.route_tpu = route_tpu
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
     FP8_LINEAR_SMALL_M_MODULE: patch_fp8_linear_small_m,
     GDN_MODULE: patch_gdn,
     MAMBA_POOL_MODULE: patch_mamba_pool,
+    MAMBA_STATE_ROWS_MODULE: patch_mamba_state_rows,
+    INKLING_SCONV_MODULE: patch_inkling_sconv,
     KV_FUSED_ROPE_WRITE_MODULE: patch_kv_fused_rope_write,
     BLOCK_DRAFT_WORKER_MODULE: patch_block_draft_worker,
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
     FUSED_MOE_MODULE: patch_fused_moe,
     FP8_MOE_FUSED_RS_MODULE: patch_fp8_moe_fused_rs,
+    FP4_MOE_MODULE: patch_fp4_moe,
+    INKLING2_ATTN_RES_MODULE: patch_inkling2_attn_res,
+    INKLING2_L2_CLIP_MODULE: patch_inkling2_l2_clip,
+    INKLING2_ROUTE_MODULE: patch_inkling2_route,
 }

@@ -1,0 +1,86 @@
+diff --git a/lib/Transforms/ConstEvalHoist.cpp b/lib/Transforms/ConstEvalHoist.cpp
+--- a/lib/Transforms/ConstEvalHoist.cpp
++++ b/lib/Transforms/ConstEvalHoist.cpp
+@@ -32,9 +32,56 @@ namespace mlir::tt::transforms {
+ #define GEN_PASS_DEF_CONSTEVALHOISTTRANSFORM
+ #include "ttmlir/Transforms/Passes.h.inc"
+ 
++// A small constant: a cacheable creation op whose only inputs are shared ops
++// (the device) and whose one result holds at most kSmallConstantElements
++// values, such as the scalar constants of element-wise ops. Each const-eval
++// subgraph that uses one gets its own copy, as with shared ops, instead of
++// joining every other subgraph that uses it: a scalar shared by unrelated
++// weights' preparations (say, the decode of every layer's 4-bit experts) would
++// merge them into one const-eval function whose results, and so its hash,
++// depend on everything else the program hoists, and other programs would miss
++// its cache and prepare the same weights again.
++static constexpr int64_t kSmallConstantElements = 1024;
++
++static bool isSmallConstant(mlir::Operation *op) {
++  if (!op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>() ||
++      op->hasTrait<mlir::tt::ttcore::Trait::TTCoreNonCacheableTrait>() ||
++      op->getNumResults() != 1) {
++    return false;
++  }
++  for (mlir::Value operand : op->getOperands()) {
++    mlir::Operation *producer = operand.getDefiningOp();
++    if (!producer ||
++        !producer
++             ->hasTrait<mlir::tt::ttcore::Trait::TTCoreDuplicateConstEvalTrait>()) {
++      return false;
++    }
++  }
++  auto type = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
++  return type && type.hasStaticShape() &&
++         type.getNumElements() <= kSmallConstantElements;
++}
++
+ static bool isSharedOp(mlir::Operation *op) {
+   assert(op != nullptr);
+-  return op->hasTrait<mlir::tt::ttcore::Trait::TTCoreDuplicateConstEvalTrait>();
++  return op->hasTrait<mlir::tt::ttcore::Trait::TTCoreDuplicateConstEvalTrait>() ||
++         isSmallConstant(op);
++}
++
++// Small constants that no op in `funcOp` uses: every const-eval function gets a
++// copy of each (as a shared op), and a function keeps only its own, so that its
++// hash covers its own computation alone; the original function keeps those its
++// remaining ops use.
++static void eraseUnusedSmallConstants(func::FuncOp funcOp) {
++  llvm::SmallVector<mlir::Operation *> unused;
++  funcOp.walk([&](mlir::Operation *op) {
++    if (isSmallConstant(op) && op->use_empty()) {
++      unused.push_back(op);
++    }
++  });
++  for (mlir::Operation *op : unused) {
++    op->erase();
++  }
+ }
+ 
+ // Check if any result of the op is written in-place by any of its users.
+@@ -560,6 +607,8 @@ private:
+         addToExistingConstEvalFunction(funcOp, subgraph, sharedOps);
+       }
+     }
++    // Small constants whose users all moved to const-eval functions.
++    eraseUnusedSmallConstants(funcOp);
+     return true;
+   }
+ 
+@@ -616,6 +665,7 @@ private:
+       processOp(op, valueMap, builder);
+     }
+     cloneSubgraph(subgraph, outputs, originalFunc.getLoc(), valueMap, builder);
++    eraseUnusedSmallConstants(newFuncOp);
+ 
+     // Replace the original ops in the parent function with a call to the new
+     // function.
+@@ -704,6 +754,7 @@ private:
+     // Some shared ops that we cloned in the const-eval function may have
+     // already been there.
+     deduplicateSharedOps(constEvalFunc);
++    eraseUnusedSmallConstants(constEvalFunc);
+ 
+     // Update the original function.
+     replaceOpsWithCall(originalFunc, constEvalFunc, subgraph, inputs, outputs,

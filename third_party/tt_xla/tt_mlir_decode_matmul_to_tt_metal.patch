@@ -1,27 +1,42 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
-@@ -283,6 +283,23 @@ std::optional<MatmulProblem> analyze(MatmulOpTy op, Value bias) {
+@@ -283,7 +283,6 @@ std::optional<MatmulProblem> analyze(MatmulOpTy op, Value bias) {
    if (batchB > 1 && !llvm::equal(aShape.drop_back(2), bShape.drop_back(2))) {
      return std::nullopt;
    }
+-
+   ttcore::DeviceAttr device = ttcore::lookupDevice(op);
+   if (!device) {
+     return std::nullopt;
+@@ -293,6 +292,30 @@ std::optional<MatmulProblem> analyze(MatmulOpTy op, Value bias) {
+     return std::nullopt;
+   }
+ 
 +  // tt-metal runs one tile row of BF16 activations into a BF16 output, and
 +  // one of float8 activations (torch._scaled_mm's) with float8 weights, with
 +  // its decode matmul, which reads the weights faster than the 1D multicast
 +  // matmul this pass would pick (Qwen3-8B's projections: 9 to 20% less device
-+  // time): leave those to tt-metal.
++  // time): leave those to tt-metal. So too BF16 activations into an FP32
++  // output with an output tile for every worker core, which tt-metal also
++  // runs with its decode matmul (Inkling-2-Mini's LM head on four chips,
++  // [2304, 50256], took 890 us at 260 GB/s on the 1D matmul).
 +  auto isFloat8 = [](Type type) {
 +    return mlir::isa<Float8E4M3FNType, Float8E5M2Type>(type);
 +  };
 +  Type aElement = op.getA().getType().getElementType();
++  Type outElement = op.getResult().getType().getElementType();
++  const bool fillsGrid = llvm::divideCeil(n, kTileDim) >=
++                         workerGrid[0] * workerGrid[1];
 +  if (!transposeA && !bias && !op.getActivationAttr() &&
 +      batchA * m <= kTileDim && k % kTileDim == 0 &&
 +      ((aElement.isBF16() &&
-+        op.getResult().getType().getElementType().isBF16()) ||
++        (outElement.isBF16() || (outElement.isF32() && fillsGrid))) ||
 +       (isFloat8(aElement) &&
 +        isFloat8(op.getB().getType().getElementType())))) {
 +    return std::nullopt;
 +  }
- 
-   ttcore::DeviceAttr device = ttcore::lookupDevice(op);
-   if (!device) {
++
+   const bool fp32DestAccEn = computeConfig.getFp32DestAccEn() &&
+                              computeConfig.getFp32DestAccEn().getValue();
+   const bool dstFullSyncEn = computeConfig.getDstFullSyncEn() &&

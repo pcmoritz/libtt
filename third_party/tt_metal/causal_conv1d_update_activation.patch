@@ -1,0 +1,333 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
+@@ -4,6 +4,8 @@
+ #include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp"
+ 
+ #include <algorithm>
++#include <bit>
++#include <string>
+ #include <utility>
+ 
+ #include <tt-metalium/buffer.hpp>
+@@ -21,6 +23,9 @@ namespace {
+ 
+ struct ConvParams {
+     DataType output_dtype = DataType::BFLOAT16;
++    bool apply_silu = true;
++    uint32_t head_dim = 0;
++    float output_scale = 1.0f;
+ };
+ 
+ struct ConvInputs {
+@@ -30,6 +35,7 @@ struct ConvInputs {
+     Tensor state_indices;
+     Tensor has_initial_state;
+     std::optional<Tensor> state_slots;
++    std::optional<Tensor> dynamic_weight;
+ };
+ 
+ // T, the steps each state takes, with a row of input each.
+@@ -99,6 +105,14 @@ void ConvOperation::validate_on_program_cache_miss(
+         validate_tensor(*in.state_slots, DataType::INT32, "state slots");
+         check_shape(*in.state_slots, {batch_size, tokens}, "state slots");
+     }
++    if (in.dynamic_weight.has_value()) {
++        validate_tensor(*in.dynamic_weight, DataType::BFLOAT16, "dynamic weight");
++        TT_FATAL(
++            params.head_dim > 0 && params.head_dim % 32 == 0 && channels % params.head_dim == 0 &&
++                channels / params.head_dim * 4 <= 32,
++            "a dynamic weight needs whole tiles of channels per head, at most 8 heads");
++        check_shape(*in.dynamic_weight, {input_shape[0], channels / params.head_dim * 4}, "dynamic weight");
++    }
+ }
+ 
+ ConvOperation::spec_return_value_t ConvOperation::compute_output_specs(
+@@ -139,7 +153,11 @@ ProgramDescriptor ConvOperation::create_descriptor(
+                 .buffer_index = static_cast<uint8_t>(index),
+                 .data_format = format, .page_size = page_size}}});
+     };
+-    make_cb(0, 8, tt::DataFormat::Float16_b);  // compute operands
++    // Compute operands: four window and four weight tiles, and with a dynamic
++    // weight its four taps (in column 0 of each row).
++    const bool has_dynamic = in.dynamic_weight.has_value();
++    const Tensor& dynamic_weight = in.dynamic_weight.value_or(in.weight);
++    make_cb(0, has_dynamic ? 12 : 8, tt::DataFormat::Float16_b);
+     make_cb(1, batch_size, tt::DataFormat::Float16_b);  // reader state scratch
+     make_cb(2, 1, tt::DataFormat::Float16_b);  // reader weight scratch
+     make_cb(3, 1, tt::DataFormat::Int32);      // reader indices
+@@ -148,6 +166,9 @@ ProgramDescriptor ConvOperation::create_descriptor(
+         make_cb(6, 1, tt::DataFormat::Int32);              // reader state slots
+         make_cb(7, tokens, tt::DataFormat::Float16_b);     // reader windows after each step
+     }
++    if (has_dynamic) {
++        make_cb(8, 1, tt::DataFormat::Float16_b);  // reader dynamic weight
++    }
+     make_cb(
+         5, (channel_tiles + num_workers - 1) / num_workers,
+         datatype_to_dataformat_converter(params.output_dtype));  // output
+@@ -160,6 +181,13 @@ ProgramDescriptor ConvOperation::create_descriptor(
+     TensorAccessorArgs(in.state_indices.buffer()).append_to(reader_args);
+     TensorAccessorArgs(in.has_initial_state.buffer()).append_to(reader_args);
+     TensorAccessorArgs(state_slots.buffer()).append_to(reader_args);
++    TensorAccessorArgs(dynamic_weight.buffer()).append_to(reader_args);
++    const std::vector<std::pair<std::string, uint32_t>> dynamic_args = {
++        {"has_dynamic", has_dynamic ? 1u : 0u},
++        {"head_tiles", has_dynamic ? params.head_dim / 32 : 1u},
++        {"scale_output", params.output_scale != 1.0f ? 1u : 0u},
++        {"output_scale", std::bit_cast<uint32_t>(params.output_scale)},
++    };
+ 
+     std::vector<uint32_t> writer_args = {channel_tiles, num_workers};
+     TensorAccessorArgs(outputs.buffer()).append_to(writer_args);
+@@ -170,6 +198,7 @@ ProgramDescriptor ConvOperation::create_descriptor(
+         .kernel_source = kernel_dir + "dataflow/reader_causal_conv1d_update.cpp",
+         .core_ranges = cores,
+         .compile_time_args = reader_args,
++        .named_compile_time_args = dynamic_args,
+         .config = DataMovementConfigDescriptor{
+             .processor = DataMovementProcessor::RISCV_1,
+             .noc = NOC::RISCV_1_default}};
+@@ -183,7 +212,8 @@ ProgramDescriptor ConvOperation::create_descriptor(
+     KernelDescriptor compute{
+         .kernel_source = kernel_dir + "compute/causal_conv1d_update.cpp",
+         .core_ranges = cores,
+-        .compile_time_args = {channel_tiles, num_workers, batch_size * tokens},
++        .compile_time_args = {channel_tiles, num_workers, batch_size * tokens, params.apply_silu},
++        .named_compile_time_args = dynamic_args,
+         .config = ComputeConfigDescriptor{
+             .math_fidelity = tt::tt_metal::MathFidelity::HiFi2,
+             .fp32_dest_acc_en = false,
+@@ -195,7 +225,7 @@ ProgramDescriptor ConvOperation::create_descriptor(
+             core,
+             {worker, in.input.buffer(), in.state.buffer(),
+              in.weight.buffer(), in.state_indices.buffer(),
+-             in.has_initial_state.buffer(), state_slots.buffer()});
++             in.has_initial_state.buffer(), state_slots.buffer(), dynamic_weight.buffer()});
+         writer.emplace_runtime_args(core, {worker, outputs.buffer()});
+         compute.emplace_runtime_args(core, {worker});
+     }
+@@ -218,16 +248,21 @@ Tensor causal_conv1d_update(
+     const Tensor& state_indices,
+     const Tensor& has_initial_state,
+     DataType output_dtype,
+-    const std::optional<Tensor>& state_slots) {
++    const std::optional<Tensor>& state_slots,
++    bool apply_silu,
++    const std::optional<Tensor>& dynamic_weight,
++    uint32_t head_dim,
++    float output_scale) {
+     using Op = prim::ConvOperation;
+     return device_operation::launch<Op>(
+-        {.output_dtype = output_dtype},
++        {.output_dtype = output_dtype, .apply_silu = apply_silu, .head_dim = head_dim, .output_scale = output_scale},
+         {.input = input,
+          .state = state,
+          .weight = weight,
+          .state_indices = state_indices,
+          .has_initial_state = has_initial_state,
+-         .state_slots = state_slots});
++         .state_slots = state_slots,
++         .dynamic_weight = dynamic_weight});
+ }
+ 
+ }  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
+@@ -11,12 +11,17 @@ namespace ttnn::transformer {
+ 
+ // One four-tap depthwise causal convolution decode step. The operation
+ // gathers and updates request state in place, and returns silu(conv) in
+-// output_dtype, BFLOAT16 or FLOAT32.
++// output_dtype, BFLOAT16 or FLOAT32, or conv itself without apply_silu.
+ //
+ // With state_slots, an int32 [B, T], each of the B states takes T steps, as
+ // in a speculative verify of T draft tokens: input holds T rows per state,
+ // and the window after step t goes to slot state_slots[b, t] instead of back
+ // to state_indices[b]. Slot 0 is never written.
++//
++// With dynamic_weight, a BFLOAT16 [rows, heads * 4] of per-row taps for each
++// head of head_dim channels in lag order (lag 0 the row's own input, tap 3),
++// each row's tap k weight is weight[c, k] + dynamic_weight[row, head(c) * 4 +
++// 3 - k]. The convolution is then scaled by output_scale (before any SiLU).
+ Tensor causal_conv1d_update(
+     const Tensor& input,
+     const Tensor& state,
+@@ -24,6 +29,10 @@ Tensor causal_conv1d_update(
+     const Tensor& state_indices,
+     const Tensor& has_initial_state,
+     tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT16,
+-    const std::optional<Tensor>& state_slots = std::nullopt);
++    const std::optional<Tensor>& state_slots = std::nullopt,
++    bool apply_silu = true,
++    const std::optional<Tensor>& dynamic_weight = std::nullopt,
++    uint32_t head_dim = 0,
++    float output_scale = 1.0f);
+ 
+ }  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
+@@ -5,7 +5,9 @@
+ 
+ #include "api/compute/common.h"
+ #include "api/compute/compute_kernel_api.h"
++#include "api/compute/bcast.h"
+ #include "api/compute/eltwise_binary_sfpu.h"
++#include "api/compute/eltwise_unary/binop_with_scalar.h"
+ #include "api/compute/eltwise_unary/eltwise_unary.h"
+ #include "api/compute/tile_move_copy.h"
+ #include "api/dataflow/circular_buffer.h"
+@@ -36,6 +38,13 @@ ALWI void rows_silu(uint32_t idst) {
+ void kernel_main() {
+     constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
+     constexpr uint32_t num_workers = get_compile_time_arg_val(1);
++    constexpr bool apply_silu = get_compile_time_arg_val(3);
++    // With a dynamic weight, weight tile 2k + 1 plus operand tile 8 + k's
++    // column 0 (each row's tap k), and the convolution scaled.
++    constexpr bool has_dynamic = get_named_compile_time_arg_val("has_dynamic") != 0;
++    constexpr bool scale_output = get_named_compile_time_arg_val("scale_output") != 0;
++    constexpr uint32_t output_scale = get_named_compile_time_arg_val("output_scale");
++    constexpr uint32_t operand_tiles = has_dynamic ? 12 : 8;
+     const uint32_t worker = get_arg_val<uint32_t>(0);
+ 
+     constexpr uint32_t operands = tt::CBIndex::c_0;
+@@ -46,13 +55,21 @@ void kernel_main() {
+     init_sfpu(operands, output);
+     for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
+          channel_tile += num_workers) {
+-        operands_cb.wait_front(8);
++        operands_cb.wait_front(operand_tiles);
+         output_cb.reserve_back(1);
+         tile_regs_acquire();
+ 
+         copy_tile_to_dst_init_short(operands);
+         for (uint32_t tile = 0; tile < 8; ++tile) {
+-            copy_tile(operands, tile, tile);
++            if (!has_dynamic || tile % 2 == 0) {
++                copy_tile(operands, tile, tile);
++            }
++        }
++        if constexpr (has_dynamic) {
++            add_bcast_cols_init(operands, operands);
++            for (uint32_t tap = 0; tap < 4; ++tap) {
++                add_tiles_bcast_cols(operands, operands, 2 * tap + 1, 8 + tap, 2 * tap + 1);
++            }
+         }
+         // Four depthwise products occupy even DST registers.
+         mul_binary_tile_init();
+@@ -65,13 +82,21 @@ void kernel_main() {
+         rows_add(0, 2, 0);
+         rows_add(4, 6, 4);
+         rows_add(0, 4, 0);
+-        silu_tile_init();
+-        rows_silu(0);
++        if constexpr (scale_output) {
++            binop_with_scalar_tile_init();
++            MATH(SFPU_UNARY_CALL(
++                DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
++                (APPROX, MUL_UNARY, iterations, DST_ACCUM_MODE), 0, vector_mode, output_scale));
++        }
++        if constexpr (apply_silu) {
++            silu_tile_init();
++            rows_silu(0);
++        }
+ 
+         tile_regs_commit();
+         tile_regs_wait();
+         pack_tile(0, output);
+-        operands_cb.pop_front(8);
++        operands_cb.pop_front(operand_tiles);
+         output_cb.push_back(1);
+         tile_regs_release();
+     }
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
+@@ -120,6 +120,12 @@ void kernel_main() {
+     const uint32_t indices_address = get_arg_val<uint32_t>(4);
+     const uint32_t flags_address = get_arg_val<uint32_t>(5);
+     const uint32_t slots_address = get_arg_val<uint32_t>(6);
++    const uint32_t dynamic_address = get_arg_val<uint32_t>(7);
++    // With a dynamic weight, operand tiles 8 + k take each row's tap k in
++    // column 0, from the head of the channel tile's channels.
++    constexpr bool has_dynamic = get_named_compile_time_arg_val("has_dynamic") != 0;
++    constexpr uint32_t head_tiles = get_named_compile_time_arg_val("head_tiles");
++    constexpr uint32_t operand_tiles = has_dynamic ? 12 : 8;
+ 
+     constexpr auto input_args = TensorAccessorArgs<5>();
+     constexpr auto state_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
+@@ -127,12 +133,14 @@ void kernel_main() {
+     constexpr auto indices_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
+     constexpr auto flags_args = TensorAccessorArgs<indices_args.next_compile_time_args_offset()>();
+     constexpr auto slots_args = TensorAccessorArgs<flags_args.next_compile_time_args_offset()>();
++    constexpr auto dynamic_args = TensorAccessorArgs<slots_args.next_compile_time_args_offset()>();
+     const auto input = TensorAccessor(input_args, input_address, tile_bytes);
+     const auto state = TensorAccessor(state_args, state_address, tile_bytes);
+     const auto weight = TensorAccessor(weight_args, weight_address, tile_bytes);
+     const auto indices = TensorAccessor(indices_args, indices_address, 4096);
+     const auto flags = TensorAccessor(flags_args, flags_address, tile_bytes);
+     const auto slots = TensorAccessor(slots_args, slots_address, 4096);
++    const auto dynamic = TensorAccessor(dynamic_args, dynamic_address, tile_bytes);
+ 
+     CircularBuffer operands_cb(tt::CBIndex::c_0);
+     CircularBuffer state_scratch(tt::CBIndex::c_1);
+@@ -141,6 +149,7 @@ void kernel_main() {
+     CircularBuffer flags_scratch(tt::CBIndex::c_4);
+     CircularBuffer slots_scratch(tt::CBIndex::c_6);
+     CircularBuffer windows_scratch(tt::CBIndex::c_7);
++    CircularBuffer dynamic_scratch(tt::CBIndex::c_8);
+     Noc noc;
+ 
+     state_scratch.reserve_back(batch_size);
+@@ -157,13 +166,17 @@ void kernel_main() {
+         noc.async_write_zeros(windows_scratch, tokens * tile_bytes);
+         noc.write_zeros_l1_barrier();
+     }
++    if constexpr (has_dynamic) {
++        dynamic_scratch.reserve_back(1);
++        noc.async_read(dynamic, dynamic_scratch, tile_bytes, {.page_id = 0}, {.offset_bytes = 0});
++    }
+     noc.async_read_barrier();
+ 
+     for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
+          channel_tile += num_workers) {
+-        operands_cb.reserve_back(8);
++        operands_cb.reserve_back(operand_tiles);
+         const uint32_t operands_address = operands_cb.get_write_ptr();
+-        noc.async_write_zeros(operands_cb, 8 * tile_bytes);
++        noc.async_write_zeros(operands_cb, operand_tiles * tile_bytes);
+         for (uint32_t batch = 0; batch < batch_size; ++batch) {
+             if (read_index(indices_scratch.get_write_ptr(), batch) != 0 &&
+                 !read_flag(flags_scratch.get_write_ptr(), batch)) {
+@@ -198,7 +211,19 @@ void kernel_main() {
+                 continue;
+             }
+             for (uint32_t token = 0; token < tokens; ++token) {
+-                copy_weights_to_row(weight_scratch.get_write_ptr(), operands_address, batch * tokens + token);
++                const uint32_t row = batch * tokens + token;
++                copy_weights_to_row(weight_scratch.get_write_ptr(), operands_address, row);
++                if constexpr (has_dynamic) {
++                    // Tap k is lag 3 - k of the head's four.
++                    const volatile tt_l1_ptr uint16_t* taps =
++                        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(dynamic_scratch.get_write_ptr());
++                    volatile tt_l1_ptr uint16_t* operands =
++                        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(operands_address);
++                    const uint32_t head = channel_tile / head_tiles;
++                    for (uint32_t tap = 0; tap < 4; ++tap) {
++                        operands[(8 + tap) * 1024 + tile_offset(row, 0)] = taps[tile_offset(row, head * 4 + 3 - tap)];
++                    }
++                }
+             }
+         }
+ 
+@@ -233,7 +258,7 @@ void kernel_main() {
+                 CoreLocalMem<uint32_t>(state_address), state, tile_bytes, {},
+                 {.page_id = slot * channel_tiles + channel_tile});
+         }
+-        operands_cb.push_back(8);
++        operands_cb.push_back(operand_tiles);
+         noc.async_write_barrier();
+     }
+ }

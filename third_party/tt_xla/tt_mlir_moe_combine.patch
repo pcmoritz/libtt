@@ -1,0 +1,169 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -2458,6 +2458,18 @@ def TTIR_RMSNormGatedOp : TTIR_NamedOp<"rms_norm_gated"> {
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
++def TTIR_MoeCombineOp : TTIR_NamedOp<"moe_combine"> {
++  let summary = "Each token's routing-weighted sum of its experts' outputs";
++  let description = [{
++    output[i] = sum_j weights[i, j] * slots[j * T + i] for slots [k * T, H]
++    (ttir.moe_compute's result) and weights [T, k], accumulated in FP32;
++    k * T <= 32. The fused MoE lowering (tt.fused_moe_ep) forms it.
++  }];
++  let arguments = (ins AnyRankedTensor:$slots,
++                       AnyRankedTensor:$weights);
++  let results = (outs AnyRankedTensor:$output);
++}
++
+ def TTIR_WindowBiasOp : TTIR_NamedOp<"window_bias"> {
+   let summary = "The causal decode attention's relative-position window bias";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2929,6 +2929,28 @@ def TTNN_RMSNormGatedOp : TTNN_Op<"rms_norm_gated", [OpModelExempt]> {
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
++def TTNN_MoeCombineOp : TTNN_Op<"moe_combine", [OpModelExempt]> {
++  let summary = "Each token's routing-weighted sum of its experts' outputs";
++  let description = [{
++    ttnn::experimental::moe_combine, see ttir.moe_combine. It reads the slots
++    row-major, as moe_compute writes them.
++  }];
++  let arguments = (ins AnyRankedTensor:$slots,
++                       AnyRankedTensor:$weights);
++  let results = (outs AnyRankedTensor:$output);
++
++  let extraClassDeclaration = [{
++    wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++      wa::TTNNOperandWorkarounds rowMajor;
++      rowMajor.tensorLayoutWorkaround = Layout::RowMajor;
++      return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++          .addInputOperandWorkaround(rowMajor)
++          .addInputOperandWorkaround(wa::TTNNOperandWorkarounds())
++          .addOutputOperandWorkaround(wa::TTNNOperandWorkarounds());
++    }
++  }];
++}
++
+ def TTNN_WindowBiasOp : TTNN_Op<"window_bias", [OpModelExempt]> {
+   let summary = "The causal decode attention's relative-position window bias";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+--- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
++++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+@@ -61,6 +61,12 @@ table DitRMSNormUnaryFusedOp {
+   out: tt.target.ttnn.TensorRef;
+ }
+ 
++table MoeCombineOp {
++  slots: tt.target.ttnn.TensorRef;
++  weights: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++}
++
+ table WindowBiasOp {
+   rel_r: tt.target.ttnn.TensorRef;
+   table: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -159,6 +159,7 @@ union OpType {
+   AttnResOp,
+   L2ClipOp,
+   LoopMixOp,
++  MoeCombineOp,
+   WindowBiasOp,
+   MoeRouteOp,
+   ReshapeOp,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1311,6 +1311,21 @@ public:
+   }
+ };
+ 
++class MoeCombineOpConversionPattern
++    : public OpConversionPattern<ttir::MoeCombineOp> {
++public:
++  using OpConversionPattern<ttir::MoeCombineOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::MoeCombineOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::MoeCombineOp>(
++        op, this->getTypeConverter()->convertType(op.getType()),
++        adaptor.getSlots(), adaptor.getWeights());
++    return success();
++  }
++};
++
+ class WindowBiasOpConversionPattern
+     : public OpConversionPattern<ttir::WindowBiasOp> {
+ public:
+@@ -4463,6 +4478,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            AttnResOpConversionPattern,
+            L2ClipOpConversionPattern,
+            LoopMixOpConversionPattern,
++           MoeCombineOpConversionPattern,
+            WindowBiasOpConversionPattern,
+            MoeRouteOpConversionPattern,
+            DistributedRMSNormOpConversionPattern,
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2108,6 +2108,18 @@ createOp(FlatbufferObjectCache &cache, RMSNormGatedOp op) {
+       static_cast<uint32_t>(op.getGateOffset()));
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::MoeCombineOp>
++createOp(FlatbufferObjectCache &cache, MoeCombineOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateMoeCombineOp(
++      *cache.fbb, tensor(op.getSlots()), tensor(op.getWeights()),
++      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
++                                  std::nullopt));
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::WindowBiasOp>
+ createOp(FlatbufferObjectCache &cache, WindowBiasOp op) {
+   auto tensor = [&](Value value) {
+@@ -5903,6 +5915,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
+                            locInfo);
+   }
++  if (auto moeCombineOp = dyn_cast<MoeCombineOp>(op)) {
++    return createOperation(cache, createOp(cache, moeCombineOp), debugString,
++                           locInfo);
++  }
+   if (auto windowBiasOp = dyn_cast<WindowBiasOp>(op)) {
+     return createOperation(cache, createOp(cache, windowBiasOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -99,6 +99,7 @@
+ #include "operations/normalization/l2_clip.h"
+ #include "operations/normalization/loop_mix.h"
+ #include "operations/normalization/moe_route.h"
++#include "operations/normalization/moe_combine.h"
+ #include "operations/normalization/window_bias.h"
+ #include "operations/normalization/rms_norm_gated.h"
+ #include "operations/normalization/rms_norm_residual.h"
+@@ -544,6 +545,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::MoeRouteOp: {
+     return operations::moe_route::run(op->type_as_MoeRouteOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::MoeCombineOp: {
++    return operations::moe_combine::run(op->type_as_MoeCombineOp(),
++                                        getContext());
++  }
+   case ::tt::target::ttnn::OpType::WindowBiasOp: {
+     return operations::window_bias::run(op->type_as_WindowBiasOp(),
+                                         getContext());

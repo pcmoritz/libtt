@@ -280,6 +280,65 @@ def test_conv_update_steps(batch, tokens):
     np.testing.assert_allclose(np.asarray(new_state).astype(np.float32), expected_state, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("batch", [1, 3])
+def test_conv_update_dynamic_weight(batch):
+    """Inkling 2's dynamic short convolution: each row's tap k weight is weight[c, k] plus its head's dynamic tap
+    (lag 3 - k of [rows, heads * 4]), the plain convolution scaled by output_scale; a padding row (index 0) and a
+    request without a saved window included."""
+    channels, slots, taps, head_dim, scale = 256, 5, 4, 128, 9**-0.5
+    heads = channels // head_dim
+
+    def conv_update(state, value, weight, indices, initial, dynamic):
+        return jax.ffi.ffi_call(
+            "tt.causal_conv1d_update",
+            (
+                jax.ShapeDtypeStruct(state.shape, state.dtype),
+                jax.ShapeDtypeStruct(value.shape, jnp.bfloat16),
+            ),
+            input_output_aliases={0: 0},
+            vmap_method="sequential",
+        )(
+            state,
+            value,
+            weight,
+            indices,
+            initial,
+            dynamic,
+            apply_silu=False,
+            has_dynamic_weight=True,
+            head_dim=np.int64(head_dim),
+            output_scale=np.float32(scale),
+        )
+
+    device = jax.devices("tt")[0]
+    run = jax.jit(conv_update, compiler_options={"optimization_level": "O1"})
+    rng = np.random.default_rng(17 + batch)
+    state = rng.normal(0, 1, (slots, channels, taps - 1)).astype(jnp.bfloat16)
+    value = rng.normal(0, 1, (batch, channels)).astype(jnp.bfloat16)
+    weight = rng.normal(0, 0.5, (channels, taps)).astype(jnp.bfloat16)
+    dynamic = rng.normal(0, 0.5, (batch, heads * taps)).astype(jnp.bfloat16)
+    indices = np.array([3, 0, 1][:batch], np.int32)
+    initial = np.array([1, 1, 0][:batch], np.float32).astype(jnp.bfloat16)
+    new_state, out = run(
+        *(jax.device_put(x, device) for x in (state, value, weight, indices, initial, dynamic))
+    )
+
+    s = state.astype(np.float32)
+    w = weight.astype(np.float32)
+    d = dynamic.astype(np.float32).reshape(batch, heads, taps)
+    expected_state = s.copy()
+    for i, slot in enumerate(indices):
+        if slot == 0:
+            continue
+        saved = s[slot] if initial[i] else np.zeros_like(s[slot])
+        history = np.concatenate([saved, value.astype(np.float32)[i][:, None]], axis=-1)  # [C, 4]
+        taps_i = w + np.repeat(d[i][:, ::-1], head_dim, axis=0)  # tap k gets lag 3 - k
+        expected = np.sum(history * taps_i, axis=-1) * scale
+        np.testing.assert_allclose(np.asarray(out)[i].astype(np.float32), expected, atol=1 / 64, rtol=1 / 64)
+        expected_state[slot] = history[:, 1:]
+    np.testing.assert_allclose(np.asarray(new_state).astype(np.float32), expected_state, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize(
     "shape,dtype", [((9, 8, 128, 128), np.float32), ((9, 512, 3), jnp.bfloat16)]

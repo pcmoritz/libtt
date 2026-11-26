@@ -52,3 +52,25 @@ def test_matmul_reads_bf16_operand(m, k, n, a_dtype, b_dtype, optimization_level
         assert casts == 0, "the BF16 operand was still cast"
     else:
         assert casts == 2, "a cast of the BF16 operands was dropped"
+
+
+def test_shared_weight_cast_is_read_by_every_matmul(tmp_path):
+    """A BF16 weight cast to FP32 once and read by several FP32 matmuls (a router a loop's passes share) is read as
+    BF16 by each of them: no cast stays."""
+    rng = np.random.default_rng(5)
+    x1, x2 = (rng.standard_normal((4, 2048)).astype(jnp.bfloat16) for _ in range(2))
+    w = rng.standard_normal((128, 2048)).astype(jnp.bfloat16)
+
+    def logits(x1, x2, w):
+        wf = w.astype(jnp.float32)
+        return x1.astype(jnp.float32) @ wf.T, x2.astype(jnp.float32) @ wf.T
+
+    run = jax.jit(logits, compiler_options={"optimization_level": "O0", "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    out1, out2 = run(*(jax.device_put(v, device) for v in (x1, x2, w)))
+    wf = w.astype(np.float64)
+    for out, x in ((out1, x1), (out2, x2)):
+        expected = x.astype(np.float64) @ wf.T
+        np.testing.assert_allclose(np.asarray(out), expected, atol=1e-3 * np.abs(expected).max(), rtol=1e-3)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs and not any('"ttnn.typecast"' in ir for ir in irs)

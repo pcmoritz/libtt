@@ -96,6 +96,29 @@ def test_narrow_decode_matmul_accumulates_in_fp32(inner_size, width):
     np.testing.assert_allclose(np.asarray(actual).astype(np.float32), expected, atol=1 / 64, rtol=1 / 128)
 
 
+@pytest.mark.parametrize("rows", [1, 4])
+def test_wide_fp32_output_decode_matmul(rows, tmp_path):
+    """One tile row of BF16 activations into FP32 with an output tile for every worker core (an FP32 LM head, its
+    weight [vocab, hidden]) is left to tt-metal, which runs its decode matmul: no program config on it."""
+
+    def logits(x, weights):
+        return jnp.matmul(x, weights.T, preferred_element_type=jnp.float32)
+
+    # O0, as torch_tpu compiles: a compute config with FP32 accumulation, which the pass requires.
+    run = jax.jit(logits, compiler_options={"optimization_level": "O0", "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(13)
+    x = rng.normal(size=(rows, 1024)).astype(jnp.bfloat16)
+    weights = rng.normal(size=(32 * 163, 1024)).astype(jnp.bfloat16)
+    actual = np.asarray(run(*(jax.device_put(v, device) for v in (x, weights))))
+    assert actual.dtype == np.float32
+    expected = x.astype(np.float64) @ weights.astype(np.float64).T
+    np.testing.assert_allclose(actual, expected, atol=1e-3 * np.abs(expected).max(), rtol=1e-3)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    matmuls = [line for ir in irs for line in ir.splitlines() if '"ttnn.matmul"' in line]
+    assert matmuls and not any("matmul_program_config" in line for line in matmuls)
+
+
 def test_large_reduction_is_left_to_the_other_matmuls():
     """A reduction whose activation row alone (1.5 MiB of tiles) does not fit
     a core's L1 must not pick the decode matmul. The other matmuls round

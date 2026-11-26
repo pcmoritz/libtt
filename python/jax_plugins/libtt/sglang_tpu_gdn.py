@@ -322,8 +322,10 @@ def fused_conv1d_gdn(
 
 def patch_mamba_pool(module):
     """Gives the recurrent-state pool's conv windows the BF16 `[slots, channels, 3]`
-    layout of TTNN's causal conv update (SGLang-TorchTPU's: FP32 `[slots, 3, 1,
-    channels]`, which tiles pad 32-fold)."""
+    layout of TTNN's causal conv update (SGLang-TorchTPU's: `[slots, 3, 1,
+    channels]`, which tiles pad 32-fold). Row reads and writes of such a pool
+    take and give rows in SGLang-TorchTPU's layout, for the ops that convolve in
+    torch (Inkling's short convolutions outside a static decode step)."""
     torch = module.torch
     pool = module.TpuMambaPool
     init = pool.__init__
@@ -348,3 +350,18 @@ def patch_mamba_pool(module):
         )
 
     pool.__init__ = __init__
+    read, write = module.read_state_rows, module.write_state_rows
+
+    def read_state_rows(state, rows):
+        if state.dim() != 3:
+            return read(state, rows)
+        # [n, channels, K - 1] -> [n, K - 1, 1, channels]
+        return state.index_select(0, rows.long()).transpose(1, 2).unsqueeze(2)
+
+    def write_state_rows(state, rows, new, live):
+        if state.dim() == 3:
+            # [n, (K - 1) * channels], oldest input first -> [n, channels, K - 1]
+            new = new.reshape(rows.shape[0], state.shape[2], state.shape[1]).transpose(1, 2)
+        return write(state, rows, new, live)
+
+    module.read_state_rows, module.write_state_rows = read_state_rows, write_state_rows

@@ -16,7 +16,11 @@
 // where the experts are split evenly over every device of the mesh in device
 // order, so device d holds experts d * E_local to (d + 1) * E_local - 1.
 // Returns each token's routing-weighted sum of the SiLU-gated experts this
-// device holds, [T, H] in x's type; the layer is the sum over devices.
+// device holds, [T, H] in x's type; the layer is the sum over devices. With
+// activation = "situ" the experts are SiTU-gated instead (Inkling 2):
+//   beta * tanh(g / beta) * sigmoid(g) * limit * tanh(u / limit)
+// for gate g and up u, with the float attributes activation_beta and
+// activation_limit.
 //
 // The kernel stores the experts in BFP4, or in BF16 as they are with the
 // weight_dtype = "bf16" attribute, takes up to 512 tokens per call, runs only
@@ -28,9 +32,9 @@
 //   s1, s3       [E_local, I] f32 the gate and up projections' scales,
 //   s2           [E_local, H] f32 and the down projections'.
 // This lowering chunks the tokens, builds
-// the expert-to-device mapping, and sums each token's slots with its weights in
-// one matmul accumulated in FP32; the kernel reads the ids as they are and
-// skips padding's negative ids.
+// the expert-to-device mapping, and sums each token's slots with its weights
+// (ttir.moe_combine up to a tile of slots, else one matmul accumulated in
+// FP32); the kernel reads the ids as they are and skips padding's negative ids.
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
@@ -50,12 +54,14 @@ namespace mlir::tt {
 namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
-// Matmul rings that run a device's experts side by side. BF16 experts stream
-// through one ring: a whole expert slice per ring core, which the rings replay
-// for every chunk, doesn't fit a core's L1 at two bytes per weight. At FP8's
-// one byte it does: 0.66 MB of the 0.79 MB at Qwen3-30B-A3B's shapes.
+// Matmul rings that run a device's FP8 experts side by side, replaying a whole
+// expert slice per ring core for every chunk where it fits half a core's L1
+// (Qwen3-30B-A3B's 2048 x 768, 0.66 MB stored), else streaming each owned
+// chunk's slice (Inkling-2-Mini's 2304 x 1152, about 1 MB per ring core): at
+// decode, the rings still read and multiply different experts at once. BF16
+// experts stream through one ring.
 constexpr uint32_t kRings = 3;
-constexpr uint32_t kBf16Rings = 0;
+constexpr uint32_t kStreamingRings = 0;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -82,6 +88,27 @@ public:
         weightDtype.getValue() != "bf16") {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep's weight_dtype is bfp4 or bf16");
+    }
+
+    auto activationFunction = ttcore::MoEActivationFunction::Silu;
+    FloatAttr activationLimit, activationBeta;
+    if (StringAttr name =
+            config ? config.getAs<StringAttr>("activation") : nullptr) {
+      if (name.getValue() == "situ") {
+        auto beta = config.getAs<FloatAttr>("activation_beta");
+        auto limit = config.getAs<FloatAttr>("activation_limit");
+        if (!beta || !limit) {
+          return rewriter.notifyMatchFailure(
+              op, "tt.fused_moe_ep's situ activation takes activation_beta "
+                  "and activation_limit");
+        }
+        activationFunction = ttcore::MoEActivationFunction::SiTU;
+        activationBeta = rewriter.getF32FloatAttr(beta.getValueAsDouble());
+        activationLimit = rewriter.getF32FloatAttr(limit.getValueAsDouble());
+      } else if (name.getValue() != "silu") {
+        return rewriter.notifyMatchFailure(
+            op, "tt.fused_moe_ep's activation is silu or situ");
+      }
     }
 
     if ((adaptor.getOperands().size() != 6 &&
@@ -235,8 +262,8 @@ public:
     Value mapping = rewriter.create<ttir::ConstantOp>(
         loc, mappingType, DenseElementsAttr::get(mappingType, owners));
 
-    auto activation = ttcore::MoEActivationFunctionAttr::get(
-        ctx, ttcore::MoEActivationFunction::Silu);
+    auto activation =
+        ttcore::MoEActivationFunctionAttr::get(ctx, activationFunction);
     // An [m, n] 0/1 matrix, 1 where row r equals column c's index index(c):
     // only the row and column indices are constants, and the comparison runs
     // once, when the program loads.
@@ -272,13 +299,22 @@ public:
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),
-          rewriter.getUI32IntegerAttr(bf16Weights ? kBf16Rings : kRings),
+          rewriter.getUI32IntegerAttr(fp8Weights ? kRings : kStreamingRings),
           fp8Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::Float8E4M3FN)
           : bf16Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
-              : ttcore::DataTypeAttr());
+              : ttcore::DataTypeAttr(),
+          activationLimit, activationBeta);
 
+      // Up to a tile of slots, ttir.moe_combine sums each token's in one
+      // program, reading the slots as moe_compute writes them (row-major).
+      if (k * t <= 32) {
+        outputs.push_back(rewriter.create<ttir::MoeCombineOp>(
+            loc, typed(chunkWeights, {t, hidden}, outType.getElementType()),
+            slots, chunkWeights));
+        continue;
+      }
       // Each token's weighted sum of its slots as one matmul in FP32: row i
       // of the placement matrix holds token i's weight j at column j * t + i,
       // its weights spread over t columns each and masked to its own column.

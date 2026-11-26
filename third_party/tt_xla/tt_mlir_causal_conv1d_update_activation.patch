@@ -1,0 +1,168 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6835,14 +6835,24 @@ def TTIR_GatedDeltaDecodeOp : TTIR_InplaceOp<"gated_delta_decode", [TTIR_CacheOp
+   let hasCanonicalizer = 1;
+ }
+ 
+-def TTIR_CausalConv1dUpdateOp : TTIR_InplaceOp<"causal_conv1d_update", [TTIR_CacheOpInterface]> {
++def TTIR_CausalConv1dUpdateOp : TTIR_InplaceOp<"causal_conv1d_update", [TTIR_CacheOpInterface, AttrSizedOperandSegments]> {
+   let summary = "causal conv1d update.";
+   let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
+                        AnyRankedTensor:$input,
+                        AnyRankedTensor:$weight,
+                        AnyRankedTensor:$state_indices,
+                        AnyRankedTensor:$has_initial_state,
+-                       Optional<AnyRankedTensor>:$state_slots);
++                       Optional<AnyRankedTensor>:$state_slots,
++                       // Per-row taps added to the weight, [rows, heads * 4]
++                       // in lag order for heads of head_dim channels, and a
++                       // scale of the convolution (Inkling 2's dynamic short
++                       // convolutions).
++                       Optional<AnyRankedTensor>:$dynamic_weight,
++                       // Without it, the plain convolution (Inkling 2's short
++                       // convolutions).
++                       DefaultValuedAttr<BoolAttr, "true">:$apply_silu,
++                       DefaultValuedAttr<I64Attr, "0">:$head_dim,
++                       DefaultValuedAttr<F32Attr, "1.0">:$output_scale);
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -5144,14 +5144,24 @@ def TTNN_GatedDeltaDecodeOp : TTNN_InplaceOp<"gated_delta_decode", [OpModelExemp
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
+-def TTNN_CausalConv1dUpdateOp : TTNN_InplaceOp<"causal_conv1d_update", [OpModelExempt]> {
++def TTNN_CausalConv1dUpdateOp : TTNN_InplaceOp<"causal_conv1d_update", [OpModelExempt, AttrSizedOperandSegments]> {
+   let summary = "causal conv1d update.";
+   let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
+                        AnyRankedTensor:$input,
+                        AnyRankedTensor:$weight,
+                        AnyRankedTensor:$state_indices,
+                        AnyRankedTensor:$has_initial_state,
+-                       Optional<AnyRankedTensor>:$state_slots);
++                       Optional<AnyRankedTensor>:$state_slots,
++                       // Per-row taps added to the weight, [rows, heads * 4]
++                       // in lag order for heads of head_dim channels, and a
++                       // scale of the convolution (Inkling 2's dynamic short
++                       // convolutions).
++                       Optional<AnyRankedTensor>:$dynamic_weight,
++                       // Without it, the plain convolution (Inkling 2's short
++                       // convolutions).
++                       DefaultValuedAttr<BoolAttr, "true">:$apply_silu,
++                       DefaultValuedAttr<I64Attr, "0">:$head_dim,
++                       DefaultValuedAttr<F32Attr, "1.0">:$output_scale);
+   let results = (outs AnyRankedTensor:$output);
+ }
+ 
+diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+--- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
++++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+@@ -122,6 +122,13 @@ table CausalConv1dUpdateOp {
+   output: tt.target.ttnn.TensorRef;
+   // Optional [B, T] slots for the window after each of T steps per state.
+   state_slots: tt.target.ttnn.TensorRef;
++  // silu(conv), or the convolution itself.
++  apply_silu: bool = true;
++  // Optional per-row taps added to the weight, for heads of head_dim
++  // channels, and the convolution's scale.
++  dynamic_weight: tt.target.ttnn.TensorRef;
++  head_dim: uint32;
++  output_scale: float = 1.0;
+ }
+ 
+ table StatePoolUpdateOp {
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10230,18 +10230,50 @@ public:
+       return success();
+     }
+     if (name == "tt.causal_conv1d_update") {
+-      // An optional sixth operand holds the state slots of a multi-step call.
+-      if ((op.getNumOperands() != 5 && op.getNumOperands() != 6) ||
++      // backend_config's apply_silu = false runs the plain convolution, and
++      // has_dynamic_weight a last operand of per-row taps (with head_dim and
++      // output_scale).
++      auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
++      if (!config) {
++        config = dyn_cast_or_null<DictionaryAttr>(
++            op->getDiscardableAttr("mhlo.backend_config"));
++      }
++      auto flag = [&](StringRef key) {
++        auto value = config ? dyn_cast_or_null<BoolAttr>(config.get(key))
++                            : nullptr;
++        return value;
++      };
++      const bool dynamic =
++          flag("has_dynamic_weight") && flag("has_dynamic_weight").getValue();
++      // An optional operand after the first five holds the state slots of a
++      // multi-step call.
++      const size_t fixed = 5 + size_t{dynamic};
++      if ((op.getNumOperands() != fixed && op.getNumOperands() != fixed + 1) ||
+           op.getNumResults() != 2) {
+         return op.emitOpError("invalid recurrent call arity");
+       }
+       if (failed(requireOutputOperandAlias(op, 0, 0))) {
+         return failure();
+       }
++      ValueRange operands = adaptor.getOperands();
++      Value stateSlots = operands.size() == fixed + 1 ? operands[5] : Value();
++      Value dynamicWeight = dynamic ? operands.back() : Value();
++      auto headDim =
++          config ? dyn_cast_or_null<IntegerAttr>(config.get("head_dim"))
++                 : nullptr;
++      auto outputScale =
++          config ? dyn_cast_or_null<FloatAttr>(config.get("output_scale"))
++                 : nullptr;
++      auto applySilu = flag("apply_silu");
+       auto type = getTypeConverter()->convertType(op.getResult(1).getType());
+       auto result = rewriter.create<ttir::CausalConv1dUpdateOp>(
+-          op.getLoc(), type, adaptor.getOperands());
+-      rewriter.replaceOp(op, {adaptor.getOperands()[0], result.getResult()});
++          op.getLoc(), type, operands[0], operands[1], operands[2],
++          operands[3], operands[4], stateSlots, dynamicWeight,
++          rewriter.getBoolAttr(applySilu ? applySilu.getValue() : true),
++          rewriter.getI64IntegerAttr(headDim ? headDim.getInt() : 0),
++          rewriter.getF32FloatAttr(
++              outputScale ? outputScale.getValueAsDouble() : 1.0));
++      rewriter.replaceOp(op, {operands[0], result.getResult()});
+       return success();
+     }
+     if (name == "tt.state_pool_update") {
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -4157,7 +4157,10 @@ createOp(FlatbufferObjectCache &cache, CausalConv1dUpdateOp op) {
+       tensor(op.getHasInitialState()),
+       cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
+                                   std::nullopt),
+-      op.getStateSlots() ? tensor(op.getStateSlots()) : 0);
++      op.getStateSlots() ? tensor(op.getStateSlots()) : 0, op.getApplySilu(),
++      op.getDynamicWeight() ? tensor(op.getDynamicWeight()) : 0,
++      static_cast<uint32_t>(op.getHeadDim()),
++      op.getOutputScale().convertToFloat());
+ }
+ 
+ ::flatbuffers::Offset<::tt::target::ttnn::StatePoolUpdateOp>
+diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
+--- a/runtime/lib/ttnn/operations/transformer/recurrent.cpp
++++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
+@@ -95,7 +95,13 @@ void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
+       utils::getDataType(op->output()),
+       op->state_slots() ? std::optional<::ttnn::Tensor>(tiled(
+                               get(op->state_slots()), ::ttnn::DataType::INT32))
+-                        : std::nullopt);
++                        : std::nullopt,
++      op->apply_silu(),
++      op->dynamic_weight()
++          ? std::optional<::ttnn::Tensor>(tiled(get(op->dynamic_weight()),
++                                                ::ttnn::DataType::BFLOAT16))
++          : std::nullopt,
++      op->head_dim(), op->output_scale());
+   put(pool, op->output(), output);
+ }
+ 
