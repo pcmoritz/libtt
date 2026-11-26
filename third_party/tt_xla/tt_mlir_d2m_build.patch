@@ -1039,7 +1039,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -42,7 +53,1428 @@ namespace mlir::tt::d2m {
+@@ -42,7 +53,1478 @@ namespace mlir::tt::d2m {
  } // namespace mlir::tt::d2m
  
  namespace {
@@ -1206,7 +1206,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    ++numOps;
 +    return true;
 +  }
- 
++
 +  // scf.if (cond) { fill_tile_init; fill_tile(k, v) } with no else.
 +  static std::optional<std::pair<Value, ttkernel::FillTileOp>>
 +  conditionalFill(Operation *op) {
@@ -1537,7 +1537,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    current[k] = t;
 +    written.insert(k);
 +  }
-+
+ 
 +  SmallVector<Value> slotValues;
 +  llvm::DenseMap<int64_t, int> constSlots;
 +  llvm::DenseMap<Value, int> valueSlots;
@@ -1969,6 +1969,24 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    // (D2M emits them per output subblock) reuse the first value.
 +    std::map<std::tuple<const void *, int64_t, int>, int> externalLoads;
 +    std::map<std::pair<int, int>, int> internalBcasts;
++    // Input CBs waited on and popped once: their tiles stay readable until
++    // the kernel ends once the pop moves there.
++    llvm::DenseSet<Value> reloadable, delayedPops;
++    {
++      llvm::DenseMap<Value, int> waits, pops;
++      for (Operation *op : ops) {
++        if (isa<ttkernel::CBWaitFrontOp>(op)) {
++          ++waits[op->getOperand(0)];
++        } else if (isa<ttkernel::CBPopFrontOp>(op)) {
++          ++pops[op->getOperand(0)];
++        }
++      }
++      for (auto [cb, n] : waits) {
++        if (n == 1 && pops.lookup(cb) == 1 && !internal.contains(cb)) {
++          reloadable.insert(cb);
++        }
++      }
++    }
 +    auto cbKey = [](Value cb) { return cb.getAsOpaquePointer(); };
 +    std::map<std::pair<const void *, int64_t>, int> regionByCb;
 +    struct OpInfo {
@@ -1976,6 +1994,8 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      Access acc;
 +      int in0 = -1, in1 = -1, out = -1;
 +      bool erase = false, finalPack = false, bcastInternal = false;
++      // A row (not column) broadcast of an internal value.
++      bool bcastRow = false;
 +    };
 +    std::vector<OpInfo> infos;
 +    auto use = [&](int v, int at) {
@@ -2052,6 +2072,22 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +          if (it == regionByCb.end()) {
 +            return false;
 +          }
++          // A value that is a plain copy of an input tile is reloaded from
++          // that input instead of kept in DST (its pop moves to the end).
++          auto src = dyn_cast_or_null<ttkernel::CopyTileOp>(vals[it->second].def);
++          if (src && reloadable.contains(src.getCb0())) {
++            OpBuilder rb(op);
++            rb.create<ttkernel::ReconfigDataFormatSrcAOp>(op->getLoc(),
++                                                          src.getCb0());
++            rb.create<ttkernel::CopyTileInitOp>(op->getLoc(), src.getCb0());
++            copy->setOperand(0, src.getCb0());
++            copy->setOperand(1, src.getTileIndexCb());
++            delayedPops.insert(src.getCb0());
++            info.out = fresh(op);
++            slotVal[acc->writeSlot] = info.out;
++            infos.push_back(info);
++            continue;
++          }
 +          slotVal[acc->writeSlot] = it->second;
 +          info.erase = true;
 +        } else {
@@ -2094,10 +2130,13 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +                         : regionByCb.end();
 +          auto type = op->getAttrOfType<ttkernel::BcastTypeAttr>("bcast_type");
 +          if (it == regionByCb.end() || !type ||
-+              type.getValue() != ttkernel::BcastType::Col) {
++              (type.getValue() != ttkernel::BcastType::Col &&
++               type.getValue() != ttkernel::BcastType::Row)) {
 +            return false;
 +          }
-+          auto hit = internalBcasts.find({it->second, 1});
++          bool row = type.getValue() == ttkernel::BcastType::Row;
++          info.bcastRow = row;
++          auto hit = internalBcasts.find({it->second, row ? 2 : 1});
 +          if (hit != internalBcasts.end()) {
 +            slotVal[acc->writeSlot] = hit->second;
 +            info.erase = true;
@@ -2109,7 +2148,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +          info.bcastInternal = true;
 +        }
 +        info.out = fresh(op);
-+        internalBcasts[{info.in0, 1}] = info.out;
++        internalBcasts[{info.in0, info.bcastRow ? 2 : 1}] = info.out;
 +        slotVal[acc->writeSlot] = info.out;
 +      } else if (auto pack = dyn_cast<ttkernel::PackTileOp>(op)) {
 +        int v = cur(acc->readSlot0);
@@ -2148,9 +2187,17 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +
 +    // Hoisting moves loads after their values are identified (the slots D2M
 +    // assigned assume the original order); the allocation below follows the
-+    // new order.
-+    if (hoistLoads) {
-+      hoistInputLoads(block, internal);
++    // new order. Pops of inputs read again later move to the end first.
++    for (Operation *op : ops) {
++      if (isa<ttkernel::CBPopFrontOp>(op) &&
++          delayedPops.contains(op->getOperand(0))) {
++        op->moveBefore(block.getTerminator());
++      }
++    }
++    if (hoistLoads || !delayedPops.empty()) {
++      if (hoistLoads) {
++        hoistInputLoads(block, internal);
++      }
 +      std::stable_sort(infos.begin(), infos.end(),
 +                       [](const OpInfo &a, const OpInfo &b) {
 +                         return a.op->isBeforeInBlock(b.op);
@@ -2187,7 +2234,8 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +          need(info.in0, kFull);
 +        } else if (info.bcastInternal) {
 +          need(info.in0, info.out >= 0 && demand[info.out] == kNone ? kNone
-+                                                                    : kCol0);
++                         : info.bcastRow                             ? kFull
++                                                                     : kCol0);
 +        } else if (info.out >= 0 && demand[info.out] != kNone) {
 +          int d = demand[info.out];
 +          if (!elementwise(info.op)) {
@@ -2205,7 +2253,8 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      for (OpInfo &info : infos) {
 +        info.in0 = resolve(info.in0);
 +        info.in1 = resolve(info.in1);
-+        if (info.bcastInternal && demand[info.out] == kCol0) {
++        if (info.bcastInternal && !info.bcastRow &&
++            demand[info.out] == kCol0) {
 +          alias[info.out] = info.in0;
 +          info.erase = true;
 +          info.bcastInternal = false;
@@ -2304,7 +2353,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      bool u = false;
 +      auto bcastType = op->getAttrOfType<ttkernel::BcastTypeAttr>("bcast_type");
 +      if (info.bcastInternal) {
-+        u = true;
++        u = !info.bcastRow;
 +      } else if (isa<ttkernel::UnaryBcastTileOp>(op)) {
 +        u = bcastType && (bcastType.getValue() == ttkernel::BcastType::Col ||
 +                          bcastType.getValue() == ttkernel::BcastType::Scalar);
@@ -2361,7 +2410,8 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      }
 +      Operation *op = info.op;
 +      if (info.bcastInternal) {
-+        helperCall(op, "bcast_col0", vals[info.in0].slot,
++        helperCall(op, info.bcastRow ? "bcast_row0" : "bcast_col0",
++                   vals[info.in0].slot,
 +                   vals[info.out].slot);
 +        info.erase = true;
 +        continue;
@@ -2468,7 +2518,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  struct ConvertD2MToTTKernel
      : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
  
-@@ -217,6 +1649,36 @@ struct ConvertD2MToTTKernel
+@@ -217,6 +1699,36 @@ struct ConvertD2MToTTKernel
        return;
      }
  
@@ -3658,7 +3708,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
        TTNNToTTIRElementwiseConversionPattern<
            mlir::tt::ttnn::LogicalRightShiftOp,
            mlir::tt::ttir::LogicalRightShiftOp>,
-@@ -429,10 +627,360 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
+@@ -429,10 +627,458 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
  
  namespace mlir::tt {
  
@@ -3674,6 +3724,102 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +}
 +
 +namespace {
++// libtt: RMS norms inside D2M subgraphs (LIBTT_D2M_EXT) become their FP32
++// primitives: x * rsqrt(sum(x * x) / D + eps) * weight [* silu(gate)], the
++// result narrowed by the last multiply (as TTNN's own kernels compute it).
++template <typename SrcOp>
++class TTNNNormDecompositionPattern : public mlir::OpConversionPattern<SrcOp> {
++  using mlir::OpConversionPattern<SrcOp>::OpConversionPattern;
++
++  static mlir::RankedTensorType retype(mlir::RankedTensorType t,
++                                       llvm::ArrayRef<int64_t> shape,
++                                       mlir::Type element) {
++    mlir::Attribute encoding = t.getEncoding();
++    if (auto layout =
++            mlir::dyn_cast_if_present<mlir::tt::ttnn::TTNNLayoutAttr>(encoding)) {
++      encoding = mlir::tt::ttnn::TTNNLayoutAttr::Builder(layout, shape)
++                     .setElementType(element)
++                     .setLayout(layout.getLayout())
++                     .build();
++    }
++    return mlir::RankedTensorType::get(shape, element, encoding);
++  }
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(SrcOp op, typename SrcOp::Adaptor adaptor,
++                  mlir::ConversionPatternRewriter &rw) const override {
++    namespace ttir = mlir::tt::ttir;
++    mlir::Location loc = op.getLoc();
++    auto outType = mlir::cast<mlir::RankedTensorType>(
++        this->getTypeConverter()->convertType(op.getResult().getType()));
++    mlir::Type f32 = rw.getF32Type();
++    auto asF32 = [&](mlir::Value v) -> mlir::Value {
++      auto t = mlir::cast<mlir::RankedTensorType>(v.getType());
++      if (t.getElementType().isF32()) {
++        return v;
++      }
++      return rw.create<ttir::TypecastOp>(loc, retype(t, t.getShape(), f32), v);
++    };
++    mlir::Value x = asF32(adaptor.getInput());
++    auto xt = mlir::cast<mlir::RankedTensorType>(x.getType());
++    int64_t rank = xt.getRank();
++    int64_t width = xt.getShape().back();
++    auto scalar = [&](float value) -> mlir::Value {
++      llvm::SmallVector<int64_t> ones(rank, 1);
++      llvm::SmallVector<int32_t> onesI32(rank, 1);
++      return rw.create<ttir::FullOp>(loc, mlir::RankedTensorType::get(ones, f32),
++                                     onesI32, rw.getF32FloatAttr(value));
++    };
++    llvm::SmallVector<int64_t> rowShape(xt.getShape());
++    rowShape.back() = 1;
++    auto rowType = retype(xt, rowShape, f32);
++    mlir::Value squares = rw.create<ttir::MultiplyOp>(loc, xt, x, x);
++    mlir::Value sum = rw.create<ttir::SumOp>(
++        loc, rowType, squares, /*keep_dim=*/true,
++        rw.getI32ArrayAttr({static_cast<int32_t>(rank - 1)}));
++    mlir::Value mean = rw.create<ttir::MultiplyOp>(
++        loc, rowType, sum, scalar(1.0f / static_cast<float>(width)));
++    mlir::Value var = rw.create<ttir::AddOp>(
++        loc, rowType, mean,
++        scalar(op.getEpsilon().convertToFloat()));
++    mlir::Value rstd = rw.create<ttir::RsqrtOp>(loc, rowType, var);
++    mlir::Value normed = rw.create<ttir::MultiplyOp>(loc, xt, x, rstd);
++    // The weight [D] as one row [1, ..., 1, D] (the same tiles).
++    mlir::Value w = asF32(adaptor.getWeight());
++    auto wt = mlir::cast<mlir::RankedTensorType>(w.getType());
++    if (wt.getRank() != rank) {
++      llvm::SmallVector<int64_t> wShape(rank, 1);
++      wShape.back() = width;
++      auto reshape = rw.create<ttir::ReshapeOp>(
++          loc, retype(wt, wShape, f32), w,
++          rw.getI32ArrayAttr(llvm::to_vector_of<int32_t>(wShape)));
++      reshape->setAttr("libtt.tile_reinterpret", rw.getUnitAttr());
++      w = reshape;
++    }
++    // The last multiply narrows as TTNN->TTIR's FP32-then-narrow binaries do:
++    // FP32 with the result's encoding, then a typecast D2M folds into the pack.
++    auto finish = [&](mlir::Value a, mlir::Value b) {
++      if (outType.getElementType().isF32()) {
++        rw.replaceOpWithNewOp<ttir::MultiplyOp>(op, outType, a, b);
++        return;
++      }
++      auto wide = mlir::RankedTensorType::get(outType.getShape(), f32,
++                                              outType.getEncoding());
++      mlir::Value product = rw.create<ttir::MultiplyOp>(loc, wide, a, b);
++      rw.replaceOpWithNewOp<ttir::TypecastOp>(op, outType, product);
++    };
++    if constexpr (std::is_same_v<SrcOp, mlir::tt::ttnn::RMSNormGatedOp>) {
++      mlir::Value weighted = rw.create<ttir::MultiplyOp>(loc, xt, normed, w);
++      mlir::Value z = asF32(adaptor.getGate());
++      finish(weighted, rw.create<ttir::SiluOp>(loc, xt, z));
++    } else {
++      finish(normed, w);
++    }
++    return mlir::success();
++  }
++};
++
 +// libtt: reshapes and permutes inside D2M subgraphs (LIBTT_D2M_VIEWS).
 +class TTNNToTTIRReshapePattern
 +    : public mlir::OpConversionPattern<mlir::tt::ttnn::ReshapeOp> {
@@ -4014,7 +4160,9 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
                                  TypeConverter &typeConverter) {
    addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
    addElementwiseBinaryOpsConversionPatterns(ctx, patterns, typeConverter);
-+  patterns.add<TTNNToTTIRReshapePattern, TTNNToTTIRPermutePattern>(
++  patterns.add<TTNNToTTIRReshapePattern, TTNNToTTIRPermutePattern,
++               TTNNNormDecompositionPattern<mlir::tt::ttnn::RMSNormOp>,
++               TTNNNormDecompositionPattern<mlir::tt::ttnn::RMSNormGatedOp>>(
 +      typeConverter, ctx);
    addReductionOpsConversionPatterns(ctx, patterns, typeConverter);
    patterns.add<TTNNMatmulToTTIRMatmulConversionPattern>(typeConverter, ctx);
@@ -6528,7 +6676,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  class ElementwiseFusionAnalysis {
  public:
    using FusionGroup = llvm::SmallVector<Operation *>;
-@@ -44,24 +63,212 @@ public:
+@@ -44,24 +63,238 @@ public:
      if (!op) {
        return false;
      }
@@ -6711,11 +6859,37 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +    // Keep activation/transcendental kernels on TTNN until their SFPU
 +    // initialization and register state are modeled by generic fusion.
 +    if (mlir::isa<AbsOp, LogicalNotOp, BitwiseNotOp, NegOp>(op)) {
-       return true;
-     }
++      return true;
++    }
 +    if (extended &&
 +        mlir::isa<RsqrtOp, SqrtOp, SigmoidOp, SignOp, ExpOp, LogOp, SiluOp,
 +                  ReciprocalOp, TanhOp>(op)) {
+       return true;
+     }
++    // libtt (LIBTT_D2M_EXT): RMS norms (and the SiLU-gated one) over whole
++    // rows of up to 32 tiles with a row-wide weight, decomposed in
++    // TTNN->TTIR (TTNNToTTIRNormDecomposition).
++    if (extended && mlir::isa<RMSNormOp, RMSNormGatedOp>(op)) {
++      auto input = cast<RankedTensorType>(op->getOperand(0).getType());
++      Value weight, bias, gate;
++      if (auto norm = dyn_cast<RMSNormOp>(op)) {
++        weight = norm.getWeight();
++        bias = norm.getBias();
++      } else {
++        auto gated = cast<RMSNormGatedOp>(op);
++        weight = gated.getWeight();
++        gate = gated.getGate();
++        if (gated.getGateOffset() != 0 ||
++            gate.getType() != op->getOperand(0).getType()) {
++          return false;
++        }
++      }
++      if (input.getRank() < 2 || bias || !weight ||
++          input.getShape().back() > 32 * 32 ||
++          cast<RankedTensorType>(weight.getType()).getNumElements() !=
++              input.getShape().back()) {
++        return false;
++      }
 +      return true;
 +    }
 +    // Row reductions over the last dimension, keeping it.
@@ -6749,7 +6923,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
-@@ -69,13 +276,28 @@ public:
+@@ -69,13 +302,28 @@ public:
    }
  
  private:
@@ -6769,13 +6943,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          lastInput = def;
 +        }
 +      }
++    }
++    if (!lastInput) {
++      return true;
      }
 -    for (Value result : op->getResults()) {
 -      for (Operation *user : result.getUsers()) {
 -        if (isAllowedToBeFused(user)) {
-+    if (!lastInput) {
-+      return true;
-+    }
 +    for (Operation *op : group) {
 +      for (Operation *user : op->getUsers()) {
 +        Operation *ancestor = block->findAncestorOpInBlock(*user);
@@ -6784,7 +6958,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            return false;
          }
        }
-@@ -89,13 +311,16 @@ private:
+@@ -89,16 +337,21 @@ private:
      llvm::SmallVector<Operation *> exitOps;
      rootOp->walk([&](Block *block) {
        for (Operation &op : llvm::reverse(*block)) {
@@ -6801,8 +6975,14 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      }
        FusionGroup group = buildFusionGroup(exitOp);
  
-       if (group.size() >= 2) {
-@@ -119,41 +344,40 @@ private:
+-      if (group.size() >= 2) {
++      // libtt: a composite norm alone is worth a generic (it is many ops).
++      if (group.size() >= 2 ||
++          (group.size() == 1 && isa<RMSNormOp, RMSNormGatedOp>(group[0]))) {
+         for (Operation *op : group) {
+           visitedOps.insert(op);
+         }
+@@ -119,41 +372,40 @@ private:
      }
    }
  
@@ -6868,7 +7048,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      for (Operation &op : *block) {
        if (fusionSet.contains(&op)) {
          fusionGroup.push_back(&op);
-@@ -176,14 +400,293 @@ public:
+@@ -176,14 +428,293 @@ public:
    using impl::TTNNCreateD2MSubgraphsBase<
        TTNNCreateD2MSubgraphsPass>::TTNNCreateD2MSubgraphsBase;
  
@@ -7163,7 +7343,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  
      IRRewriter rewriter(&getContext());
      for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
-@@ -216,8 +719,16 @@ private:
+@@ -216,8 +747,16 @@ private:
        }
      }
  
@@ -7182,7 +7362,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (outputs.empty()) {
        TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
                     "Fusion group {} has no external outputs", groupIdx);
-@@ -229,7 +740,7 @@ private:
+@@ -229,7 +768,7 @@ private:
      Operation *lastInputDefiner = nullptr;
      for (Value v : inputs) {
        Operation *defOp = v.getDefiningOp();
@@ -7191,7 +7371,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
          lastInputDefiner = defOp;
        }
-@@ -244,14 +755,27 @@ private:
+@@ -244,14 +783,27 @@ private:
      // Get device for creating empty output buffers for DPS.
      auto device = utils::getOrInsertDevice(rewriter, firstOp);
      llvm::SmallVector<Type> inputTypes;
@@ -7222,7 +7402,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        outputTypes.push_back(tensorType);
  
        auto shapeAttr =
-@@ -289,7 +813,23 @@ private:
+@@ -289,7 +841,23 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -7247,7 +7427,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +846,20 @@ private:
+@@ -306,12 +874,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(
@@ -7525,7 +7705,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
  #include "ttmlir/Target/TTKernel/TTKernelToCpp.h"
  
  #include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
-@@ -37,6 +41,142 @@
+@@ -37,6 +41,182 @@
  
  #include <set>
  
@@ -7620,6 +7800,29 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
 +  }
 +  _llk_math_eltwise_sfpu_done_();
 +}
++// dst = row 0 of src spread down each column (in place allowed): a
++// subvector transpose of four copies of a row-0 vector repeats its first
++// subvector (row 0) in every subvector.
++template <uint32_t src, uint32_t dst>
++inline void bcast_row0() {
++  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
++  _llk_math_eltwise_sfpu_start_(0);
++#pragma GCC unroll 2
++  for (uint32_t face = 0; face < 2; ++face) {
++#pragma GCC unroll 2
++    for (uint32_t parity = 0; parity < 2; ++parity) {
++      sfpi::vInt a = sfpi::dst_reg[src * 32 + face * 8 + parity];
++      sfpi::vInt b = a, c = a, d = a, e = a, f = a, g = a, h = a;
++      sfpi::subvec_transp(a, b, c, d, e, f, g, h);
++#pragma GCC unroll 4
++      for (uint32_t band = 0; band < 4; ++band) {
++        sfpi::dst_reg[dst * 32 + face * 8 + 2 * band + parity] = a;
++        sfpi::dst_reg[dst * 32 + (face + 2) * 8 + 2 * band + parity] = a;
++      }
++    }
++  }
++  _llk_math_eltwise_sfpu_done_();
++}
 +sfpi_inline sfpi::vFloat rotate8f(sfpi::vFloat v) {
 +  return sfpi::vFloat(sfpi::subvec_shflror1(v));
 +}
@@ -7658,6 +7861,23 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
 +} // namespace libtt_sfpu
 +#endif)libtt";
 +
++// libtt: tt-metal renamed the binary startup and dest-reuse calls; D2M still
++// emits the old names, defined here on the new API.
++static const char *const kLibttBinaryCompat = R"libtt(
++ALWI void binary_op_init_common(uint32_t icb0, uint32_t icb1, uint32_t ocb) {
++  ckernel::compute_kernel_hw_startup(icb0, icb1, ocb);
++}
++template <ckernel::EltwiseBinaryType type,
++          ckernel::EltwiseBinaryReuseDestType reuse>
++ALWI void binary_dest_reuse_tiles_init(uint32_t icb) {
++  ckernel::detail::binary_reuse_dest_init<type, reuse>(icb, __builtin_LINE());
++}
++template <ckernel::EltwiseBinaryType type,
++          ckernel::EltwiseBinaryReuseDestType reuse>
++ALWI void binary_dest_reuse_tiles(uint32_t cb, uint32_t tile, uint32_t dst) {
++  ckernel::detail::binary_reuse_dest_tiles<type, reuse>(cb, tile, dst);
++})libtt";
++
 +// libtt tile ops called from kernel_main on every TRISC.
 +static const char *const kLibttTileOps = R"libtt(
 +ALWI void libtt_group_sum_tile_init() {}
@@ -7668,7 +7888,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
  namespace mlir::tt::ttkernel {
  
  // Class used to add includes and other boilerplate code to the generated
-@@ -63,7 +203,8 @@ public:
+@@ -63,7 +243,8 @@ public:
      }
  
      // TODO(wenbinlyuTT): make this conditional, originally from #4680.
@@ -7678,10 +7898,17 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
  
      const auto &headerMap = getCalleeToHeadersMap();
  
-@@ -88,6 +229,16 @@ public:
+@@ -88,6 +269,23 @@ public:
      region->walk([&](emitc::CallOpaqueOp callOp) {
        llvm::StringRef callee = callOp.getCallee();
  
++      if (callee == "binary_op_init_common" ||
++          callee == "binary_dest_reuse_tiles" ||
++          callee == "binary_dest_reuse_tiles_init") {
++        if (emittedLlks.insert(kLibttBinaryCompat).second) {
++          llksToEmit.push_back(kLibttBinaryCompat);
++        }
++      }
 +      // libtt tile ops: SFPI helpers plus their wrappers.
 +      if (callee.starts_with("libtt_")) {
 +        for (llvm::StringRef snippet : {llvm::StringRef(kLibttSfpuHelpers),
@@ -7695,7 +7922,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
        auto it = headerMap.find(callee);
        if (it != headerMap.end()) {
          insertHeaders(it->second);
-@@ -183,6 +334,15 @@ public:
+@@ -183,6 +381,15 @@ public:
          }
        }
  
@@ -7711,7 +7938,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
        if (value.starts_with("experimental::invoke_sfpi")) {
          emitLlk(experimental_invoke_sfpi_llks_generated,
                  experimental_invoke_sfpi_llks_generated_len);
-@@ -353,7 +513,39 @@ LogicalResult translateKernelFuncToCpp(func::FuncOp entry,
+@@ -353,7 +560,39 @@ LogicalResult translateKernelFuncToCpp(func::FuncOp entry,
      return failure();
    }
    auto moduleCleanup = llvm::make_scope_exit([&]() { kernelModule->erase(); });
