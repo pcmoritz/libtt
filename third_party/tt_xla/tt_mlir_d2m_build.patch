@@ -9,7 +9,7 @@ diff --git a/include/ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h b/include/ttmlir/
  #include "mlir/Pass/Pass.h"
  #include "mlir/Transforms/DialectConversion.h"
  
-@@ -22,6 +23,15 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -22,6 +23,16 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
  
  std::unique_ptr<OperationPass<ModuleOp>> createConvertTTNNToTTIRPass();
  
@@ -19,6 +19,7 @@ diff --git a/include/ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h b/include/ttmlir/
 +// libtt: computes a D2M subgraph that splits [T, H*D] into heads in
 +// head-major [H, T, D] form (see the definition); true if rewritten.
 +bool rewriteHeadMajorSubgraph(func::FuncOp func);
++bool rewriteWideRowSubgraph(func::FuncOp func);
 +
 +bool canExpandTTNNActivations(ArrayAttr activations);
 +
@@ -151,6 +152,31 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
  def TTIR_SeluOp : TTIR_ElementwiseOp<"selu", [OneOperand, TTIR_ElementwiseUnary, TTIR_QuantizableOpInterface]> {
      let summary = "Elementwise scaled exponential linear unit (SELU).";
      let description = [{
+diff --git a/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h b/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h
+--- a/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h
++++ b/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h
+@@ -60,7 +60,10 @@ protected:
+           continue;
+         }
+         if constexpr (std::is_same_v<TMOpType, ttir::ReshapeOp>) {
+-          if (isHighRankReductionReshape(tmUser)) {
++          // libtt: tile reinterpretations (D2M subgraphs) are placed on
++          // purpose.
++          if (isHighRankReductionReshape(tmUser) ||
++              tmUser->hasAttr("libtt.tile_reinterpret")) {
+             continue;
+           }
+         }
+@@ -95,7 +98,8 @@ protected:
+           continue;
+         }
+         if constexpr (std::is_same_v<TMOpType, ttir::ReshapeOp>) {
+-          if (isHighRankReductionReshape(tmOperand)) {
++          if (isHighRankReductionReshape(tmOperand) ||
++              tmOperand->hasAttr("libtt.tile_reinterpret")) {
+             continue;
+           }
+         }
 diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 --- a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 +++ b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
@@ -1127,7 +1153,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -42,7 +53,1571 @@ namespace mlir::tt::d2m {
+@@ -42,7 +53,1601 @@ namespace mlir::tt::d2m {
  } // namespace mlir::tt::d2m
  
  namespace {
@@ -1361,6 +1387,9 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +  // Only column 0 of the results is read (DstResidentRewriter's
 +  // libtt.col0_only): compute the left faces' even vectors only.
 +  bool col0Only = false;
++  // libtt.tile_rows: every value of the kernel has at most this many rows
++  // in each tile row (1..16, decode); only those rows are computed.
++  int64_t tileRows = 0;
 +
 +  // Emits the call before `before`; false if the chain is too large.
 +  bool emit(Operation *before) {
@@ -1397,8 +1426,11 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    // Pair-uniform lines (equal in both vectors) run once; the others twice
 +    // (temps t<n>_e / t<n>_o, the odd vector one register further). Pair ops
 +    // (group sums) combine the two.
++    // With few rows, unrolled vectors replace the loop: pair only for pair
++    // ops (which need both vectors).
 +    bool paired = !col0Only &&
-+                  (hasPairOp || (llvm::is_contained(lineUniform, true) &&
++                  (hasPairOp || (tileRows == 0 &&
++                                 llvm::is_contained(lineUniform, true) &&
 +                                 llvm::is_contained(lineUniform, false)));
 +    if (col0Only && hasPairOp) {
 +      return false;
@@ -1510,18 +1542,36 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +        return false;
 +      }
 +    }
-+    if (col0Only) {
-+      // FP32 DST lane layout: column 0 lives in the even vectors of faces 0
-+      // and 2 (dst_reg offsets 0, 2, 4, 6, 16, 18, 20, 22 of a tile).
++    const bool unroll = col0Only || tileRows > 0;
++    if (unroll) {
++      // FP32 DST lane layout: vector d (0..7) of face f is dst_reg offset
++      // 8 * f + d of a tile and holds rows 4 * (d / 2) .. + 3, the even
++      // (d even) or odd columns of the face (faces 0, 1: rows 0..15, columns
++      // 0..15 and 16..31; faces 2, 3: rows 16..31). Column 0: the even
++      // vectors of faces 0 and 2; R <= 16 rows: vectors d < 2 * ceil(R / 4)
++      // of faces 0 and 1; a pair (even, odd) per even d with pair ops.
++      const int vectors = tileRows > 0 ? 2 * ((tileRows + 3) / 4) : 8;
++      SmallVector<int> faces = tileRows > 0
++                                   ? (col0Only ? SmallVector<int>{0}
++                                               : SmallVector<int>{0, 1})
++                                   : SmallVector<int>{0, 2};
++      const bool evenOnly = col0Only || paired;
 +      std::string unrolled;
-+      for (int off : {0, 2, 4, 6, 16, 18, 20, 22}) {
-+        std::string copy = body;
-+        std::string from = " * 32]", to = llvm::formatv(" * 32 + {0}]", off);
-+        for (size_t pos = copy.find(from); pos != std::string::npos;
-+             pos = copy.find(from, pos + to.size())) {
-+          copy.replace(pos, from.size(), to);
++      for (int f : faces) {
++        for (int d = 0; d < vectors; d += evenOnly ? 2 : 1) {
++          int off = 8 * f + d;
++          std::string copy = body;
++          auto replaceAll = [&](const std::string &from, const std::string &to) {
++            for (size_t pos = copy.find(from); pos != std::string::npos;
++                 pos = copy.find(from, pos + to.size())) {
++              copy.replace(pos, from.size(), to);
++            }
++          };
++          replaceAll(" * 32 + 1]", llvm::formatv(" * 32 + {0}]", off + 1));
++          replaceAll(" * 32]", llvm::formatv(" * 32 + {0}]", off));
++          replaceAll("sfpi::dst_reg++;", "");
++          unrolled += "  {\n" + copy + "  }\n";
 +        }
-+        unrolled += "  {\n" + copy + "  }\n";
 +      }
 +      body = unrolled;
 +    }
@@ -1561,7 +1611,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      }
 +    }
 +    std::string fn =
-+        col0Only
++        unroll
 +            ? llvm::formatv("ALWI void NAME({0}) {{\n"
 +                            "  llk_math_eltwise_unary_sfpu_init<SfpuType::"
 +                            "unused, DST_ACCUM_MODE>();\n"
@@ -1710,6 +1760,10 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +  }
 +  SmallVector<Block *> blocks;
 +  funcOp.walk([&](Block *b) { blocks.push_back(b); });
++  int64_t tileRows = 0;
++  if (auto rows = funcOp->getAttrOfType<IntegerAttr>("libtt.tile_rows")) {
++    tileRows = rows.getInt();
++  }
 +  for (Block *block : blocks) {
 +    SmallVector<Operation *> run;
 +    bool runCol0 = false, runHasOps = false;
@@ -1721,6 +1775,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      }
 +      SFPUChainEmitter emitter;
 +      emitter.col0Only = col0;
++      emitter.tileRows = tileRows;
 +      Operation *last = nullptr;
 +      for (Operation *op : run) {
 +        if (!SFPUChainEmitter::isInit(op)) {
@@ -1730,7 +1785,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      }
 +      bool emitted = last &&
 +                     (emitter.getNumOps() >= 2 ||
-+                      (col0 && emitter.getNumOps() >= 1)) &&
++                      ((col0 || tileRows > 0) && emitter.getNumOps() >= 1)) &&
 +                     emitter.emit(last->getNextNode());
 +      // A chain with heavy ops (group sums, exp-based ops) that does not fit:
 +      // chain the parts around them (they stay LLK / helper calls).
@@ -1756,6 +1811,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +        for (auto &part : parts) {
 +          SFPUChainEmitter sub;
 +          sub.col0Only = col0;
++          sub.tileRows = tileRows;
 +          Operation *subLast = nullptr;
 +          for (Operation *op : part) {
 +            if (!SFPUChainEmitter::isInit(op)) {
@@ -2022,7 +2078,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      }
 +    }
 +  }
-+
+ 
 +  bool unrollAndFold() {
 +    // Innermost loops first; give up on large kernels.
 +    int64_t budget = 256;
@@ -2492,7 +2548,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +        busy[vals[info.out].slot] = false;
 +      }
 +    }
- 
++
 +    for (OpInfo &info : infos) {
 +      if (info.out < 0 || info.erase) {
 +        continue;
@@ -2699,16 +2755,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  struct ConvertD2MToTTKernel
      : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
  
-@@ -212,11 +1787,91 @@ struct ConvertD2MToTTKernel
-           funcOp.getLoc(), fabricConnectionManager);
-     }
- 
-+    // TEMP libtt debugging: LIBTT_D2M_TRACE names each kernel function.
-+    if (std::getenv("LIBTT_D2M_TRACE")) {
-+      llvm::errs() << "libtt d2m-to-ttkernel: " << funcOp.getSymName() << "\n";
-+    }
-     if (failed(applyFullConversion(funcOp, target, std::move(patterns)))) {
-       signalPassFailure();
+@@ -217,6 +1822,76 @@ struct ConvertD2MToTTKernel
        return;
      }
  
@@ -2778,13 +2825,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +
 +    if (std::getenv("LIBTT_D2M_EXT") && !funcOp.getBody().empty() &&
 +        usesFp32Dst(funcOp)) {
-+      if (std::getenv("LIBTT_D2M_TRACE")) {
-+        llvm::errs() << "libtt dst-resident: " << funcOp.getSymName() << "\n";
-+      }
 +      DstResidentRewriter::apply(funcOp);
-+      if (std::getenv("LIBTT_D2M_TRACE")) {
-+        llvm::errs() << "libtt sfpu chains: " << funcOp.getSymName() << "\n";
-+      }
 +      fuseSFPUChains(funcOp);
 +    }
 +
@@ -3226,7 +3267,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                 [&](std::size_t index, bool dropped) { dims[index] = dropped; });
  
      bool reduceSecondToLast = dims[rank - 2]; // "C" in tile terminology
-@@ -4339,8 +4359,19 @@ public:
+@@ -4339,8 +4359,26 @@ public:
      }
  
      TensorManipulationInfo info = LogicalInfoFn(op);
@@ -3237,17 +3278,24 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +    if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
 +      reinterpret = op->hasAttr("libtt.tile_reinterpret");
 +    }
-+    if (reinterpret) {
++    // libtt: a tile-aligned column slice of whole rows [T, N] (T <= 32)
++    // (libtt.tile_slice): the output's tiles at a constant tile offset.
++    bool tileSlice = false;
++    if constexpr (std::is_same_v<TensorManipulationOp, ttir::SliceStaticOp>) {
++      tileSlice = op->hasAttr("libtt.tile_slice");
++    }
++    if (reinterpret || tileSlice) {
 +      info.canBeTilized = true;
 +    }
      AffineMap deviceMap =
 -        projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
-+        reinterpret ? AffineMap()
-+                    : projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
++        reinterpret || tileSlice
++            ? AffineMap()
++            : projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
  
      auto origInputs = adaptor.getOperands();
      auto origOutputs =
-@@ -4359,6 +4390,28 @@ public:
+@@ -4359,6 +4397,43 @@ public:
          layout.getDimAlignments());
      auto newOutTy = RankedTensorType::get(outTy.getShape(),
                                            outTy.getElementType(), newLayout);
@@ -3273,10 +3321,25 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      llvm::append_range(results, shardExprs);
 +      deviceMap = AffineMap::get(2 * outRank, 0, results, ctx);
 +    }
++    if constexpr (std::is_same_v<TensorManipulationOp, ttir::SliceStaticOp>) {
++      if (tileSlice) {
++        ArrayRef<int64_t> outShape = outTy.getShape();
++        size_t rank = outShape.size() / 2;
++        assert(rank == 2 && "libtt.tile_slice is a rank-2 slice");
++        auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
++        MLIRContext *ctx = rewriter.getContext();
++        SmallVector<AffineExpr> results(rank, getAffineConstantExpr(0, ctx));
++        for (size_t i = 0; i < rank; ++i) {
++          results.push_back(getAffineDimExpr(rank + i, ctx) +
++                            begins[begins.size() - rank + i] / 32);
++        }
++        deviceMap = AffineMap::get(2 * rank, 0, results, ctx);
++      }
++    }
  
      // Express the data rearrangement as a view. The allocator will later
      // decide whether to insert a CB allocation for any GenericOp that
-@@ -5396,6 +5449,8 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5396,6 +5471,8 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
      D2MNamedElementwiseRewriter<ttir::SignOp,            d2m::TileSignOp>,
      D2MNamedElementwiseRewriter<ttir::SignbitOp,        d2m::TileSignbitOp>,
      D2MNamedElementwiseRewriter<ttir::SeluOp,           d2m::TileSeluOp>,
@@ -3285,7 +3348,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      D2MNamedElementwiseRewriter<ttir::SiluOp,            d2m::TileSiluOp>,
      D2MNamedElementwiseRewriter<ttir::SoftsignOp,       d2m::TileSoftsignOp>,
      D2MNamedElementwiseRewriter<ttir::SinOp,             d2m::TileSinOp>,
-@@ -5493,6 +5548,273 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5493,6 +5570,273 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
  #include "ttmlir/Conversion/Passes.h.inc"
  
  namespace {
@@ -3559,7 +3622,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  class TTIRToD2MPass final
      : public mlir::tt::impl::TTIRToD2MBase<TTIRToD2MPass> {
  public:
-@@ -5521,6 +5843,13 @@ public:
+@@ -5521,6 +5865,13 @@ public:
    void runOnOperation() override {
      MLIRContext *ctx = &getContext();
      ModuleOp module = getOperation();
@@ -3708,7 +3771,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPass.cpp b/lib/Conversion/TTNNT
  #include "ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h"
  
  #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
-@@ -94,10 +96,139 @@ struct ConvertTTNNToTTIRPass
+@@ -94,10 +96,169 @@ struct ConvertTTNNToTTIRPass
      if (failed(
              applyFullConversion(getOperation(), target, std::move(patterns)))) {
        signalPassFailure();
@@ -3722,7 +3785,8 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPass.cpp b/lib/Conversion/TTNNT
 +      inlineScalarConstants(getOperation());
 +      // libtt: head-major / group-major per-head subgraphs.
 +      for (func::FuncOp f : d2mSubgraphs) {
-+        if (::mlir::tt::rewriteHeadMajorSubgraph(f)) {
++        if (::mlir::tt::rewriteHeadMajorSubgraph(f) ||
++            ::mlir::tt::rewriteWideRowSubgraph(f)) {
 +          continue;
 +        }
 +        // D2M's general reshape views are wrong across tiles: a head
@@ -3743,11 +3807,40 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPass.cpp b/lib/Conversion/TTNNT
 +          return;
 +        }
 +      }
++      for (func::FuncOp f : d2mSubgraphs) {
++        annotateTileRows(f);
++      }
 +    }
 +    dedupeSubgraphs(getOperation());
    }
  
  private:
++  // libtt: the most rows any value of the subgraph has in a tile row (its
++  // second-to-last dim; one for rank < 2). At most 16 (decode), the SFPU
++  // chains of its kernels compute only those rows (D2MToTTKernel); the
++  // padding rows of the results are left unspecified.
++  static void annotateTileRows(func::FuncOp f) {
++    int64_t rows = 1;
++    auto visit = [&](Type t) {
++      auto r = mlir::dyn_cast<RankedTensorType>(t);
++      if (r && r.getRank() >= 2) {
++        rows = std::max(rows, r.getDimSize(r.getRank() - 2));
++      }
++    };
++    for (Type t : f.getArgumentTypes()) {
++      visit(t);
++    }
++    f.walk([&](Operation *op) {
++      for (Type t : op->getResultTypes()) {
++        visit(t);
++      }
++    });
++    if (rows <= 16) {
++      f->setAttr("libtt.tile_rows",
++                 IntegerAttr::get(IntegerType::get(f.getContext(), 64), rows));
++    }
++  }
++
 +  // libtt: a model repeats each subgraph per layer (an Inkling prefill had
 +  // 1573 subgraphs, ~100 distinct); identical ones (after the per-dispatch
 +  // specializations above) are compiled once, every dispatch calling the
@@ -4108,7 +4201,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
        TTNNToTTIRElementwiseConversionPattern<
            mlir::tt::ttnn::LogicalRightShiftOp,
            mlir::tt::ttir::LogicalRightShiftOp>,
-@@ -429,10 +627,490 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
+@@ -429,10 +627,637 @@ addReductionOpsConversionPatterns(mlir::MLIRContext *ctx,
  
  namespace mlir::tt {
  
@@ -4184,6 +4277,22 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +        loc, rowType, mean,
 +        scalar(op.getEpsilon().convertToFloat()));
 +    mlir::Value rstd = rw.create<ttir::RsqrtOp>(loc, rowType, var);
++    // The last multiply narrows as TTNN->TTIR's FP32-then-narrow binaries do:
++    // FP32 with the result's encoding, then a typecast D2M folds into the pack.
++    auto finish = [&](mlir::Value a, mlir::Value b) {
++      if (outType.getElementType().isF32()) {
++        rw.replaceOpWithNewOp<ttir::MultiplyOp>(op, outType, a, b);
++        return;
++      }
++      auto wide = mlir::RankedTensorType::get(outType.getShape(), f32,
++                                              outType.getEncoding());
++      mlir::Value product = rw.create<ttir::MultiplyOp>(loc, wide, a, b);
++      rw.replaceOpWithNewOp<ttir::TypecastOp>(op, outType, product);
++    };
++    if (!adaptor.getWeight()) {
++      finish(x, rstd);
++      return mlir::success();
++    }
 +    mlir::Value normed = rw.create<ttir::MultiplyOp>(loc, xt, x, rstd);
 +    // The weight [D] as one row [1, ..., 1, D] (the same tiles); through the
 +    // [1, D] -> [D] reshape the subgraph outlining adds for the TTNN op.
@@ -4204,18 +4313,6 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +      reshape->setAttr("libtt.tile_reinterpret", rw.getUnitAttr());
 +      w = reshape;
 +    }
-+    // The last multiply narrows as TTNN->TTIR's FP32-then-narrow binaries do:
-+    // FP32 with the result's encoding, then a typecast D2M folds into the pack.
-+    auto finish = [&](mlir::Value a, mlir::Value b) {
-+      if (outType.getElementType().isF32()) {
-+        rw.replaceOpWithNewOp<ttir::MultiplyOp>(op, outType, a, b);
-+        return;
-+      }
-+      auto wide = mlir::RankedTensorType::get(outType.getShape(), f32,
-+                                              outType.getEncoding());
-+      mlir::Value product = rw.create<ttir::MultiplyOp>(loc, wide, a, b);
-+      rw.replaceOpWithNewOp<ttir::TypecastOp>(op, outType, product);
-+    };
 +    if constexpr (std::is_same_v<SrcOp, mlir::tt::ttnn::RMSNormGatedOp>) {
 +      mlir::Value weighted = rw.create<ttir::MultiplyOp>(loc, xt, normed, w);
 +      mlir::Value z = asF32(adaptor.getGate());
@@ -4240,6 +4337,25 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +        getTypeConverter()->convertType(op.getResult().getType()));
 +    rewriter.replaceOpWithNewOp<mlir::tt::ttir::ReshapeOp>(
 +        op, type, adaptor.getInput(), op.getShapeAttr());
++    return mlir::success();
++  }
++};
++// libtt: tile-aligned column slices of whole rows inside D2M subgraphs
++// (LIBTT_D2M_EXT), lowered to tile-offset views (libtt.tile_slice).
++class TTNNToTTIRSlicePattern
++    : public mlir::OpConversionPattern<mlir::tt::ttnn::SliceStaticOp> {
++  using OpConversionPattern::OpConversionPattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(mlir::tt::ttnn::SliceStaticOp op, OpAdaptor adaptor,
++                  mlir::ConversionPatternRewriter &rewriter) const override {
++    auto type = mlir::cast<mlir::RankedTensorType>(
++        getTypeConverter()->convertType(op.getResult().getType()));
++    auto slice = rewriter.replaceOpWithNewOp<mlir::tt::ttir::SliceStaticOp>(
++        op, type, adaptor.getInput(), op.getBeginsAttr(), op.getEndsAttr(),
++        op.getStepAttr());
++    slice->setAttr("libtt.tile_slice", rewriter.getUnitAttr());
 +    return mlir::success();
 +  }
 +};
@@ -4414,6 +4530,121 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +  return true;
 +}
 +
++// libtt: an elementwise subgraph over one tile row [T, N] (T <= 32) wider
++// than a core row (more than 8 tiles; Inkling 2's attention output gate,
++// [1, 768]) gets one core row. Computed as [k, T, N / k] (the same tiles in
++// the same order, k tile rows: tile reinterpretations), it spreads over k.
++bool rewriteWideRowSubgraph(func::FuncOp func) {
++  namespace ttir = mlir::tt::ttir;
++  if (func.getBody().getBlocks().size() != 1) {
++    return false;
++  }
++  Block &body = func.getBody().front();
++  int64_t T = -1, N = -1;
++  auto row = [&](Type type) {
++    auto t = mlir::dyn_cast<RankedTensorType>(type);
++    if (!t || t.getNumElements() == 1) {
++      return t != nullptr;
++    }
++    if (t.getRank() != 2) {
++      return false;
++    }
++    if (T < 0) {
++      T = t.getDimSize(0);
++      N = t.getDimSize(1);
++    }
++    return t.getDimSize(0) == T && t.getDimSize(1) == N;
++  };
++  for (Operation &op : body) {
++    auto slice = mlir::dyn_cast<ttir::SliceStaticOp>(op);
++    if (slice && !slice->hasAttr("libtt.tile_slice")) {
++      return false;
++    }
++    if (!slice && !mlir::isa<ttir::ElementwiseUnary, ttir::ElementwiseBinary,
++                             ttir::TypecastOp, ttir::FullOp, func::ReturnOp>(
++                      op)) {
++      return false;
++    }
++    if (!slice && !llvm::all_of(op.getOperandTypes(), row)) {
++      return false;
++    }
++    if (!llvm::all_of(op.getResultTypes(), row)) {
++      return false;
++    }
++  }
++  if (T < 1 || T > 32 || N % 32 != 0) {
++    return false;
++  }
++  const int64_t tiles = N / 32;
++  int64_t k = 0;
++  for (int64_t d = 2; d <= 8 && !k; ++d) {
++    if (tiles % d == 0 && tiles / d <= 8) {
++      k = d;
++    }
++  }
++  if (tiles <= 8 || !k) {
++    return false;
++  }
++  SmallVector<int64_t> wide{k, T, N / k};
++  auto widen = [&](RankedTensorType t) {
++    return t.getNumElements() == 1 ? withShape(t, {1, 1, 1})
++                                   : withShape(t, wide);
++  };
++  mlir::OpBuilder b(func.getContext());
++  auto reinterpret = [&](Location loc, Value v, RankedTensorType to) {
++    auto r = b.create<ttir::ReshapeOp>(
++        loc, to, v,
++        b.getI32ArrayAttr(llvm::to_vector_of<int32_t>(to.getShape())));
++    r->setAttr("libtt.tile_reinterpret", b.getUnitAttr());
++    return r;
++  };
++  // Arguments (other than slice sources) and slice results: views.
++  b.setInsertionPointToStart(&body);
++  for (BlockArgument arg : body.getArguments()) {
++    if (llvm::all_of(arg.getUsers(), [](Operation *u) {
++          return mlir::isa<ttir::SliceStaticOp>(u);
++        })) {
++      continue;
++    }
++    auto t = mlir::cast<RankedTensorType>(arg.getType());
++    auto view = reinterpret(arg.getLoc(), arg, widen(t));
++    arg.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
++      return use.getOwner() != view &&
++             !mlir::isa<ttir::SliceStaticOp>(use.getOwner());
++    });
++  }
++  for (Operation &op : llvm::make_early_inc_range(body.without_terminator())) {
++    if (auto slice = mlir::dyn_cast<ttir::SliceStaticOp>(op)) {
++      b.setInsertionPointAfter(slice);
++      auto view = reinterpret(slice.getLoc(), slice.getResult(),
++                              widen(slice.getType()));
++      slice.getResult().replaceAllUsesExcept(view.getResult(), view);
++      continue;
++    }
++    if (mlir::isa<ttir::ReshapeOp>(op)) {
++      continue;
++    }
++    for (Value r : op.getResults()) {
++      r.setType(widen(mlir::cast<RankedTensorType>(r.getType())));
++    }
++    if (auto full = mlir::dyn_cast<ttir::FullOp>(op)) {
++      auto t = mlir::cast<RankedTensorType>(full.getType());
++      full.setShapeAttr(b.getDenseI32ArrayAttr(
++          llvm::to_vector_of<int32_t>(t.getShape())));
++    }
++  }
++  auto ret = mlir::cast<func::ReturnOp>(body.getTerminator());
++  b.setInsertionPoint(ret);
++  for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
++    auto to = mlir::cast<RankedTensorType>(func.getResultTypes()[i]);
++    if (v.getType() != to) {
++      ret.setOperand(i, reinterpret(ret.getLoc(), v, to).getResult());
++    }
++  }
++  func->setAttr("libtt.wide_rows", b.getUnitAttr());
++  return true;
++}
++
 +bool rewriteHeadMajorSubgraph(func::FuncOp func) {
 +
 +  if (func.getBody().getBlocks().size() != 1) {
@@ -4497,7 +4728,8 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +    if (t && t.getRank() < 3 &&
 +        mlir::isa<mlir::tt::ttir::ElementwiseUnary,
 +                  mlir::tt::ttir::ElementwiseBinary,
-+                  mlir::tt::ttir::TypecastOp>(op) &&
++                  mlir::tt::ttir::TypecastOp, mlir::tt::ttir::SliceStaticOp>(
++            op) &&
 +        llvm::all_of(op.getOperandTypes(), [](Type type) {
 +          return mlir::cast<RankedTensorType>(type).getRank() < 3;
 +        })) {
@@ -4522,6 +4754,13 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 +  }
 +  if (!llvm::any_of(inputs, [](auto p) { return p.second == Kind::Split; })) {
 +    return false;
++  }
++  // Rank-3 arguments keep TTNN's [T, H, D] layout: only single elements.
++  for (BlockArgument arg : body.getArguments()) {
++    auto t = mlir::cast<RankedTensorType>(arg.getType());
++    if (t.getRank() == 3 && t.getNumElements() != 1 && !arg.use_empty()) {
++      return false;
++    }
 +  }
 +  if (group) {
 +    return rewriteGroupMajor(func, outReshape, inputs, T, H, D);
@@ -4593,6 +4832,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
    addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
    addElementwiseBinaryOpsConversionPatterns(ctx, patterns, typeConverter);
 +  patterns.add<TTNNToTTIRReshapePattern, TTNNToTTIRPermutePattern,
++               TTNNToTTIRSlicePattern,
 +               TTNNNormDecompositionPattern<mlir::tt::ttnn::RMSNormOp>,
 +               TTNNNormDecompositionPattern<mlir::tt::ttnn::RMSNormGatedOp>>(
 +      typeConverter, ctx);
@@ -5734,6 +5974,23 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
      MLIRContext *ctx = &getContext();
      RewritePatternSet patterns(ctx);
      patterns.add<FuseD2MElementwiseOpsPattern>(ctx);
+diff --git a/lib/Dialect/D2M/Transforms/GenericRegionsToFuncs.cpp b/lib/Dialect/D2M/Transforms/GenericRegionsToFuncs.cpp
+--- a/lib/Dialect/D2M/Transforms/GenericRegionsToFuncs.cpp
++++ b/lib/Dialect/D2M/Transforms/GenericRegionsToFuncs.cpp
+@@ -199,6 +199,13 @@ public:
+                               {}));
+         func.setPrivate();
+         func->setAttr(d2m::ThreadAttr::name, threadAttrWithoutSym);
++        // libtt: the row count of a D2M subgraph's values (TTNNToTTIR) for
++        // its kernels.
++        if (auto parent = generic->getParentOfType<func::FuncOp>()) {
++          if (Attribute rows = parent->getAttr("libtt.tile_rows")) {
++            func->setAttr("libtt.tile_rows", rows);
++          }
++        }
+         if (physicalCBPortMap) {
+           func->setAttr(getPhysicalCBPortMapAttrName(), physicalCBPortMap);
+         }
 diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
 --- a/lib/Dialect/D2M/Transforms/GridSelection.cpp
 +++ b/lib/Dialect/D2M/Transforms/GridSelection.cpp
@@ -7301,15 +7558,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
-@@ -19,6 +23,7 @@
- #include "llvm/ADT/DenseSet.h"
- #include "llvm/ADT/SetVector.h"
- #include "llvm/ADT/SmallVector.h"
-+#include "llvm/Support/xxhash.h"
+@@ -11,6 +15,7 @@
+ #include "ttmlir/Support/Logger.h"
  
- namespace mlir::tt::ttnn {
- #define GEN_PASS_DEF_TTNNCREATED2MSUBGRAPHS
-@@ -26,12 +31,51 @@ namespace mlir::tt::ttnn {
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/Utils/StaticValueUtils.h"
+ #include "mlir/IR/Builders.h"
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/IRMapping.h"
+@@ -26,12 +31,102 @@ namespace mlir::tt::ttnn {
  
  namespace {
  
@@ -7364,10 +7621,61 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +// the group-major one (16: two heads per tile).
 +static bool headDimSupported(int64_t d) { return d % 32 == 0 || d == 16; }
 +
++// libtt: a slice of whole rows of x [T, N] (T <= 32) at tile-aligned columns:
++// D2M reads it in place (a tile-offset view of x).
++static bool isTileColumnSlice(SliceStaticOp s) {
++  auto in = s.getInput().getType();
++  if (in.getRank() != 2 || in.getDimSize(0) > 32) {
++    return false;
++  }
++  auto b = extractFromIntegerArrayAttr<int32_t>(s.getBegins());
++  auto e = extractFromIntegerArrayAttr<int32_t>(s.getEnds());
++  auto st = extractFromIntegerArrayAttr<int32_t>(s.getStep());
++  return st[0] == 1 && st[1] == 1 && b[0] == 0 && e[0] == in.getDimSize(0) &&
++         b[1] % 32 == 0 && (e[1] % 32 == 0 || e[1] == in.getDimSize(1));
++}
++
++// libtt: heads [h0, h1) sliced from a fused projection x [T, N] viewed as
++// [..., N / D, D] (the leading dims flatten to the T rows; every other dim
++// whole, steps 1). Returns h0 and h1.
++static std::optional<std::pair<int64_t, int64_t>> headSlice(SliceStaticOp s) {
++  auto r = s.getInput().getDefiningOp<ReshapeOp>();
++  if (!r) {
++    return std::nullopt;
++  }
++  auto x = r.getInput().getType();
++  auto v = r.getResult().getType();
++  int64_t k = v.getRank();
++  if (x.getRank() != 2 || k < 2 || x.getDimSize(0) > 32) {
++    return std::nullopt;
++  }
++  int64_t T = x.getDimSize(0), N = x.getDimSize(1), D = v.getDimSize(k - 1);
++  int64_t lead = 1;
++  for (int64_t d = 0; d + 2 < k; ++d) {
++    lead *= v.getDimSize(d);
++  }
++  if (N % D != 0 || v.getDimSize(k - 2) != N / D || lead != T) {
++    return std::nullopt;
++  }
++  auto b = extractFromIntegerArrayAttr<int32_t>(s.getBegins());
++  auto e = extractFromIntegerArrayAttr<int32_t>(s.getEnds());
++  auto st = extractFromIntegerArrayAttr<int32_t>(s.getStep());
++  for (int64_t d = 0; d < k; ++d) {
++    if (st[d] != 1 || (d != k - 2 && (b[d] != 0 || e[d] != v.getDimSize(d)))) {
++      return std::nullopt;
++    }
++  }
++  int64_t h0 = b[k - 2], h1 = e[k - 2];
++  if ((h0 * D) % 32 != 0 || ((h1 * D) % 32 != 0 && h1 * D != N)) {
++    return std::nullopt;
++  }
++  return std::make_pair(h0, h1);
++}
++
  class ElementwiseFusionAnalysis {
  public:
    using FusionGroup = llvm::SmallVector<Operation *>;
-@@ -44,24 +88,255 @@ public:
+@@ -44,24 +139,259 @@ public:
      if (!op) {
        return false;
      }
@@ -7552,6 +7860,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +    if (auto reshape = dyn_cast<ReshapeOp>(op)) {
 +      return isPromotionReshape(reshape);
 +    }
++    if (auto slice = dyn_cast<SliceStaticOp>(op)) {
++      return extended && isTileColumnSlice(slice);
++    }
 +    if (auto spec = dyn_cast<ToTensorSpecOp>(op)) {
 +      auto input = spec.getInput().getType();
 +      auto output = spec.getResult().getType();
@@ -7570,8 +7881,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +    if (extended &&
 +        mlir::isa<RsqrtOp, SqrtOp, SigmoidOp, SignOp, ExpOp, LogOp, SiluOp,
 +                  ReciprocalOp, TanhOp>(op)) {
-+      return true;
-+    }
+       return true;
+     }
 +    // libtt (LIBTT_D2M_EXT): RMS norms (and the SiLU-gated one) over whole
 +    // rows of up to 32 tiles with a row-wide weight, decomposed in
 +    // TTNN->TTIR (TTNNToTTIRNormDecomposition).
@@ -7590,15 +7901,16 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          return false;
 +        }
 +      }
-+      // Decode-sized: larger ones overflowed L1 (whole rows per core).
-+      if (input.getRank() < 2 || bias || !weight ||
-+          input.getShape().back() > 32 * 32 || tileCount(input) > 64 ||
-+          cast<RankedTensorType>(weight.getType()).getNumElements() !=
-+              input.getShape().back()) {
++      // Decode-sized: larger ones overflowed L1 (whole rows per core). The
++      // weight is optional (Inkling 2's clips and value norm have none).
++      if (input.getRank() < 2 || bias || input.getShape().back() > 32 * 32 ||
++          tileCount(input) > 64 ||
++          (weight && cast<RankedTensorType>(weight.getType()).getNumElements() !=
++                         input.getShape().back())) {
 +        return false;
 +      }
-       return true;
-     }
++      return true;
++    }
 +    // Row reductions over the last dimension, keeping it.
 +    if (extended && mlir::isa<MeanOp, SumOp, MaxOp>(op)) {
 +      auto input = cast<RankedTensorType>(op->getOperand(0).getType());
@@ -7631,7 +7943,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
-@@ -69,13 +344,28 @@ public:
+@@ -69,13 +399,28 @@ public:
    }
  
  private:
@@ -7651,13 +7963,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          lastInput = def;
 +        }
 +      }
-+    }
-+    if (!lastInput) {
-+      return true;
      }
 -    for (Value result : op->getResults()) {
 -      for (Operation *user : result.getUsers()) {
 -        if (isAllowedToBeFused(user)) {
++    if (!lastInput) {
++      return true;
++    }
 +    for (Operation *op : group) {
 +      for (Operation *user : op->getUsers()) {
 +        Operation *ancestor = block->findAncestorOpInBlock(*user);
@@ -7666,7 +7978,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            return false;
          }
        }
-@@ -89,16 +379,21 @@ private:
+@@ -89,16 +434,21 @@ private:
      llvm::SmallVector<Operation *> exitOps;
      rootOp->walk([&](Block *block) {
        for (Operation &op : llvm::reverse(*block)) {
@@ -7690,7 +8002,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
          for (Operation *op : group) {
            visitedOps.insert(op);
          }
-@@ -119,41 +414,76 @@ private:
+@@ -119,41 +469,76 @@ private:
      }
    }
  
@@ -7793,7 +8105,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      for (Operation &op : *block) {
        if (fusionSet.contains(&op)) {
          fusionGroup.push_back(&op);
-@@ -162,6 +492,9 @@ private:
+@@ -162,6 +547,9 @@ private:
      return fusionGroup;
    }
  
@@ -7803,7 +8115,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
    llvm::DenseSet<Operation *> visitedOps;
    llvm::SmallVector<FusionGroup> fusionGroups;
  };
-@@ -176,14 +509,324 @@ public:
+@@ -176,14 +564,681 @@ public:
    using impl::TTNNCreateD2MSubgraphsBase<
        TTNNCreateD2MSubgraphsPass>::TTNNCreateD2MSubgraphsBase;
  
@@ -7837,6 +8149,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +    if (T > 32 || !headDimSupported(D) || merged.getDimSize(0) != T ||
 +        merged.getDimSize(1) != H * D) {
 +      return false;
++    }
++    // Rank-3 values from outside keep TTNN's layout (heads as rows), not
++    // the rewrite's: only single elements may come in that way.
++    for (Operation *op : group) {
++      for (Value v : op->getOperands()) {
++        auto t = dyn_cast<RankedTensorType>(v.getType());
++        if (!members.contains(v.getDefiningOp()) && t && t.getRank() == 3 &&
++            t.getNumElements() != 1) {
++          return false;
++        }
++      }
 +    }
 +    bool split = false;
 +    for (Operation *op : group) {
@@ -7872,7 +8195,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +        return false;
 +      }
 +      // A norm's row weight serves every head only with whole-tile heads.
-+      if (isa<RMSNormOp, RMSNormGatedOp>(op) && D % 32 != 0) {
++      if (D % 32 != 0 &&
++          (isa<RMSNormGatedOp>(op) ||
++           (isa<RMSNormOp>(op) && cast<RMSNormOp>(op).getWeight()))) {
 +        return false;
 +      }
 +      auto t = dyn_cast<RankedTensorType>(op->getResult(0).getType());
@@ -7900,9 +8225,388 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +           in.getDimSize(1) == out.getDimSize(1) * out.getDimSize(2);
 +  }
 +
++  // libtt: a group with a head split whose one result [T, H, D] leaves only
++  // through reshapes to other shapes (Inkling 2's q into the decode
++  // attention's [1, T, H, D]) merges it to [T, H * D] first, which makes the
++  // group head-major; the reshape from [T, H * D] stays on TTNN.
++  static void addHeadMerge(SmallVector<Operation *> &group) {
++    llvm::DenseSet<Operation *> members(group.begin(), group.end());
++    if (llvm::none_of(group, [](Operation *op) {
++          auto r = dyn_cast<ReshapeOp>(op);
++          return r && isHeadSplit(r);
++        })) {
++      return;
++    }
++    Value out;
++    for (Operation *op : group) {
++      for (Value r : op->getResults()) {
++        if (llvm::any_of(r.getUsers(),
++                         [&](Operation *u) { return !members.contains(u); })) {
++          if (out) {
++            return;
++          }
++          out = r;
++        }
++      }
++    }
++    auto t = out ? dyn_cast<RankedTensorType>(out.getType()) : nullptr;
++    if (!t || t.getRank() != 3 || t.getDimSize(0) > 32 ||
++        !headDimSupported(t.getDimSize(2))) {
++      return;
++    }
++    int64_t T = t.getDimSize(0), HD = t.getDimSize(1) * t.getDimSize(2);
++    SmallVector<ReshapeOp> users;
++    for (Operation *u : out.getUsers()) {
++      if (members.contains(u)) {
++        continue;
++      }
++      auto r = dyn_cast<ReshapeOp>(u);
++      if (!r || r.getType().getShape() == ArrayRef<int64_t>{T, HD}) {
++        return;
++      }
++      users.push_back(r);
++    }
++    SmallVector<int64_t> shape{T, HD};
++    auto mergedType = RankedTensorType::get(
++        shape, t.getElementType(),
++        TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(t.getEncoding()), shape)
++            .build());
++    OpBuilder b(out.getContext());
++    b.setInsertionPointAfterValue(out);
++    auto merge = b.create<ReshapeOp>(
++        out.getLoc(), mergedType, out,
++        b.getI32ArrayAttr(
++            {static_cast<int32_t>(T), static_cast<int32_t>(HD)}));
++    for (ReshapeOp u : users) {
++      u.getInputMutable().assign(merge.getResult());
++    }
++    group.push_back(merge);
++    members.insert(merge);
++    if (!headMajorApplicable(group, members)) {
++      for (ReshapeOp u : users) {
++        u.getInputMutable().assign(out);
++      }
++      group.pop_back();
++      merge.erase();
++    }
++  }
++
++  // libtt: a per-head scale reshaped [H * D] -> [1, H, D] outside the group
++  // (the frontend reshapes Inkling 2's clip scales far ahead of their use)
++  // joins it as a copy, so the head-major rewrite sees the flat input.
++  // Returns each copy with its original (for undoing).
++  static SmallVector<std::pair<ReshapeOp, ReshapeOp>>
++  pullInScaleReshapes(SmallVector<Operation *> &group) {
++    llvm::DenseSet<Operation *> members(group.begin(), group.end());
++    SmallVector<std::pair<ReshapeOp, ReshapeOp>> copies;
++    for (Operation *op : SmallVector<Operation *>(group)) {
++      for (OpOperand &use : op->getOpOperands()) {
++        auto r = use.get().getDefiningOp<ReshapeOp>();
++        if (!r || members.contains(r)) {
++          continue;
++        }
++        auto in = r.getInput().getType();
++        auto out = r.getResult().getType();
++        if (out.getRank() != 3 || out.getDimSize(0) != 1 ||
++            !headDimSupported(out.getDimSize(2)) || in.getRank() > 2 ||
++            in.getShape().back() != out.getDimSize(1) * out.getDimSize(2) ||
++            in.getNumElements() != in.getShape().back()) {
++          continue;
++        }
++        OpBuilder b(op);
++        auto copy = cast<ReshapeOp>(b.clone(*r));
++        use.set(copy.getResult());
++        group.push_back(copy);
++        members.insert(copy);
++        copies.emplace_back(copy, r);
++      }
++    }
++    return copies;
++  }
++
++  // libtt: a slice is a view D2M reads in place; a subgraph cannot return a
++  // view (it returned the sliced tensor whole). A slice whose result leaves
++  // the group stays on TTNN, with a copy in the group for its users there.
++  static void keepEscapingSlicesOnTTNN(SmallVector<Operation *> &group) {
++    llvm::DenseSet<Operation *> members(group.begin(), group.end());
++    SmallVector<Operation *> kept;
++    for (Operation *op : group) {
++      auto slice = dyn_cast<SliceStaticOp>(op);
++      if (!slice || llvm::all_of(slice->getUsers(), [&](Operation *u) {
++            return members.contains(u);
++          })) {
++        kept.push_back(op);
++        continue;
++      }
++      SmallVector<OpOperand *> inside;
++      for (OpOperand &use : slice->getUses()) {
++        if (members.contains(use.getOwner())) {
++          inside.push_back(&use);
++        }
++      }
++      if (inside.empty()) {
++        continue;
++      }
++      OpBuilder b(slice);
++      Operation *copy = b.clone(*slice);
++      for (OpOperand *use : inside) {
++        use->set(copy->getResult(0));
++      }
++      kept.push_back(copy);
++    }
++    group = std::move(kept);
++    if (group.size() == 1 && !isa<RMSNormOp, RMSNormGatedOp>(group[0])) {
++      group.clear();
++    }
++  }
++
++  // libtt: a group with a head split whose one [T, H, D] result is joined
++  // by other escaping values (Inkling 2's first global layer computes the
++  // per-token tau that later layers use too) cannot be head-major. Those
++  // values, and the members only feeding them, stay on TTNN; the group reads
++  // them as inputs.
++  static void dropSideOutputs(SmallVector<Operation *> &group) {
++    llvm::DenseSet<Operation *> members(group.begin(), group.end());
++    if (llvm::none_of(group, [](Operation *op) {
++          auto r = dyn_cast<ReshapeOp>(op);
++          return r && isHeadSplit(r);
++        })) {
++      return;
++    }
++    int heads = 0;
++    llvm::DenseSet<Operation *> removed;
++    for (Operation *op : group) {
++      for (Value r : op->getResults()) {
++        if (llvm::none_of(r.getUsers(),
++                          [&](Operation *u) { return !members.contains(u); })) {
++          continue;
++        }
++        if (cast<RankedTensorType>(r.getType()).getRank() == 3) {
++          ++heads;
++        } else {
++          removed.insert(op);
++        }
++      }
++    }
++    if (heads != 1 || removed.empty()) {
++      return;
++    }
++    for (bool changed = true; changed;) {
++      changed = false;
++      for (Operation *op : group) {
++        if (removed.contains(op) || op->use_empty()) {
++          continue;
++        }
++        bool feedsRemoved = false, feedsKept = false;
++        for (Operation *u : op->getUsers()) {
++          feedsRemoved |= removed.contains(u);
++          feedsKept |= members.contains(u) && !removed.contains(u);
++        }
++        if (feedsRemoved && !feedsKept) {
++          removed.insert(op);
++          changed = true;
++        }
++      }
++    }
++    llvm::erase_if(group, [&](Operation *op) { return removed.contains(op); });
++  }
++
++  // libtt: a group with head splits also holding a per-token scalar chain
++  // (Inkling 2's first global layer computes tau inside its q and rel groups,
++  // joining them into one) leaves that chain on TTNN and becomes one group
++  // per connected part (each can be head-major).
++  static SmallVector<SmallVector<Operation *>>
++  splitHeadGroup(const SmallVector<Operation *> &group) {
++    if (llvm::none_of(group, [](Operation *op) {
++          auto r = dyn_cast<ReshapeOp>(op);
++          return r && isHeadSplit(r);
++        })) {
++      return {group};
++    }
++    auto single = [](Operation *op, bool flatOnly) {
++      return op->getNumResults() > 0 &&
++             llvm::all_of(op->getResultTypes(), [&](Type t) {
++               auto r = dyn_cast<RankedTensorType>(t);
++               return r && r.getNumElements() == 1 &&
++                      (!flatOnly || r.getRank() <= 1);
++             });
++    };
++    // The scalar chain ([1] values) stays on TTNN.
++    SmallVector<Operation *> kept;
++    for (Operation *op : group) {
++      if (!single(op, /*flatOnly=*/true)) {
++        kept.push_back(op);
++      }
++    }
++    if (kept.size() == group.size()) {
++      return {group};
++    }
++    // Parts: connected over values with more than one element; a
++    // single-element op ([1] -> [1, 1, 1]) used by several parts is copied.
++    llvm::DenseSet<Operation *> wide;
++    for (Operation *op : kept) {
++      if (!single(op, /*flatOnly=*/false)) {
++        wide.insert(op);
++      }
++    }
++    llvm::DenseMap<Operation *, int> part;
++    int parts = 0;
++    for (Operation *root : kept) {
++      if (!wide.contains(root) || part.count(root)) {
++        continue;
++      }
++      SmallVector<Operation *> work{root};
++      part[root] = parts;
++      while (!work.empty()) {
++        Operation *op = work.pop_back_val();
++        SmallVector<Operation *> next;
++        for (Value v : op->getOperands()) {
++          if (Operation *d = v.getDefiningOp(); d && wide.contains(d)) {
++            next.push_back(d);
++          }
++        }
++        for (Operation *u : op->getUsers()) {
++          if (wide.contains(u)) {
++            next.push_back(u);
++          }
++        }
++        for (Operation *n : next) {
++          if (part.try_emplace(n, parts).second) {
++            work.push_back(n);
++          }
++        }
++      }
++      ++parts;
++    }
++    SmallVector<SmallVector<Operation *>> result(parts);
++    for (Operation *op : kept) {
++      if (wide.contains(op)) {
++        result[part[op]].push_back(op);
++        continue;
++      }
++      // A single-element op: a copy in every part using it; the original
++      // stays outside for its other users (the per-token tau of later
++      // layers) or goes.
++      for (int k = 0; k < parts; ++k) {
++        SmallVector<OpOperand *> uses;
++        for (OpOperand &use : op->getUses()) {
++          auto it = part.find(use.getOwner());
++          if (it != part.end() && it->second == k) {
++            uses.push_back(&use);
++          }
++        }
++        if (uses.empty()) {
++          continue;
++        }
++        OpBuilder b(op->getContext());
++        b.setInsertionPointAfter(op);
++        Operation *mine = b.clone(*op);
++        for (OpOperand *use : uses) {
++          use->set(mine->getResult(0));
++        }
++        result[k].push_back(mine);
++      }
++      if (op->use_empty()) {
++        op->erase();
++      }
++    }
++    for (auto &r : result) {
++      llvm::sort(r, [](Operation *x, Operation *y) {
++        return x->isBeforeInBlock(y);
++      });
++    }
++    return result;
++  }
++
    void runOnOperation() final {
      ModuleOp moduleOp = getOperation();
  
++    // libtt (LIBTT_D2M_EXT): heads sliced from a fused projection become
++    // the column slice x[:, h0 * D : h1 * D] (read in place by D2M) and the
++    // head split, instead of a reshape of x and a slice of whole heads.
++    if (std::getenv("LIBTT_D2M_EXT")) {
++      IRRewriter rw(&getContext());
++      SmallVector<SliceStaticOp> slices;
++      moduleOp.walk([&](SliceStaticOp s) {
++        if (headSlice(s)) {
++          slices.push_back(s);
++        }
++      });
++      for (SliceStaticOp s : slices) {
++        auto [h0, h1] = *headSlice(s);
++        auto r = s.getInput().getDefiningOp<ReshapeOp>();
++        Value x = r.getInput();
++        auto xType = cast<RankedTensorType>(x.getType());
++        int64_t T = xType.getDimSize(0);
++        int64_t D = r.getResult().getType().getShape().back();
++        SmallVector<int64_t> shape{T, (h1 - h0) * D};
++        auto colType = RankedTensorType::get(
++            shape, xType.getElementType(),
++            TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(xType.getEncoding()),
++                                    shape)
++                .build());
++        rw.setInsertionPoint(s);
++        auto cols = rw.create<SliceStaticOp>(
++            s.getLoc(), colType, x,
++            rw.getI32ArrayAttr({0, static_cast<int32_t>(h0 * D)}),
++            rw.getI32ArrayAttr(
++                {static_cast<int32_t>(T), static_cast<int32_t>(h1 * D)}),
++            rw.getI32ArrayAttr({1, 1}));
++        for (OpOperand &use : llvm::make_early_inc_range(s->getUses())) {
++          if (auto user = dyn_cast<ReshapeOp>(use.getOwner())) {
++            rw.modifyOpInPlace(user, [&] { use.set(cols.getResult()); });
++          }
++        }
++        if (!s->use_empty()) {
++          auto back = rw.create<ReshapeOp>(
++              s.getLoc(), s.getType(), cols.getResult(),
++              rw.getI32ArrayAttr(llvm::to_vector_of<int32_t>(
++                  s.getType().getShape())));
++          rw.replaceAllUsesWith(s.getResult(), back.getResult());
++        }
++        rw.eraseOp(s);
++        if (r->use_empty()) {
++          rw.eraseOp(r);
++        }
++      }
++    }
++
++    // libtt (LIBTT_D2M_EXT): a widening typecast whose only use is a
++    // reshape (Inkling 2's attention output before its gate) widens after
++    // the reshape instead, next to its consumer, where D2M takes it.
++    if (std::getenv("LIBTT_D2M_EXT")) {
++      IRRewriter rw(&getContext());
++      SmallVector<TypecastOp> casts;
++      moduleOp.walk([&](TypecastOp castOp) {
++        auto in = castOp.getInput().getType();
++        auto out = castOp.getResult().getType();
++        if (castOp->hasOneUse() && isa<ReshapeOp>(*castOp->getUsers().begin()) &&
++            in.getElementType().isBF16() && out.getElementType().isF32() &&
++            isa<TTNNLayoutAttr>(in.getEncoding())) {
++          casts.push_back(castOp);
++        }
++      });
++      for (TypecastOp castOp : casts) {
++        auto r = cast<ReshapeOp>(*castOp->getUsers().begin());
++        auto in = castOp.getInput().getType();
++        auto out = r.getResult().getType();
++        auto narrowType = RankedTensorType::get(
++            out.getShape(), in.getElementType(),
++            TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(in.getEncoding()),
++                                    out.getShape())
++                .build());
++        rw.setInsertionPoint(r);
++        Operation *reshape = rw.clone(*r);
++        reshape->setOperand(0, castOp.getInput());
++        reshape->getResult(0).setType(narrowType);
++        Operation *widen = rw.clone(*castOp);
++        widen->setOperand(0, reshape->getResult(0));
++        widen->getResult(0).setType(out);
++        rw.replaceOp(r, widen->getResults());
++        rw.eraseOp(castOp);
++      }
++    }
++
 +    // libtt (LIBTT_D2M_EXT): a head split followed by a narrowing
 +    // typecast (which stays on TTNN) narrows first, so the split joins the
 +    // subgraph: reshape(x) -> typecast becomes typecast(x) -> reshape.
@@ -7987,84 +8691,49 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (fusionGroups.empty()) {
        return;
      }
-+    // TEMP libtt debugging: LIBTT_D2M_EXCLUDE=kind,... keeps groups with an
-+    // op of these kinds on TTNN; LIBTT_D2M_HASH=k:v keeps only groups whose
-+    // signature hash has bit k equal to v (bisection).
-+    if (const char *ex = std::getenv("LIBTT_D2M_EXCLUDE")) {
-+      std::string kinds = std::string(",") + ex + ",";
-+      auto has = [&](const char *k) {
-+        return kinds.find(std::string(",") + k + ",") != std::string::npos;
-+      };
++    if (std::getenv("LIBTT_D2M_EXT")) {
++      SmallVector<ElementwiseFusionAnalysis::FusionGroup> split;
 +      for (auto &group : fusionGroups) {
-+        for (Operation *op : group) {
-+          StringRef n = op->getName().getStringRef();
-+          bool integer = llvm::any_of(op->getResultTypes(), [](Type t) {
-+                           auto r = dyn_cast<RankedTensorType>(t);
-+                           return r && isa<IntegerType>(r.getElementType());
-+                         }) ||
-+                         llvm::any_of(op->getOperandTypes(), [](Type t) {
-+                           auto r = dyn_cast<RankedTensorType>(t);
-+                           return r && isa<IntegerType>(r.getElementType());
-+                         });
-+          bool bf16 = llvm::any_of(op->getResultTypes(), [](Type t) {
-+            auto r = dyn_cast<RankedTensorType>(t);
-+            return r && r.getElementType().isBF16();
-+          });
-+          bool cmp = llvm::is_contained(
-+                         {"ttnn.eq", "ttnn.ne", "ttnn.gt", "ttnn.ge", "ttnn.lt",
-+                          "ttnn.le", "ttnn.logical_and", "ttnn.logical_or",
-+                          "ttnn.logical_not", "ttnn.logical_xor"},
-+                         n) ||
-+                     n.starts_with("ttnn.bitwise");
-+          bool reduce = llvm::is_contained(
-+              {"ttnn.sum", "ttnn.mean", "ttnn.max", "ttnn.min", "ttnn.prod"}, n);
-+          bool norm = n.contains("norm");
-+          bool trans = llvm::is_contained(
-+              {"ttnn.exp", "ttnn.log", "ttnn.sigmoid", "ttnn.silu", "ttnn.tanh",
-+               "ttnn.rsqrt", "ttnn.sqrt", "ttnn.reciprocal", "ttnn.divide",
-+               "ttnn.pow", "ttnn.gelu", "ttnn.erf"},
-+              n);
-+          if ((has("int") && integer) || (has("cmp") && cmp) ||
-+              (has("where") && n == "ttnn.where") ||
-+              (has("reduce") && reduce) || (has("norm") && norm) ||
-+              (has("reshape") && n == "ttnn.reshape") ||
-+              (has("trans") && trans) ||
-+              (has("typecast") && n == "ttnn.typecast") ||
-+              (has("bf16") && bf16) || has("all")) {
-+            group.clear();
-+            break;
++        for (auto &part : splitHeadGroup(group)) {
++          if (part.size() >= 2) {
++            split.push_back(std::move(part));
 +          }
 +        }
 +      }
-+    }
-+    if (const char *hb = std::getenv("LIBTT_D2M_HASH")) {
-+      int bit = std::atoi(hb);
-+      int want = std::strchr(hb, ':') ? std::atoi(std::strchr(hb, ':') + 1) : 1;
-+      for (auto &group : fusionGroups) {
-+        std::string sig;
-+        llvm::raw_string_ostream os(sig);
-+        for (Operation *op : group) {
-+          os << op->getName().getStringRef();
-+          for (Type t : op->getResultTypes()) {
-+            if (auto r = dyn_cast<RankedTensorType>(t)) {
-+              for (int64_t d : r.getShape()) {
-+                os << "x" << d;
-+              }
-+              os << r.getElementType();
-+            }
-+          }
-+          os << ";";
-+        }
-+        uint64_t h = llvm::xxh3_64bits(sig);
-+        if (static_cast<int>((h >> bit) & 1) != want) {
-+          group.clear();
-+        }
-+      }
++      fusionGroups = std::move(split);
 +    }
 +    // The head reshapes are views only after the head-major rewrite, which
 +    // needs the group's head split. Without one, boundary head reshapes stay
 +    // on TTNN; a group with one in the middle is not outlined.
 +    for (auto &group : fusionGroups) {
++      if (std::getenv("LIBTT_D2M_EXT")) {
++        keepEscapingSlicesOnTTNN(group);
++        dropSideOutputs(group);
++        auto copies = pullInScaleReshapes(group);
++        addHeadMerge(group);
++        llvm::DenseSet<Operation *> members(group.begin(), group.end());
++        if (!copies.empty() && !headMajorApplicable(group, members)) {
++          for (auto [copy, original] : copies) {
++            llvm::erase(group, copy.getOperation());
++            copy.getResult().replaceAllUsesWith(original.getResult());
++            copy.erase();
++          }
++        } else {
++          llvm::SetVector<Operation *> originals;
++          for (auto [copy, original] : copies) {
++            originals.insert(original);
++          }
++          for (Operation *original : originals) {
++            if (original->use_empty()) {
++              original->erase();
++            }
++          }
++        }
++        // Outlining clones the group in order: keep it in block order.
++        llvm::sort(group, [](Operation *a, Operation *b) {
++          return a->isBeforeInBlock(b);
++        });
++      }
 +      llvm::DenseSet<Operation *> members(group.begin(), group.end());
 +      bool hasHeadReshape = llvm::any_of(group, [](Operation *op) {
 +        auto r = dyn_cast<ReshapeOp>(op);
@@ -8129,7 +8798,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  
      IRRewriter rewriter(&getContext());
      for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
-@@ -195,6 +838,9 @@ public:
+@@ -195,6 +1250,9 @@ public:
    }
  
  private:
@@ -8139,7 +8808,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
    LogicalResult wrapFusionGroup(llvm::ArrayRef<Operation *> fusionGroup,
                                  IRRewriter &rewriter, unsigned groupIdx) {
      if (fusionGroup.empty()) {
-@@ -216,8 +862,16 @@ private:
+@@ -216,8 +1274,16 @@ private:
        }
      }
  
@@ -8158,7 +8827,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (outputs.empty()) {
        TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
                     "Fusion group {} has no external outputs", groupIdx);
-@@ -229,7 +883,7 @@ private:
+@@ -229,7 +1295,7 @@ private:
      Operation *lastInputDefiner = nullptr;
      for (Value v : inputs) {
        Operation *defOp = v.getDefiningOp();
@@ -8167,7 +8836,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
          lastInputDefiner = defOp;
        }
-@@ -244,14 +898,27 @@ private:
+@@ -244,14 +1310,27 @@ private:
      // Get device for creating empty output buffers for DPS.
      auto device = utils::getOrInsertDevice(rewriter, firstOp);
      llvm::SmallVector<Type> inputTypes;
@@ -8198,7 +8867,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        outputTypes.push_back(tensorType);
  
        auto shapeAttr =
-@@ -272,14 +939,19 @@ private:
+@@ -272,14 +1351,19 @@ private:
        return firstOp->emitError("Could not find parent module");
      }
  
@@ -8220,7 +8889,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      Block *funcBlock = funcOp.addEntryBlock();
      rewriter.setInsertionPointToStart(funcBlock);
  
-@@ -289,7 +961,41 @@ private:
+@@ -289,7 +1373,41 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -8263,7 +8932,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +1012,20 @@ private:
+@@ -306,12 +1424,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(
