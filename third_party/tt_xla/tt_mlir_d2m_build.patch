@@ -154,7 +154,23 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 --- a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 +++ b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
-@@ -623,12 +623,21 @@ def TTKernel_UnaryBcastInitOp : TTKernel_InitOp<"unary_bcast_init"> {
+@@ -190,6 +190,15 @@ def TTKernel_PackReconfigDataFormatOp : TTKernel_Op<"pack_reconfig_data_format">
+     }];
+ }
+ 
++// libtt: 16-bit unary broadcasts unpack through srcB.
++def TTKernel_ReconfigDataFormatSrcBOp : TTKernel_Op<"reconfig_data_format_srcb"> {
++    let summary = "Reconfigure Src B data format for the given input CB.";
++    let arguments = (ins TTKernel_CB:$in_cb);
++    let assemblyFormat = [{
++      `(` $in_cb `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
+ def TTKernel_ReconfigDataFormatSrcAOp : TTKernel_Op<"reconfig_data_format_srca"> {
+     let summary = "Reconfigure Src A data format for the given input CB.";
+     let description = [{
+@@ -623,12 +632,21 @@ def TTKernel_UnaryBcastInitOp : TTKernel_InitOp<"unary_bcast_init"> {
      }];
  
      let arguments = (ins TTKernel_CB:$in_cb,
@@ -178,7 +194,7 @@ diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/
      }];
  }
  
-@@ -1428,6 +1437,192 @@ def TTKernel_LeBinaryTilesOp : TTKernel_SFPUOp<"le_binary_tile", [TTKernel_Binar
+@@ -1428,6 +1446,192 @@ def TTKernel_LeBinaryTilesOp : TTKernel_SFPUOp<"le_binary_tile", [TTKernel_Binar
      }];
  }
  
@@ -371,7 +387,7 @@ diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/
  def TTKernel_BinaryBitwiseTileInitOp : TTKernel_InitOp<"binary_bitwise_tile_init"> {
      let summary = "Init function for binary bitwise operations (AND, OR, XOR). Refer to documentation for any init function.";
      let description = [{
-@@ -2109,6 +2304,29 @@ def TTKernel_SqrtTileOp : TTKernel_SFPUOp<"sqrt_tile", [TTKernel_UnaryOpTrait]>
+@@ -2109,6 +2313,29 @@ def TTKernel_SqrtTileOp : TTKernel_SFPUOp<"sqrt_tile", [TTKernel_UnaryOpTrait]>
      }];
  }
  
@@ -401,7 +417,7 @@ diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/
  def TTKernel_RsqrtTileInitOp : TTKernel_InitOp<"rsqrt_tile_init"> {
      let summary = "Short init function which configures compute unit for execution of rsqrt_tile.";
      let description = [{
-@@ -3501,23 +3719,24 @@ def TTKernel_UntilizeUninitOp : TTKernel_Op<"untilize_uninit", [TTKernel_LayoutO
+@@ -3501,23 +3728,24 @@ def TTKernel_UntilizeUninitOp : TTKernel_Op<"untilize_uninit", [TTKernel_LayoutO
      }];
  }
  
@@ -731,7 +747,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
                                 std::is_same_v<Op, ttkernel::MulIntTileOp>;
  
  namespace {
-@@ -1198,10 +1320,22 @@ public:
+@@ -1198,10 +1320,26 @@ public:
        auto cb = getCB(rewriter, op.getInput());
        auto dstIdx = getDstIdxFromResult(op.getResult());
        ensureDominatesInsertionPoint(rewriter, dstIdx);
@@ -746,6 +762,10 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
 +                                                          nullptr, outCB);
 +      rewriter.setInsertionPoint(insertionPoint->getBlock(), insertionPoint);
 +      rewriter.create<ttkernel::ReconfigDataFormatSrcAOp>(op->getLoc(), cb);
++      // libtt: a 16-bit operand is broadcast through srcB (tt-metal's
++      // unary_bcast B2D path); its format is set like srcA's (a bf16 tile
++      // read with srcB still in an earlier f32 format was garbage).
++      rewriter.create<ttkernel::ReconfigDataFormatSrcBOp>(op->getLoc(), cb);
 +      rewriter.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, nullptr,
                                                    bcastType);
        rewriter.create<ttkernel::UnaryBcastTileOp>(
@@ -755,7 +775,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else if constexpr (arity == 2) {
        auto dstIdx = getDstIdxFromResult(op.getResult());
        ensureDominatesInsertionPoint(rewriter, dstIdx);
-@@ -1254,18 +1388,47 @@ public:
+@@ -1254,18 +1392,47 @@ public:
        break;
      }
  
@@ -807,7 +827,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  
      std::optional<int64_t> cIdxVal = getConstantIntValue(cIdx);
  
-@@ -1274,29 +1437,16 @@ public:
+@@ -1274,29 +1441,16 @@ public:
        setInsertionPointAfterOperands(rewriter, {cbA, outCB},
                                       /*allowHoisting*/ true);
        rewriter.create<ttkernel::InitSFPUOp>(op->getLoc(), cbA, outCB);
@@ -844,7 +864,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  
        Value seedGuard =
            buildFirstReductionIterationGuard(rewriter, op->getLoc(), op, cIdx);
-@@ -1317,33 +1467,73 @@ public:
+@@ -1317,33 +1471,73 @@ public:
                               "d2m-insert-dst-register-access before lowering");
      }
      Value tempIdx =
@@ -931,7 +951,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      rewriter.eraseOp(op);
      return success();
    }
-@@ -1423,8 +1613,16 @@ public:
+@@ -1423,8 +1617,16 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
@@ -950,7 +970,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else {
        rewriter.create<InitOp>(op->getLoc());
      }
-@@ -1439,8 +1637,12 @@ public:
+@@ -1439,8 +1641,12 @@ public:
            mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
        const auto outDtype =
            mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
@@ -965,7 +985,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      } else if constexpr (std::is_same_v<SFPUOp, ttkernel::ClampScalarTileOp>) {
        auto loc = op->getLoc();
        // The hardware clamp API takes i32 params for both int and float clamps.
-@@ -1577,9 +1779,13 @@ public:
+@@ -1577,9 +1783,13 @@ public:
                                        adaptor.getFalseValue(), dstIdx},
                                       /*allowHoisting*/ false);
        if constexpr (std::is_same_v<ConcreteOp, d2m::TileWhereOp>) {
@@ -982,7 +1002,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
          rewriter.create<ttkernel::WhereTileOp>(
              op->getLoc(), adaptor.getCondition(), adaptor.getTrueValue(),
              adaptor.getFalseValue(), dstIdx, dtype);
-@@ -1629,6 +1835,17 @@ public:
+@@ -1629,6 +1839,17 @@ public:
        return emitFPUTiles(rewriter, op, adaptor, loc);
      }
  
@@ -1000,7 +1020,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      if (lhsFromDst) {
        // LHS from Dst, RHS from Cb (FPU - DEST_TO_SRCA)
        return emitFPUBinaryDestReuse(rewriter, op, adaptor, loc,
-@@ -1737,6 +1954,61 @@ private:
+@@ -1737,6 +1958,61 @@ private:
      return success();
    }
  
@@ -1062,7 +1082,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
    // One operand from Dst, use binary_dest_reuse
    LogicalResult emitFPUBinaryDestReuse(ConversionPatternRewriter &rewriter,
                                         ConcreteOp op,
-@@ -2087,12 +2359,9 @@ public:
+@@ -2087,12 +2363,9 @@ public:
  
      Value inCB = getInCB(rewriter, op);
  
@@ -1077,7 +1097,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      rewriter.setInsertionPoint(insertionPoint->getBlock(), insertionPoint);
  
      // Get the tile index from the input operand.
-@@ -4109,6 +4378,8 @@ void populateD2MToTTKernelPatterns(
+@@ -4109,6 +4382,8 @@ void populateD2MToTTKernelPatterns(
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileCeilOp>,
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileClampScalarOp>,
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileSeluOp>,
@@ -1107,7 +1127,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  #include "ttmlir/Conversion/D2MToTTKernel/D2MToTTKernel.h"
  #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
  
-@@ -42,7 +53,1568 @@ namespace mlir::tt::d2m {
+@@ -42,7 +53,1571 @@ namespace mlir::tt::d2m {
  } // namespace mlir::tt::d2m
  
  namespace {
@@ -1283,7 +1303,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +    ++numOps;
 +    return true;
 +  }
- 
++
 +  // scf.if (cond) { fill_tile_init; fill_tile(k, v) } with no else.
 +  static std::optional<std::pair<Value, ttkernel::FillTileOp>>
 +  conditionalFill(Operation *op) {
@@ -1955,7 +1975,8 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +          group.insert(group.begin(), prev);
 +          continue;
 +        }
-+        if (isa<ttkernel::ReconfigDataFormatSrcAOp>(prev) &&
++        if (isa<ttkernel::ReconfigDataFormatSrcAOp,
++                ttkernel::ReconfigDataFormatSrcBOp>(prev) &&
 +            prev->getOperand(0) == cb) {
 +          group.insert(group.begin(), prev);
 +          continue;
@@ -2152,6 +2173,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +      if (isa<ttkernel::CBPushBackOp, ttkernel::CBWaitFrontOp,
 +              ttkernel::CBPopFrontOp, ttkernel::CBReserveBackOp,
 +              ttkernel::ReconfigDataFormatSrcAOp,
++              ttkernel::ReconfigDataFormatSrcBOp,
 +              ttkernel::PackReconfigDataFormatOp, ttkernel::CopyTileInitOp,
 +              ttkernel::UnaryBcastInitOp, ttkernel::UnaryBcastUninitOp>(
 +              op) &&
@@ -2470,7 +2492,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +        busy[vals[info.out].slot] = false;
 +      }
 +    }
-+
+ 
 +    for (OpInfo &info : infos) {
 +      if (info.out < 0 || info.erase) {
 +        continue;
@@ -2626,7 +2648,8 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
 +        if (isa<arith::ConstantOp>(prev)) {
 +          continue;
 +        }
-+        if (!isa<ttkernel::ReconfigDataFormatSrcAOp, ttkernel::CopyTileInitOp,
++        if (!isa<ttkernel::ReconfigDataFormatSrcAOp,
++                 ttkernel::ReconfigDataFormatSrcBOp, ttkernel::CopyTileInitOp,
 +                 ttkernel::UnaryBcastInitOp>(prev) ||
 +            prev->getOperand(0) != cb) {
 +          break;
@@ -2676,37 +2699,92 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernelPass.cpp b/lib/Conversion
  struct ConvertD2MToTTKernel
      : public d2m::impl::ConvertD2MToTTKernelBase<ConvertD2MToTTKernel> {
  
-@@ -217,6 +1789,36 @@ struct ConvertD2MToTTKernel
+@@ -212,11 +1787,91 @@ struct ConvertD2MToTTKernel
+           funcOp.getLoc(), fabricConnectionManager);
+     }
+ 
++    // TEMP libtt debugging: LIBTT_D2M_TRACE names each kernel function.
++    if (std::getenv("LIBTT_D2M_TRACE")) {
++      llvm::errs() << "libtt d2m-to-ttkernel: " << funcOp.getSymName() << "\n";
++    }
+     if (failed(applyFullConversion(funcOp, target, std::move(patterns)))) {
+       signalPassFailure();
        return;
      }
  
-+    // libtt: one hardware startup per kernel. Each compute op's conversion
-+    // hoists its own compute_kernel_hw_startup / init_sfpu to the kernel
-+    // start (a fused kernel had ten); every op still initializes itself and
-+    // reconfigures its data formats before use, as tt-metal's kernels do
-+    // after their single startup.
-+    {
-+      Operation *firstStartup = nullptr;
-+      SmallVector<Operation *> redundant;
-+      for (Operation &op : funcOp.getBody().front()) {
-+        if (!isa<ttkernel::ComputeKernelHWStartupOp, ttkernel::InitSFPUOp>(
-+                op)) {
-+          continue;
-+        }
-+        if (!firstStartup) {
-+          firstStartup = &op;
-+        } else {
-+          redundant.push_back(&op);
++    // libtt: one hardware startup per kernel, for the kernel's first unpack
++    // and pack. Each compute op's conversion puts its own
++    // compute_kernel_hw_startup / init_sfpu right after its CB definitions (a
++    // fused kernel had ten), so their order says nothing about which op runs
++    // first; the formats a startup sets are not all redone by the later
++    // per-op reconfigurations (a bf16 operand read after an f32 op's startup
++    // was unpacked as f32).
++    if (!funcOp.getBody().empty()) {
++      Block &top = funcOp.getBody().front();
++      SmallVector<Operation *> startups;
++      for (Operation &op : top) {
++        if (isa<ttkernel::ComputeKernelHWStartupOp, ttkernel::InitSFPUOp>(op)) {
++          startups.push_back(&op);
 +        }
 +      }
-+      for (Operation *op : redundant) {
-+        op->erase();
++      auto isCB = [](Value v) { return isa<ttkernel::CBType>(v.getType()); };
++      Value icb0, icb1, ocb;
++      funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) {
++        if (isa<ttkernel::ComputeKernelHWStartupOp, ttkernel::InitSFPUOp,
++                ttkernel::CBWaitFrontOp, ttkernel::CBPopFrontOp,
++                ttkernel::CBReserveBackOp, ttkernel::CBPushBackOp>(op)) {
++          return WalkResult::advance();
++        }
++        SmallVector<Value> cbs;
++        llvm::copy_if(op->getOperands(), std::back_inserter(cbs), isCB);
++        if (cbs.empty()) {
++          return WalkResult::advance();
++        }
++        if (isa<ttkernel::PackTileOp, ttkernel::PackReconfigDataFormatOp>(op)) {
++          if (!ocb) {
++            ocb = cbs.front();
++          }
++        } else if (!icb0) {
++          icb0 = cbs.front();
++          if (cbs.size() > 1 && cbs[1] != icb0) {
++            icb1 = cbs[1];
++          }
++        }
++        return icb0 && ocb ? WalkResult::interrupt() : WalkResult::advance();
++      });
++      if (!startups.empty() && icb0) {
++        // After the definitions of its CBs.
++        Operation *after = nullptr;
++        for (Value v : {icb0, icb1, ocb ? ocb : icb0}) {
++          Operation *def = v ? v.getDefiningOp() : nullptr;
++          if (def && def->getBlock() == &top &&
++              (!after || after->isBeforeInBlock(def))) {
++            after = def;
++          }
++        }
++        OpBuilder b(funcOp.getContext());
++        if (after) {
++          b.setInsertionPointAfter(after);
++        } else {
++          b.setInsertionPointToStart(&top);
++        }
++        b.create<ttkernel::ComputeKernelHWStartupOp>(
++            startups.front()->getLoc(), icb0, icb1, ocb ? ocb : icb0);
++        for (Operation *op : startups) {
++          op->erase();
++        }
 +      }
 +    }
 +
 +    if (std::getenv("LIBTT_D2M_EXT") && !funcOp.getBody().empty() &&
 +        usesFp32Dst(funcOp)) {
++      if (std::getenv("LIBTT_D2M_TRACE")) {
++        llvm::errs() << "libtt dst-resident: " << funcOp.getSymName() << "\n";
++      }
 +      DstResidentRewriter::apply(funcOp);
++      if (std::getenv("LIBTT_D2M_TRACE")) {
++        llvm::errs() << "libtt sfpu chains: " << funcOp.getSymName() << "\n";
++      }
 +      fuseSFPUChains(funcOp);
 +    }
 +
@@ -3572,7 +3650,15 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
      populateArithToEmitCPatterns(typeConverter, patterns);
      populateSCFToEmitCConversionPatterns(patterns, typeConverter);
      populateMemRefToEmitCTypeConversion(typeConverter);
-@@ -2756,6 +2795,18 @@ public:
+@@ -2686,6 +2725,7 @@ public:
+         TTKernelToEmitCOpaqueRewriter<ttkernel::PackUntilizeInitOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::PackUntilizeUninitOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::ReconfigDataFormatSrcAOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::ReconfigDataFormatSrcBOp>,
+         TTKernelToEmitCOpaqueRewriter<
+             ttkernel::ExperimentalPackUntilizeBlockOp>,
+ 
+@@ -2756,6 +2796,18 @@ public:
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddBinaryTilesOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileInitOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileOp>,
@@ -3591,7 +3677,7 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
          TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileOp>,
          TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileInt32Op>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::DivBinaryTilesInitOp>,
-@@ -2862,6 +2913,10 @@ public:
+@@ -2862,6 +2914,10 @@ public:
          TTKernelToEmitCOpaqueRewriter<ttkernel::SeluTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::RandTileInitOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::RandTileOp>,
@@ -3602,7 +3688,7 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
          TTKernelToEmitCOpaqueRewriter<ttkernel::RsqrtTileInitOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::RsqrtTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::SqrtTileInitOp>,
-@@ -2889,6 +2944,7 @@ public:
+@@ -2889,6 +2945,7 @@ public:
          TTKernelToEmitCOpaqueRewriter<ttkernel::ExperimentalWriteColMaskTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::ExperimentalFillArangeTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::UnaryBcastInitOp>,
@@ -3622,12 +3708,12 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPass.cpp b/lib/Conversion/TTNNT
  #include "ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h"
  
  #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
-@@ -94,10 +96,94 @@ struct ConvertTTNNToTTIRPass
+@@ -94,10 +96,139 @@ struct ConvertTTNNToTTIRPass
      if (failed(
              applyFullConversion(getOperation(), target, std::move(patterns)))) {
        signalPassFailure();
 +      return;
-+    }
+     }
 +    // libtt: a subgraph input that is a scalar const-eval constant (a
 +    // load_cached of a function returning one ttnn.full) becomes a ttir.full
 +    // inside the subgraph, which D2M applies as a scalar operand instead of
@@ -3657,10 +3743,55 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPass.cpp b/lib/Conversion/TTNNT
 +          return;
 +        }
 +      }
-     }
++    }
++    dedupeSubgraphs(getOperation());
    }
  
  private:
++  // libtt: a model repeats each subgraph per layer (an Inkling prefill had
++  // 1573 subgraphs, ~100 distinct); identical ones (after the per-dispatch
++  // specializations above) are compiled once, every dispatch calling the
++  // first copy (TTNNCollapseD2M clones the body per dispatch).
++  void dedupeSubgraphs(ModuleOp moduleOp) {
++    llvm::StringMap<func::FuncOp> canonical;
++    llvm::DenseMap<Operation *, func::FuncOp> target;
++    SmallVector<func::FuncOp> duplicates;
++    moduleOp.walk([&](ttnn::D2MSubgraphOp dispatchOp) {
++      func::FuncOp func = dispatchOp.getD2MMainFunc();
++      if (!func || func.getBody().empty()) {
++        return;
++      }
++      auto it = target.find(func.getOperation());
++      if (it == target.end()) {
++        std::string text;
++        llvm::raw_string_ostream os(text);
++        // Without locations (each layer's are its own).
++        func.print(os, OpPrintingFlags()
++                           .printGenericOpForm()
++                           .enableDebugInfo(/*enable=*/false)
++                           .useLocalScope());
++        std::string name = func.getSymName().str();
++        for (size_t pos = text.find(name); pos != std::string::npos;
++             pos = text.find(name, pos)) {
++          text.replace(pos, name.size(), "F");
++        }
++        auto [cit, inserted] = canonical.try_emplace(text, func);
++        it = target.try_emplace(func.getOperation(), cit->second).first;
++        if (!inserted) {
++          duplicates.push_back(func);
++        }
++      }
++      if (it->second != func) {
++        dispatchOp.setD2mFuncAttr(
++            FlatSymbolRefAttr::get(it->second.getSymNameAttr()));
++      }
++    });
++    for (func::FuncOp func : duplicates) {
++      d2mSubgraphs.erase(func);
++      func.erase();
++    }
++  }
++
 +  static std::optional<std::pair<RankedTensorType, Attribute>>
 +  scalarConstant(ModuleOp moduleOp, Value v) {
 +    auto load = v.getDefiningOp<ttcore::LoadCachedOp>();
@@ -4730,7 +4861,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
  }
  
  namespace {
-@@ -715,45 +745,846 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
+@@ -715,45 +745,854 @@ struct FuseD2MEltwiseReductionOpsPattern : public OpRewritePattern<GenericOp> {
  };
  } // namespace
  
@@ -4978,6 +5109,9 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +  DenseMap<Value, Value> producerLocalResults;
 +  SmallVector<Value> consumerYields;
 +  SmallVector<Value> producerYields(producer.getNumResults());
++  // The producer's compute ops (their intermediates are one tile under a
++  // broadcast map).
++  llvm::SmallPtrSet<Operation *, 8> producerOps;
 +  auto cloneBody = [&](GenericOp original) {
 +    for (Operation &op : original.getRegion(0).front()) {
 +      if (auto empty = dyn_cast<tensor::EmptyOp>(op);
@@ -5034,7 +5168,10 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +        }
 +        continue;
 +      }
-+      rewriter.clone(op, mapping);
++      Operation *cloned = rewriter.clone(op, mapping);
++      if (original == producer) {
++        producerOps.insert(cloned);
++      }
 +    }
 +  };
 +  cloneBody(producer);
@@ -5060,8 +5197,10 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +  }
 +  for (Operation &op : block) {
 +    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-+      op.setAttr("d2m.blocking_map",
-+                 AffineMapAttr::get(linalgOp.getIndexingMapsArray().back()));
++      AffineMap map = plan.broadcastProducerMap && producerOps.contains(&op)
++                          ? plan.broadcastProducerMap
++                          : linalgOp.getIndexingMapsArray().back();
++      op.setAttr("d2m.blocking_map", AffineMapAttr::get(map));
 +    }
 +  }
 +  for (auto [i, result] : llvm::enumerate(consumer.getResults())) {
@@ -5981,6 +6120,44 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
    if (!linalgRoot) {
      return true;
    }
+@@ -1661,10 +1725,25 @@ buildIndices(PatternRewriter &rewriter, Location loc,
+     }
+   }
+ 
++  // libtt: every slice spans the footprint of the DST loops around the
++  // access. An operand indexed by fewer of them (a broadcast or scalar tile)
++  // was based at slice * its own extent, inside an earlier slice's tiles (a
++  // [1, 1] operand at DST 1 overwrote the second tile of a two-tile block).
++  int64_t footprint = 1;
++  for (Operation *p = access.op->getParentOp(); p; p = p->getParentOp()) {
++    if (auto loop = dyn_cast<affine::AffineForOp>(p);
++        loop && isDstScopeIV(loop.getInductionVar(), linalgRoot)) {
++      footprint *= getRequiredConstantAffineTripCount(loop);
++    }
++    if (p == linalgRoot) {
++      break;
++    }
++  }
++
+   unsigned numDstDims = dstOperands.size();
+   if (numDstDims == 0) {
+-    AffineMap dstAccessMap =
+-        AffineMap::getConstantMap(dstSlice, rewriter.getContext());
++    AffineMap dstAccessMap = AffineMap::getConstantMap(
++        static_cast<int64_t>(dstSlice) * footprint, rewriter.getContext());
+     return {l1AccessMap, l1AccessIndices, dstAccessMap, {}};
+   }
+ 
+@@ -1678,7 +1757,8 @@ buildIndices(PatternRewriter &rewriter, Location loc,
+   }
+ 
+   AffineExpr linearExpr = getAffineConstantExpr(
+-      static_cast<int64_t>(dstSlice) * stride, rewriter.getContext());
++      static_cast<int64_t>(dstSlice) * std::max(stride, footprint),
++      rewriter.getContext());
+ 
+   for (unsigned i = 0; i < numDstDims; ++i) {
+     AffineExpr dimExpr = getAffineDimExpr(i, rewriter.getContext());
 diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
@@ -7080,19 +7257,59 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
        TTMLIR_DEBUG(ttmlir::LogComponent::RMPropagation,
                     "Stopping RM propagation at op {} as it returns tile "
                     "layout,\n\t output layout: {}",
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp b/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include "llvm/ADT/SetVector.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+ 
+@@ -25,7 +26,8 @@ public:
+ 
+   void runOnOperation() final {
+     ModuleOp moduleOp = getOperation();
+-    SmallVector<func::FuncOp> funcsToDelete;
++    // libtt: deduplicated subgraphs have several dispatches per function.
++    llvm::SetVector<func::FuncOp> funcsToDelete;
+ 
+     moduleOp.walk([&](D2MSubgraphOp dispatchOp) {
+       func::FuncOp mainFunc = dispatchOp.getD2MMainFunc();
+@@ -33,7 +35,7 @@ public:
+         signalPassFailure();
+         return;
+       }
+-      funcsToDelete.push_back(mainFunc);
++      funcsToDelete.insert(mainFunc);
+     });
+ 
+     for (func::FuncOp func : funcsToDelete) {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-@@ -2,6 +2,8 @@
+@@ -2,6 +2,10 @@
  //
  // SPDX-License-Identifier: Apache-2.0
  
 +#include <cstdlib>
++#include <map>
++#include <optional>
 +#include "ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h"
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
-@@ -26,12 +28,42 @@ namespace mlir::tt::ttnn {
+@@ -19,6 +23,7 @@
+ #include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/SetVector.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/Support/xxhash.h"
+ 
+ namespace mlir::tt::ttnn {
+ #define GEN_PASS_DEF_TTNNCREATED2MSUBGRAPHS
+@@ -26,12 +31,51 @@ namespace mlir::tt::ttnn {
  
  namespace {
  
@@ -7115,6 +7332,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(type.getEncoding()), shape)
 +          .build();
 +  return RankedTensorType::get(shape, type.getElementType(), layout);
++}
++
++// libtt: a reshape the outliner drops (one element, the same shape once
++// promoted to rank 2); any other reshape is a view D2M only gets right after
++// the head-major rewrite.
++static bool isPromotionReshape(ReshapeOp r) {
++  return r.getInput().getType().getNumElements() == 1 &&
++         normalizeSubgraphType(r.getInput().getType()) ==
++             normalizeSubgraphType(r.getResult().getType());
 +}
 +
 +// Grow schedulable elementwise groups backwards. Intermediate values may
@@ -7141,7 +7367,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  class ElementwiseFusionAnalysis {
  public:
    using FusionGroup = llvm::SmallVector<Operation *>;
-@@ -44,24 +76,242 @@ public:
+@@ -44,24 +88,255 @@ public:
      if (!op) {
        return false;
      }
@@ -7188,6 +7414,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +                               : size;
 +      }
 +      if (tiles > maxTiles) {
++        return false;
++      }
++      // libtt: rank > 2 tensors whose rows are padded to a tile per leading
++      // index past 128 tile rows overflowed L1 (prefill-sized clips).
++      if (extended && type.getRank() > 2 &&
++          type.getDimSize(type.getRank() - 2) % 32 != 0 && tiles > 128) {
 +        return false;
 +      }
 +    }
@@ -7250,6 +7482,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +                       isa<MinimumOp, MaximumOp, ClampTensorOp, AbsOp>(op)))) {
 +        return false;
 +      }
++      // libtt (EXT): integer compares against a broadcast operand gave wrong
++      // tiles (every other one: [1, 1] vs [1, 2112], [1, 1, 1] vs [64, 1, 1]);
++      // those stay on TTNN.
++      if (integer && extended &&
++          isa<EqualOp, NotEqualOp, GreaterThanOp, GreaterEqualOp, LessThanOp,
++              LessEqualOp>(op) &&
++          op->getOperand(0).getType() != op->getOperand(1).getType()) {
++        return false;
++      }
 +    }
 +    if (isa<TypecastOp, ToTensorSpecOp>(op)) {
 +      auto input = cast<RankedTensorType>(op->getOperand(0).getType());
@@ -7309,9 +7550,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      // Otherwise the single-element rule below.
 +    }
 +    if (auto reshape = dyn_cast<ReshapeOp>(op)) {
-+      return reshape.getInput().getType().getNumElements() == 1 &&
-+             normalizeSubgraphType(reshape.getInput().getType()) ==
-+                 normalizeSubgraphType(reshape.getResult().getType());
++      return isPromotionReshape(reshape);
 +    }
 +    if (auto spec = dyn_cast<ToTensorSpecOp>(op)) {
 +      auto input = spec.getInput().getType();
@@ -7331,8 +7570,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +    if (extended &&
 +        mlir::isa<RsqrtOp, SqrtOp, SigmoidOp, SignOp, ExpOp, LogOp, SiluOp,
 +                  ReciprocalOp, TanhOp>(op)) {
-       return true;
-     }
++      return true;
++    }
 +    // libtt (LIBTT_D2M_EXT): RMS norms (and the SiLU-gated one) over whole
 +    // rows of up to 32 tiles with a row-wide weight, decomposed in
 +    // TTNN->TTIR (TTNNToTTIRNormDecomposition).
@@ -7358,8 +7597,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +              input.getShape().back()) {
 +        return false;
 +      }
-+      return true;
-+    }
+       return true;
+     }
 +    // Row reductions over the last dimension, keeping it.
 +    if (extended && mlir::isa<MeanOp, SumOp, MaxOp>(op)) {
 +      auto input = cast<RankedTensorType>(op->getOperand(0).getType());
@@ -7392,7 +7631,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
-@@ -69,13 +319,28 @@ public:
+@@ -69,13 +344,28 @@ public:
    }
  
  private:
@@ -7412,13 +7651,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          lastInput = def;
 +        }
 +      }
++    }
++    if (!lastInput) {
++      return true;
      }
 -    for (Value result : op->getResults()) {
 -      for (Operation *user : result.getUsers()) {
 -        if (isAllowedToBeFused(user)) {
-+    if (!lastInput) {
-+      return true;
-+    }
 +    for (Operation *op : group) {
 +      for (Operation *user : op->getUsers()) {
 +        Operation *ancestor = block->findAncestorOpInBlock(*user);
@@ -7427,12 +7666,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            return false;
          }
        }
-@@ -89,16 +354,21 @@ private:
+@@ -89,16 +379,21 @@ private:
      llvm::SmallVector<Operation *> exitOps;
      rootOp->walk([&](Block *block) {
        for (Operation &op : llvm::reverse(*block)) {
 -        if (isFusionGroupExit(&op) && !visitedOps.contains(&op)) {
-+        if (isAllowedToBeFused(&op) && !visitedOps.contains(&op)) {
++        if (allowed(&op) && !visitedOps.contains(&op)) {
            exitOps.push_back(&op);
          }
        }
@@ -7451,59 +7690,96 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
          for (Operation *op : group) {
            visitedOps.insert(op);
          }
-@@ -119,41 +389,40 @@ private:
+@@ -119,41 +414,76 @@ private:
      }
    }
  
 -  // DFS backward from exit op and include producer only if all its consumers
 -  // are in the fusion set.
-   FusionGroup buildFusionGroup(Operation *exitOp) {
+-  FusionGroup buildFusionGroup(Operation *exitOp) {
 -    llvm::DenseSet<Operation *> fusionSet;
 -    llvm::SmallVector<Operation *> stack;
 -
 -    fusionSet.insert(exitOp);
 -    stack.push_back(exitOp);
--
++  // libtt: isAllowedToBeFused depends only on the op; scanning every op of
++  // the block for every group made outlining quadratic (25 s of a 67 s
++  // compile of a 64-token Inkling prefill).
++  bool allowed(Operation *op) {
++    auto [it, inserted] = allowedCache.try_emplace(op, false);
++    if (inserted) {
++      it->second = isAllowedToBeFused(op);
++    }
++    return it->second;
++  }
+ 
 -    while (!stack.empty()) {
 -      Operation *cur = stack.pop_back_val();
--
++  unsigned position(Operation *op) {
++    Block *block = op->getBlock();
++    if (positionsBlock != block) {
++      positions.clear();
++      unsigned i = 0;
++      for (Operation &o : *block) {
++        positions[&o] = i++;
++      }
++      positionsBlock = block;
++    }
++    return positions.lookup(op);
++  }
+ 
 -      for (Value operand : cur->getOperands()) {
 -        Operation *producer = operand.getDefiningOp();
 -        if (!producer || !isAllowedToBeFused(producer) ||
 -            visitedOps.contains(producer) || fusionSet.contains(producer)) {
++  // Grows the group as a scan of the block in order would (an op joins when
++  // it is connected to the group at the time the scan reaches it, and the
++  // group stays schedulable), visiting only the group's neighbours.
++  FusionGroup buildFusionGroup(Operation *exitOp) {
 +    llvm::DenseSet<Operation *> fusionSet{exitOp};
 +    Block *block = exitOp->getBlock();
++    std::map<unsigned, Operation *> queue;
++    auto pushNeighbours = [&](Operation *op, unsigned after, bool any) {
++      for (Value input : op->getOperands()) {
++        Operation *def = input.getDefiningOp();
++        if (def && def->getBlock() == block &&
++            (any || position(def) > after)) {
++          queue.emplace(position(def), def);
++        }
++      }
++      for (Operation *user : op->getUsers()) {
++        if (user->getBlock() == block && (any || position(user) > after)) {
++          queue.emplace(position(user), user);
++        }
++      }
++    };
 +    bool changed;
 +    do {
 +      changed = false;
-+      for (Operation &candidate : *block) {
-+        Operation *op = &candidate;
-+        if (!isAllowedToBeFused(op) || visitedOps.contains(op) ||
-+            fusionSet.contains(op)) {
++      queue.clear();
++      for (Operation *op : fusionSet) {
++        pushNeighbours(op, 0, /*any=*/true);
++      }
++      while (!queue.empty()) {
++        auto [pos, op] = *queue.begin();
++        queue.erase(queue.begin());
++        if (!allowed(op) || visitedOps.contains(op) || fusionSet.contains(op)) {
            continue;
          }
 -
 -        // All consumers of producers must be in the fusion group set
 -        bool allConsumersInSet =
 -            llvm::all_of(producer->getUsers(), [&](Operation *user) {
-+        bool connected =
-+            llvm::any_of(op->getOperands(),
-+                         [&](Value input) {
-+                           return fusionSet.contains(input.getDefiningOp());
-+                         }) ||
-+            llvm::any_of(op->getUsers(), [&](Operation *user) {
-               return fusionSet.contains(user);
-             });
+-              return fusionSet.contains(user);
+-            });
 -
 -        if (allConsumersInSet) {
 -          fusionSet.insert(producer);
 -          stack.push_back(producer);
-+        if (!connected) {
-+          continue;
-+        }
 +        fusionSet.insert(op);
 +        if (isSchedulable(fusionSet, block)) {
 +          changed = true;
++          pushNeighbours(op, pos, /*any=*/false);
 +        } else {
 +          fusionSet.erase(op);
          }
@@ -7517,7 +7793,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      for (Operation &op : *block) {
        if (fusionSet.contains(&op)) {
          fusionGroup.push_back(&op);
-@@ -176,14 +445,221 @@ public:
+@@ -162,6 +492,9 @@ private:
+     return fusionGroup;
+   }
+ 
++  llvm::DenseMap<Operation *, bool> allowedCache;
++  llvm::DenseMap<Operation *, unsigned> positions;
++  Block *positionsBlock = nullptr;
+   llvm::DenseSet<Operation *> visitedOps;
+   llvm::SmallVector<FusionGroup> fusionGroups;
+ };
+@@ -176,14 +509,324 @@ public:
    using impl::TTNNCreateD2MSubgraphsBase<
        TTNNCreateD2MSubgraphsPass>::TTNNCreateD2MSubgraphsBase;
  
@@ -7560,7 +7846,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      if (auto r = dyn_cast<ReshapeOp>(op)) {
 +        auto in = r.getInput().getType();
 +        auto out = r.getResult().getType();
-+        if (in.getNumElements() == 1 && out.getNumElements() == 1) {
++        if (isPromotionReshape(r)) {
 +          continue;
 +        }
 +        if (out.getRank() != 3 || in.getRank() == 0 || in.getRank() > 2) {
@@ -7701,6 +7987,80 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (fusionGroups.empty()) {
        return;
      }
++    // TEMP libtt debugging: LIBTT_D2M_EXCLUDE=kind,... keeps groups with an
++    // op of these kinds on TTNN; LIBTT_D2M_HASH=k:v keeps only groups whose
++    // signature hash has bit k equal to v (bisection).
++    if (const char *ex = std::getenv("LIBTT_D2M_EXCLUDE")) {
++      std::string kinds = std::string(",") + ex + ",";
++      auto has = [&](const char *k) {
++        return kinds.find(std::string(",") + k + ",") != std::string::npos;
++      };
++      for (auto &group : fusionGroups) {
++        for (Operation *op : group) {
++          StringRef n = op->getName().getStringRef();
++          bool integer = llvm::any_of(op->getResultTypes(), [](Type t) {
++                           auto r = dyn_cast<RankedTensorType>(t);
++                           return r && isa<IntegerType>(r.getElementType());
++                         }) ||
++                         llvm::any_of(op->getOperandTypes(), [](Type t) {
++                           auto r = dyn_cast<RankedTensorType>(t);
++                           return r && isa<IntegerType>(r.getElementType());
++                         });
++          bool bf16 = llvm::any_of(op->getResultTypes(), [](Type t) {
++            auto r = dyn_cast<RankedTensorType>(t);
++            return r && r.getElementType().isBF16();
++          });
++          bool cmp = llvm::is_contained(
++                         {"ttnn.eq", "ttnn.ne", "ttnn.gt", "ttnn.ge", "ttnn.lt",
++                          "ttnn.le", "ttnn.logical_and", "ttnn.logical_or",
++                          "ttnn.logical_not", "ttnn.logical_xor"},
++                         n) ||
++                     n.starts_with("ttnn.bitwise");
++          bool reduce = llvm::is_contained(
++              {"ttnn.sum", "ttnn.mean", "ttnn.max", "ttnn.min", "ttnn.prod"}, n);
++          bool norm = n.contains("norm");
++          bool trans = llvm::is_contained(
++              {"ttnn.exp", "ttnn.log", "ttnn.sigmoid", "ttnn.silu", "ttnn.tanh",
++               "ttnn.rsqrt", "ttnn.sqrt", "ttnn.reciprocal", "ttnn.divide",
++               "ttnn.pow", "ttnn.gelu", "ttnn.erf"},
++              n);
++          if ((has("int") && integer) || (has("cmp") && cmp) ||
++              (has("where") && n == "ttnn.where") ||
++              (has("reduce") && reduce) || (has("norm") && norm) ||
++              (has("reshape") && n == "ttnn.reshape") ||
++              (has("trans") && trans) ||
++              (has("typecast") && n == "ttnn.typecast") ||
++              (has("bf16") && bf16) || has("all")) {
++            group.clear();
++            break;
++          }
++        }
++      }
++    }
++    if (const char *hb = std::getenv("LIBTT_D2M_HASH")) {
++      int bit = std::atoi(hb);
++      int want = std::strchr(hb, ':') ? std::atoi(std::strchr(hb, ':') + 1) : 1;
++      for (auto &group : fusionGroups) {
++        std::string sig;
++        llvm::raw_string_ostream os(sig);
++        for (Operation *op : group) {
++          os << op->getName().getStringRef();
++          for (Type t : op->getResultTypes()) {
++            if (auto r = dyn_cast<RankedTensorType>(t)) {
++              for (int64_t d : r.getShape()) {
++                os << "x" << d;
++              }
++              os << r.getElementType();
++            }
++          }
++          os << ";";
++        }
++        uint64_t h = llvm::xxh3_64bits(sig);
++        if (static_cast<int>((h >> bit) & 1) != want) {
++          group.clear();
++        }
++      }
++    }
 +    // The head reshapes are views only after the head-major rewrite, which
 +    // needs the group's head split. Without one, boundary head reshapes stay
 +    // on TTNN; a group with one in the middle is not outlined.
@@ -7708,8 +8068,37 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      llvm::DenseSet<Operation *> members(group.begin(), group.end());
 +      bool hasHeadReshape = llvm::any_of(group, [](Operation *op) {
 +        auto r = dyn_cast<ReshapeOp>(op);
-+        return r && r.getInput().getType().getNumElements() > 1;
++        return r && !isPromotionReshape(r);
 +      });
++      // A leading-dim broadcast of an operand with more than one row (a
++      // [1, H, D] scale over [T, H, D]) is a view D2M only gets right after
++      // the head-major rewrite (dims collapse past the per-index padding).
++      bool slabBroadcast = llvm::any_of(group, [](Operation *op) {
++        if (op->getNumResults() != 1) {
++          return false;
++        }
++        auto out = dyn_cast<RankedTensorType>(op->getResult(0).getType());
++        if (!out || out.getRank() < 3) {
++          return false;
++        }
++        return llvm::any_of(op->getOperands(), [&](Value v) {
++          auto in = dyn_cast<RankedTensorType>(v.getType());
++          if (!in || in.getRank() < 2) {
++            return false;
++          }
++          int64_t pad = out.getRank() - in.getRank();
++          bool leading = false;
++          for (int64_t d = 0; d + 2 < out.getRank(); ++d) {
++            int64_t size = d < pad ? 1 : in.getDimSize(d - pad);
++            leading |= size != out.getDimSize(d);
++          }
++          return leading && in.getDimSize(in.getRank() - 2) != 1;
++        });
++      });
++      if (slabBroadcast && !headMajorApplicable(group, members)) {
++        group.clear();
++        continue;
++      }
 +      if (!hasHeadReshape || headMajorApplicable(group, members)) {
 +        continue;
 +      }
@@ -7717,7 +8106,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      bool drop = false;
 +      for (Operation *op : group) {
 +        auto r = dyn_cast<ReshapeOp>(op);
-+        if (!r || r.getInput().getType().getNumElements() == 1) {
++        if (!r || isPromotionReshape(r)) {
 +          kept.push_back(op);
 +          continue;
 +        }
@@ -7740,7 +8129,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  
      IRRewriter rewriter(&getContext());
      for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
-@@ -216,8 +692,16 @@ private:
+@@ -195,6 +838,9 @@ public:
+   }
+ 
+ private:
++  std::optional<SymbolTable> symbolTable;
++  ModuleOp symbolTableModule;
++
+   LogicalResult wrapFusionGroup(llvm::ArrayRef<Operation *> fusionGroup,
+                                 IRRewriter &rewriter, unsigned groupIdx) {
+     if (fusionGroup.empty()) {
+@@ -216,8 +862,16 @@ private:
        }
      }
  
@@ -7759,7 +8158,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (outputs.empty()) {
        TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
                     "Fusion group {} has no external outputs", groupIdx);
-@@ -229,7 +713,7 @@ private:
+@@ -229,7 +883,7 @@ private:
      Operation *lastInputDefiner = nullptr;
      for (Value v : inputs) {
        Operation *defOp = v.getDefiningOp();
@@ -7768,7 +8167,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
          lastInputDefiner = defOp;
        }
-@@ -244,14 +728,27 @@ private:
+@@ -244,14 +898,27 @@ private:
      // Get device for creating empty output buffers for DPS.
      auto device = utils::getOrInsertDevice(rewriter, firstOp);
      llvm::SmallVector<Type> inputTypes;
@@ -7799,7 +8198,29 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        outputTypes.push_back(tensorType);
  
        auto shapeAttr =
-@@ -289,7 +786,42 @@ private:
+@@ -272,14 +939,19 @@ private:
+       return firstOp->emitError("Could not find parent module");
+     }
+ 
+-    SymbolTable symbolTable(parentModule);
++    // libtt: one symbol table per module (building one per group was
++    // quadratic in the number of outlined functions).
++    if (symbolTableModule != parentModule) {
++      symbolTable.emplace(parentModule);
++      symbolTableModule = parentModule;
++    }
+     OpBuilder::InsertionGuard guard(rewriter);
+     rewriter.setInsertionPointToEnd(parentModule.getBody());
+ 
+     // Create private function at module scope.
+     auto funcOp = func::FuncOp::create(loc, funcName, funcType);
+     funcOp.setPrivate();
+-    symbolTable.insert(funcOp);
++    symbolTable->insert(funcOp);
+     Block *funcBlock = funcOp.addEntryBlock();
+     rewriter.setInsertionPointToStart(funcBlock);
+ 
+@@ -289,7 +961,41 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -7811,8 +8232,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +            mapping.lookup(spec.getInput()));
 +        mapping.map(spec.getResult(), cast.getResult());
 +      } else if (auto reshape = dyn_cast<ReshapeOp>(op);
-+                 reshape && reshape.getInput().getType().getNumElements() ==
-+                                1) {
++                 reshape && isPromotionReshape(reshape)) {
 +        mapping.map(reshape.getResult(), mapping.lookup(reshape.getInput()));
 +      } else {
 +        Operation *clone = rewriter.clone(*op, mapping);
@@ -7843,7 +8263,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +838,20 @@ private:
+@@ -306,12 +1012,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(

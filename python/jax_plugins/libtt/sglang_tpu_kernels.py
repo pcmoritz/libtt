@@ -1349,7 +1349,10 @@ def patch_inkling2_l2_clip(module):
     import torch
 
     def supports_l2_clip(tokens: int) -> bool:
-        return True
+        # LIBTT_INKLING2_L2_CLIP=0 leaves the clips to the compiler (D2M fusion comparisons).
+        import os
+
+        return os.environ.get("LIBTT_INKLING2_L2_CLIP", "1") != "0"
 
     @functools.cache
     def l2_clip_op():
