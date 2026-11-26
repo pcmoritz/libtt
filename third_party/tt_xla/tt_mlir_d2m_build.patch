@@ -167,9 +167,25 @@ diff --git a/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverse
              continue;
            }
          }
-@@ -95,7 +98,8 @@ protected:
+@@ -85,17 +88,20 @@ protected:
+ 
+     } else if constexpr (commuteDirection == CommuteDirection::DOWNWARDS) {
+       for (Value operand : op->getOperands()) {
++        // libtt: the cheap test first; tracesToConstantArgs walks the whole
++        // use-def chain (quadratic when run for every operand of a model).
++        auto tmOperand = operand.getDefiningOp<TMOpType>();
++        if (!tmOperand) {
++          continue;
++        }
+         // We do not want to commute any tms downwards which are already a part
+         // of a consteval-able path
+         if (tracesToConstantArgs(operand)) {
            continue;
          }
+-        auto tmOperand = operand.getDefiningOp<TMOpType>();
+-        if (!tmOperand) {
+-          continue;
+-        }
          if constexpr (std::is_same_v<TMOpType, ttir::ReshapeOp>) {
 -          if (isHighRankReductionReshape(tmOperand)) {
 +          if (isHighRankReductionReshape(tmOperand) ||
@@ -7463,7 +7479,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 +++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-@@ -11,6 +11,8 @@
+@@ -11,16 +11,20 @@
  #include "ttmlir/Conversion/TTNNToEmitPy/TTNNToEmitPy.h"
  #include "ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h"
  #include "ttmlir/Dialect/D2M/Pipelines/D2MPipelines.h"
@@ -7472,7 +7488,80 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
  #include "ttmlir/Dialect/TTCore/Transforms/Passes.h"
  #include "ttmlir/Dialect/TTCore/Utils/PopulateArgumentTypes.h"
-@@ -519,13 +521,9 @@ void createTTIRToTTNNCommonPipeline(
+ #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
++#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/DevicePassesWrapper.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+ #include "ttmlir/Transforms/Passes.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Pass/Pass.h"
+ #include "mlir/Pass/PassManager.h"
+ #include "mlir/Transforms/Passes.h"
+ 
+@@ -35,6 +39,60 @@ std::unique_ptr<Pass> createTTIRPhysicalLayoutsPass();
+ } // namespace mlir::tt::ttir
+ 
+ namespace mlir::tt::ttnn {
++namespace {
++// libtt: the D2M stage (subgraph lowering, collapse, cleanup) as a dynamic
++// pipeline that runs only on modules with D2M subgraphs. Building and
++// initializing its ~70 passes cost ~6 ms per compile, and most programs of a
++// served model (hundreds of small ones) have none.
++class RunD2MStageIfSubgraphs
++    : public PassWrapper<RunD2MStageIfSubgraphs, OperationPass<ModuleOp>> {
++public:
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RunD2MStageIfSubgraphs)
++
++  explicit RunD2MStageIfSubgraphs(bool elementwiseFusion)
++      : elementwiseFusion(elementwiseFusion) {}
++  RunD2MStageIfSubgraphs(const RunD2MStageIfSubgraphs &other)
++      : PassWrapper(other), elementwiseFusion(other.elementwiseFusion) {}
++
++  StringRef getArgument() const final {
++    return "ttnn-run-d2m-stage-if-subgraphs";
++  }
++  StringRef getName() const final { return "TTNNRunD2MStageIfSubgraphs"; }
++
++  void getDependentDialects(DialectRegistry &registry) const override {
++    buildStage().getDependentDialects(registry);
++  }
++
++  void runOnOperation() final {
++    bool any = false;
++    getOperation().walk([&](D2MSubgraphOp) {
++      any = true;
++      return WalkResult::interrupt();
++    });
++    if (!any) {
++      return;
++    }
++    OpPassManager stage = buildStage();
++    if (failed(runPipeline(stage, getOperation()))) {
++      signalPassFailure();
++    }
++  }
++
++private:
++  OpPassManager buildStage() const {
++    OpPassManager pm(ModuleOp::getOperationName());
++    TTNNPipelineD2MPassOptions d2mOptions;
++    d2mOptions.enableElementwiseFusion = elementwiseFusion;
++    createTTNNPipelineD2MPass(pm, d2mOptions);
++    pm.addPass(createTTNNCollaspeD2M());
++    pm.addPass(createCanonicalizerPass());
++    return pm;
++  }
++
++  bool elementwiseFusion;
++};
++} // namespace
++
+ //===----------------------------------------------------------------------===//
+ // Helper functions which combine multiple passes into logical groupings.
+ //===----------------------------------------------------------------------===//
+@@ -519,13 +577,9 @@ void createTTIRToTTNNCommonPipeline(
      devicePm.addPass(createTTNNSetComputeKernelConfig(setConfigOptions));
  
      if (options.enableCreateD2MSubgraphs) {
@@ -7489,7 +7578,21 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
        devicePm.addPass(tt::ttnn::createTTNNCreateD2MSubgraphs());
      }
  
-@@ -797,6 +795,10 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+@@ -550,11 +604,8 @@ void createTTIRToTTNNCommonPipeline(
+     devicePm.addPass(mlir::tt::ttnn::createTTNNPrepareConv3dWeights());
+ 
+     if (options.enableCreateD2MSubgraphs) {
+-      TTNNPipelineD2MPassOptions d2mOptions;
+-      d2mOptions.enableElementwiseFusion = options.enableD2MElementwiseFusion;
+-      createTTNNPipelineD2MPass(devicePm, d2mOptions);
+-      devicePm.addPass(createTTNNCollaspeD2M());
+-      devicePm.addPass(createCanonicalizerPass());
++      devicePm.addPass(std::make_unique<RunD2MStageIfSubgraphs>(
++          options.enableD2MElementwiseFusion));
+     }
+ 
+     // We need to re-run const-eval to pick up const prepare conv2d weight ops
+@@ -797,6 +848,10 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
    ttmetal::D2MPipelineOptions ttmetalOptions;
    ttmetalOptions.ttnnMode = true;
    ttmetalOptions.enableElementwiseFusion = options.enableElementwiseFusion;
@@ -7675,7 +7778,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  class ElementwiseFusionAnalysis {
  public:
    using FusionGroup = llvm::SmallVector<Operation *>;
-@@ -44,24 +139,259 @@ public:
+@@ -44,24 +139,272 @@ public:
      if (!op) {
        return false;
      }
@@ -7704,6 +7807,19 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +      auto type = mlir::dyn_cast<RankedTensorType>(v.getType());
 +      if (!type) {
 +        continue;
++      }
++      // libtt (LIBTT_D2M_EXT): decode-sized values only: at most one tile row
++      // (32) in the second-to-last dim and at most 32 leading indices (tokens,
++      // or tokens x heads). Prefill subgraphs (64-256 tokens) were a third of
++      // an Inkling 2 server's D2M compile time and run eagerly.
++      if (extended && type.getRank() >= 2) {
++        int64_t leading = 1;
++        for (int64_t d = 0; d + 2 < type.getRank(); ++d) {
++          leading *= type.getDimSize(d);
++        }
++        if (type.getDimSize(type.getRank() - 2) > 32 || leading > 32) {
++          return false;
++        }
 +      }
 +      // libtt (LIBTT_D2M_EXT): multi-core generics beyond the one-core limits.
 +      const int64_t maxElements = extended ? 1000000 : 4096;
@@ -7881,8 +7997,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +    if (extended &&
 +        mlir::isa<RsqrtOp, SqrtOp, SigmoidOp, SignOp, ExpOp, LogOp, SiluOp,
 +                  ReciprocalOp, TanhOp>(op)) {
-       return true;
-     }
++      return true;
++    }
 +    // libtt (LIBTT_D2M_EXT): RMS norms (and the SiLU-gated one) over whole
 +    // rows of up to 32 tiles with a row-wide weight, decomposed in
 +    // TTNN->TTIR (TTNNToTTIRNormDecomposition).
@@ -7909,8 +8025,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +                         input.getShape().back())) {
 +        return false;
 +      }
-+      return true;
-+    }
+       return true;
+     }
 +    // Row reductions over the last dimension, keeping it.
 +    if (extended && mlir::isa<MeanOp, SumOp, MaxOp>(op)) {
 +      auto input = cast<RankedTensorType>(op->getOperand(0).getType());
@@ -7943,7 +8059,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
-@@ -69,13 +399,28 @@ public:
+@@ -69,13 +412,28 @@ public:
    }
  
  private:
@@ -7963,13 +8079,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          lastInput = def;
 +        }
 +      }
++    }
++    if (!lastInput) {
++      return true;
      }
 -    for (Value result : op->getResults()) {
 -      for (Operation *user : result.getUsers()) {
 -        if (isAllowedToBeFused(user)) {
-+    if (!lastInput) {
-+      return true;
-+    }
 +    for (Operation *op : group) {
 +      for (Operation *user : op->getUsers()) {
 +        Operation *ancestor = block->findAncestorOpInBlock(*user);
@@ -7978,7 +8094,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            return false;
          }
        }
-@@ -89,16 +434,21 @@ private:
+@@ -89,16 +447,21 @@ private:
      llvm::SmallVector<Operation *> exitOps;
      rootOp->walk([&](Block *block) {
        for (Operation &op : llvm::reverse(*block)) {
@@ -8002,7 +8118,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
          for (Operation *op : group) {
            visitedOps.insert(op);
          }
-@@ -119,41 +469,76 @@ private:
+@@ -119,49 +482,86 @@ private:
      }
    }
  
@@ -8099,13 +8215,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 -    }
 +    } while (changed);
  
-     // Return ordered fusion group.
-     FusionGroup fusionGroup;
+-    // Return ordered fusion group.
+-    FusionGroup fusionGroup;
 -    Block *block = exitOp->getBlock();
-     for (Operation &op : *block) {
-       if (fusionSet.contains(&op)) {
-         fusionGroup.push_back(&op);
-@@ -162,6 +547,9 @@ private:
+-    for (Operation &op : *block) {
+-      if (fusionSet.contains(&op)) {
+-        fusionGroup.push_back(&op);
+-      }
+-    }
++    // Return ordered fusion group (by position: scanning the block per group
++    // was quadratic).
++    FusionGroup fusionGroup(fusionSet.begin(), fusionSet.end());
++    llvm::sort(fusionGroup, [&](Operation *a, Operation *b) {
++      return position(a) < position(b);
++    });
      return fusionGroup;
    }
  
@@ -8115,7 +8238,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
    llvm::DenseSet<Operation *> visitedOps;
    llvm::SmallVector<FusionGroup> fusionGroups;
  };
-@@ -176,14 +564,681 @@ public:
+@@ -176,14 +576,681 @@ public:
    using impl::TTNNCreateD2MSubgraphsBase<
        TTNNCreateD2MSubgraphsPass>::TTNNCreateD2MSubgraphsBase;
  
@@ -8798,7 +8921,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  
      IRRewriter rewriter(&getContext());
      for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
-@@ -195,6 +1250,9 @@ public:
+@@ -195,6 +1262,9 @@ public:
    }
  
  private:
@@ -8808,7 +8931,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
    LogicalResult wrapFusionGroup(llvm::ArrayRef<Operation *> fusionGroup,
                                  IRRewriter &rewriter, unsigned groupIdx) {
      if (fusionGroup.empty()) {
-@@ -216,8 +1274,16 @@ private:
+@@ -216,8 +1286,16 @@ private:
        }
      }
  
@@ -8827,7 +8950,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (outputs.empty()) {
        TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
                     "Fusion group {} has no external outputs", groupIdx);
-@@ -229,7 +1295,7 @@ private:
+@@ -229,7 +1307,7 @@ private:
      Operation *lastInputDefiner = nullptr;
      for (Value v : inputs) {
        Operation *defOp = v.getDefiningOp();
@@ -8836,7 +8959,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
            (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
          lastInputDefiner = defOp;
        }
-@@ -244,14 +1310,27 @@ private:
+@@ -244,14 +1322,27 @@ private:
      // Get device for creating empty output buffers for DPS.
      auto device = utils::getOrInsertDevice(rewriter, firstOp);
      llvm::SmallVector<Type> inputTypes;
@@ -8867,7 +8990,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        outputTypes.push_back(tensorType);
  
        auto shapeAttr =
-@@ -272,14 +1351,19 @@ private:
+@@ -272,14 +1363,19 @@ private:
        return firstOp->emitError("Could not find parent module");
      }
  
@@ -8889,7 +9012,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      Block *funcBlock = funcOp.addEntryBlock();
      rewriter.setInsertionPointToStart(funcBlock);
  
-@@ -289,7 +1373,41 @@ private:
+@@ -289,7 +1385,41 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -8932,7 +9055,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +1424,20 @@ private:
+@@ -306,12 +1436,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(

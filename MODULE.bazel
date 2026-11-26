@@ -536,6 +536,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_tokens_as_empty_arrays.patch",
         "//third_party/tt_xla:tt_xla_free_donated_inputs.patch",
         "//third_party/tt_xla:tt_xla_d2m_env.patch",
+        "//third_party/tt_xla:tt_xla_verify_once.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )

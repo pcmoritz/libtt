@@ -1,0 +1,30 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -36,6 +36,7 @@
+ #include "mlir/IR/DialectRegistry.h"
+ #include "mlir/IR/OperationSupport.h"
+ #include "mlir/IR/OwningOpRef.h"
++#include "mlir/IR/Verifier.h"
+ #include "mlir/Parser/Parser.h"
+ #include "mlir/Pass/PassManager.h"
+ #include "mlir/Target/Cpp/CppEmitter.h"
+@@ -1500,8 +1501,18 @@
+   enableVerboseIRPrinting(ttir_to_ttnn_pm);
+   enableMlirPassTiming(ttir_to_ttnn_pm);
+ 
++  // libtt: verify the module once after the pipeline, not after each of its
++  // passes (whole-module verification after each of ~200 passes was a third
++  // of a large compile with D2M subgraphs). LIBTT_VERIFY_EACH_PASS=1 restores
++  // the per-pass checks for debugging.
++  const bool verifyEachPass = std::getenv("LIBTT_VERIFY_EACH_PASS") != nullptr;
++  ttir_to_ttnn_pm.enableVerifier(verifyEachPass);
++
+   // Run the pass manager.
+   mlir::LogicalResult mlir_result = ttir_to_ttnn_pm.run(mlir_module.get());
++  if (mlir::succeeded(mlir_result) && !verifyEachPass) {
++    mlir_result = mlir::verify(mlir_module.get().getOperation());
++  }
+ 
+   if (mlir::failed(mlir_result)) {
+     LOG_F(ERROR, "Failed to run TTIRToTTNNCommon pipeline");
