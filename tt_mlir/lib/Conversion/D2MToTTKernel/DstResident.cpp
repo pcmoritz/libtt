@@ -791,6 +791,12 @@ namespace {
 // stay in DST (a broadcast read becomes an in-DST broadcast), allocates DST
 // slices over the whole kernel with one acquire, and packs the kernel's
 // outputs at the end. A kernel that does not fit is left unchanged.
+//
+// A chunk all-reduce (insertChunkAllReduce) sends its partial out of the
+// kernel and reads the exchanged one back: the partial's pack and the copy
+// at the libtt_chunk_allreduce_tile marker stay, with a DST section boundary
+// between them (the release clears DST). Nothing else may be live across
+// it; copies of input tiles are reloaded after it.
 struct DstResidentRewriter {
   func::FuncOp funcOp;
   // Move loads from input CBs to the top (after the acquire), so the
@@ -1066,6 +1072,41 @@ struct DstResidentRewriter {
       }
       ops.push_back(&op);
     }
+    // The chunk all-reduce's partial: its pack and the marker's copy of it.
+    Operation *exchangePack = nullptr, *exchangeLoad = nullptr;
+    SmallVector<ttkernel::LibttChunkAllReduceTileOp> markers;
+    funcOp.walk(
+        [&](ttkernel::LibttChunkAllReduceTileOp m) { markers.push_back(m); });
+    if (markers.size() > 1) {
+      return false;
+    }
+    if (!markers.empty()) {
+      auto slot = ci(markers.front().getTileIndex());
+      for (Operation *op = markers.front()->getPrevNode(); op && slot;
+           op = op->getPrevNode()) {
+        if (auto c = dyn_cast<ttkernel::CopyTileOp>(op);
+            c && ci(c.getTileIndexDst()) == slot) {
+          exchangeLoad = c;
+          break;
+        }
+      }
+      if (!exchangeLoad || !internal.contains(cbOf(exchangeLoad))) {
+        return false;
+      }
+      auto page = ci(exchangeLoad->getOperand(1));
+      for (Operation *op = exchangeLoad->getPrevNode(); op && page;
+           op = op->getPrevNode()) {
+        if (auto p = dyn_cast<ttkernel::PackTileOp>(op);
+            p && p.getOutCb() == cbOf(exchangeLoad) &&
+            ci(p.getOutIndex()) == page) {
+          exchangePack = p;
+          break;
+        }
+      }
+      if (!exchangePack) {
+        return false;
+      }
+    }
 
     // Values: slot -> current value; (cb, tile) -> value.
     std::map<int, int> slotVal;
@@ -1098,6 +1139,10 @@ struct DstResidentRewriter {
       Access acc;
       int in0 = -1, in1 = -1, out = -1;
       bool erase = false, finalPack = false, bcastInternal = false;
+      // The chunk all-reduce's pack (the section boundary).
+      bool exchange = false;
+      // A load of an internal CB tile before anything was packed there.
+      bool undefined = false;
       // A row (not column) broadcast of an internal value.
       bool bcastRow = false;
     };
@@ -1166,7 +1211,20 @@ struct DstResidentRewriter {
         vals.push_back(Val{def, -1, -1});
         return static_cast<int>(vals.size() - 1);
       };
-      if (auto copy = dyn_cast<ttkernel::CopyTileOp>(op)) {
+      if (op == exchangePack) {
+        info.in0 = cur(acc->readSlot0);
+        if (info.in0 < 0) {
+          return false;
+        }
+        use(info.in0, at);
+        info.exchange = true;
+        // Loads after the boundary are new values.
+        externalLoads.clear();
+        internalBcasts.clear();
+      } else if (op == exchangeLoad) {
+        info.out = fresh(op);
+        slotVal[acc->writeSlot] = info.out;
+      } else if (auto copy = dyn_cast<ttkernel::CopyTileOp>(op)) {
         auto tile = ci(copy.getTileIndexCb());
         if (internal.contains(copy.getCb0())) {
           if (!tile) {
@@ -1174,7 +1232,13 @@ struct DstResidentRewriter {
           }
           auto it = regionByCb.find({cbKey(copy.getCb0()), *tile});
           if (it == regionByCb.end()) {
-            return false;
+            // Not packed yet: D2M loads a reduction's accumulator before
+            // overwriting it. Fine if nothing reads it (checked below).
+            info.out = fresh(op);
+            info.undefined = true;
+            slotVal[acc->writeSlot] = info.out;
+            infos.push_back(info);
+            continue;
           }
           // A value that is a plain copy of an input tile is reloaded from
           // that input instead of kept in DST (its pop moves to the end).
@@ -1333,9 +1397,45 @@ struct DstResidentRewriter {
         SFPUChainEmitter probe;
         return !isa<ttkernel::LibttGroupSumTileOp>(op) && probe.add(op);
       };
+      // With at most 8 rows (libtt.tile_rows), a column broadcast of a
+      // row-uniform value (one value per row: the chunk all-reduce's result,
+      // fills, elementwise ops of those) is the identity: computing all of a
+      // few rows costs less than column 0 plus the broadcast (wide norm
+      // 2304: T = 1 5.50 -> 5.26 us, T = 8 5.69 -> 5.57; T = 32 6.49 ->
+      // 6.79).
+      auto rows = funcOp->getAttrOfType<IntegerAttr>("libtt.tile_rows");
+      if (rows && rows.getInt() <= 8) {
+        std::vector<bool> uniform(vals.size(), false);
+        std::vector<int> same(vals.size());
+        for (size_t v = 0; v < vals.size(); ++v) {
+          same[v] = static_cast<int>(v);
+        }
+        auto resolve = [&](int v) { return v < 0 ? v : same[v]; };
+        for (OpInfo &info : infos) {
+          info.in0 = resolve(info.in0);
+          info.in1 = resolve(info.in1);
+          if (info.out < 0) {
+            continue;
+          }
+          if (info.bcastInternal && !info.bcastRow && uniform[info.in0]) {
+            same[info.out] = info.in0;
+            info.erase = true;
+            info.bcastInternal = false;
+            info.out = info.in0 = -1;
+            continue;
+          }
+          uniform[info.out] =
+              isa<ttkernel::LibttChunkAllReduceTileOp, ttkernel::FillTileOp>(
+                  info.op) ||
+              (!info.bcastInternal && elementwise(info.op) &&
+               (info.in0 >= 0 || info.in1 >= 0) &&
+               (info.in0 < 0 || uniform[info.in0]) &&
+               (info.in1 < 0 || uniform[info.in1]));
+        }
+      }
       for (int i = static_cast<int>(infos.size()) - 1; i >= 0; --i) {
         OpInfo &info = infos[i];
-        if (info.finalPack) {
+        if (info.finalPack || info.exchange) {
           need(info.in0, kFull);
         } else if (info.bcastInternal) {
           need(info.in0, info.out >= 0 && demand[info.out] == kNone ? kNone
@@ -1388,6 +1488,29 @@ struct DstResidentRewriter {
         info.erase = true;
         info.out = -1;
         info.in0 = -1;
+      }
+      if (info.undefined && info.out >= 0) {
+        return false;
+      }
+    }
+
+    // Nothing but the partial crosses the exchange's section boundary.
+    if (exchangePack) {
+      int boundary = -1;
+      std::vector<int> defAt(vals.size(), -1);
+      for (size_t i = 0; i < infos.size(); ++i) {
+        if (infos[i].exchange) {
+          boundary = static_cast<int>(i);
+        }
+        if (infos[i].out >= 0) {
+          defAt[infos[i].out] = static_cast<int>(i);
+        }
+      }
+      for (size_t v = 0; v < vals.size(); ++v) {
+        if (defAt[v] >= 0 && defAt[v] < boundary &&
+            vals[v].lastUse > boundary) {
+          return false;
+        }
       }
     }
 
@@ -1527,6 +1650,27 @@ struct DstResidentRewriter {
         tail.push_back(op);
         continue;
       }
+      // The exchange: the partial packed at the end of one section, read
+      // back at the start of the next (their unpacker and packer setup went
+      // with the internal CB's).
+      if (info.exchange) {
+        auto pack = cast<ttkernel::PackTileOp>(op);
+        Location loc = op->getLoc();
+        b.setInsertionPoint(op);
+        b.create<ttkernel::PackReconfigDataFormatOp>(loc, pack.getOutCb());
+        b.create<ttkernel::TileRegsCommitOp>(loc);
+        b.create<ttkernel::TileRegsWaitOp>(loc);
+        pack->setOperand(0, idxConst(op, vals[info.in0].slot));
+        b.setInsertionPointAfter(op);
+        b.create<ttkernel::TileRegsReleaseOp>(loc);
+        b.create<ttkernel::TileRegsAcquireOp>(loc);
+        continue;
+      }
+      if (op == exchangeLoad) {
+        b.setInsertionPoint(op);
+        b.create<ttkernel::ReconfigDataFormatSrcAOp>(op->getLoc(), cbOf(op));
+        b.create<ttkernel::CopyTileInitOp>(op->getLoc(), cbOf(op));
+      }
       if (!isDstOp(op)) {
         continue;
       }
@@ -1567,7 +1711,10 @@ struct DstResidentRewriter {
     // acquire and a release are self-managed: TTKernelControlDstSection adds
     // nothing), then the release.
     b.setInsertionPoint(terminator);
-    b.create<ttkernel::TileRegsCommitOp>(terminator->getLoc());
+    // The first pack's packer setup goes before the commit: the packer
+    // thread does it while math finishes.
+    Operation *commit =
+        b.create<ttkernel::TileRegsCommitOp>(terminator->getLoc());
     b.create<ttkernel::TileRegsWaitOp>(terminator->getLoc());
     for (Operation *op : tail) {
       Operation *prev = op->getPrevNode();
@@ -1575,7 +1722,7 @@ struct DstResidentRewriter {
         prev = prev->getPrevNode();
       }
       if (prev && isa<ttkernel::PackReconfigDataFormatOp>(prev)) {
-        prev->moveBefore(terminator);
+        prev->moveBefore(op == tail.front() ? commit : terminator);
       }
       op->moveBefore(terminator);
     }

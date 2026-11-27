@@ -152,7 +152,16 @@ static void annotateRowMergeCandidates(ModuleOp module) {
         transcendental |= isTranscendental(op->getName().getStringRef());
       });
     }
-    const bool spread = cols > 1 && (rows < 4 || transcendental);
+    // A wide row reduced in chunks (ttir.chunk_allreduce): one chunk per
+    // core, all members on whole chunk rows (d2m.chunk_rows: GridAnalysis
+    // gives each core one tile row, on a virtual grid if needed).
+    bool chunked = false;
+    for (GenericOp g : generics) {
+      g->walk([&](Operation *op) {
+        chunked |= op->getName().getStringRef() == "d2m.tile_chunk_allreduce";
+      });
+    }
+    const bool spread = !chunked && cols > 1 && (rows < 4 || transcendental);
     // Members feeding a reduction (directly or through other members, also
     // through views) must stay on whole rows.
     llvm::SmallPtrSet<Operation *, 16> feedsReduction;
@@ -192,6 +201,9 @@ static void annotateRowMergeCandidates(ModuleOp module) {
           feedsReduction.contains(g) ||
           llvm::all_of(g->getOperands(),
                        [&](Value v) { return tiles(v)->second == 1; });
+      if (chunked) {
+        g->setAttr("d2m.chunk_rows", b.getUnitAttr());
+      }
       if (keepRow) {
         g->setAttr("d2m.unsplit_dims", b.getI64ArrayAttr({1}));
       } else {
@@ -401,6 +413,9 @@ static void mergeRowGroups(ModuleOp module) {
         rewriter.getAffineMapArrayAttr(maps),
         rewriter.getArrayAttr({parallel, parallel}), first.getThreads(),
         first.getFabricConnectionConfigAttr(), /*regions=*/1);
+    if (Attribute chunkRows = first->getAttr("d2m.chunk_rows")) {
+      merged->setAttr("d2m.chunk_rows", chunkRows);
+    }
     if (Attribute unsplit = first->getAttr("d2m.unsplit_dims")) {
       merged->setAttr("d2m.unsplit_dims", unsplit);
     }

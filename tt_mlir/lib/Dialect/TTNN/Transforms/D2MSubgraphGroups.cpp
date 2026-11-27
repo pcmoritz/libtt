@@ -24,6 +24,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include <algorithm>
 #include <map>
 #include <optional>
 
@@ -45,6 +46,44 @@ int64_t tileCount(RankedTensorType t) {
 // Head widths the head-major rewrite handles (multiples of a tile) or
 // the group-major one (16: two heads per tile).
 bool headDimSupported(int64_t d) { return d % 32 == 0 || d == 16; }
+
+std::optional<int64_t> wideNormChunks(Operation *op, RankedTensorType t) {
+  int64_t rank = t.getRank();
+  if (rank < 2 || t.getDimSize(rank - 2) > 32 || t.getDimSize(rank - 1) % 32) {
+    return std::nullopt;
+  }
+  for (int64_t d = 0; d + 2 < rank; ++d) {
+    if (t.getDimSize(d) != 1) {
+      return std::nullopt;
+    }
+  }
+  const int64_t tiles = t.getDimSize(rank - 1) / 32;
+  if (tiles <= 32) {
+    return std::nullopt;
+  }
+  // One chunk per core, the cores a rectangle of the worker grid.
+  ttcore::DeviceAttr device = ttcore::lookupDevice(op);
+  if (!device) {
+    return std::nullopt;
+  }
+  ArrayRef<int64_t> grid = device.getWorkerGrid().getShape();
+  auto fits = [&](int64_t k) {
+    for (int64_t y = 1; y <= std::min(k, grid[0]); ++y) {
+      if (k % y == 0 && k / y <= grid[1]) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // The fewest tiles per core on at most 72 cores (2304 wide, T = 1, with
+  // four-phase kernels: 72 cores 6.13 us, 36 cores 6.77).
+  for (int64_t chunk = 1; chunk <= tiles; ++chunk) {
+    if (tiles % chunk == 0 && tiles / chunk <= 72 && fits(tiles / chunk)) {
+      return tiles / chunk;
+    }
+  }
+  return std::nullopt;
+}
 
 // A slice of whole rows of x [T, N] (T <= 32) at tile-aligned columns:
 // D2M reads it in place (a tile-offset view of x).
@@ -694,7 +733,9 @@ void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &fusionGroups) {
   SmallVector<SmallVector<Operation *>> split;
   for (auto &group : fusionGroups) {
     for (auto &part : splitHeadGroup(group)) {
-      if (part.size() >= 2) {
+      // A composite norm alone is worth a generic (the outliner's rule).
+      if (part.size() >= 2 ||
+          (part.size() == 1 && isa<RMSNormOp, RMSNormGatedOp>(part[0]))) {
         split.push_back(std::move(part));
       }
     }

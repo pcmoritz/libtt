@@ -121,6 +121,11 @@ mlir::Value applyActivations(mlir::OpBuilder &builder, mlir::Location loc,
 
 namespace mlir::tt::d2m_fusion {
 
+static RankedTensorType withShape(RankedTensorType t, ArrayRef<int64_t> shape);
+static mlir::tt::ttir::ReshapeOp reinterpret(mlir::OpBuilder &b,
+                                             mlir::Location loc, mlir::Value v,
+                                             RankedTensorType to);
+
 mlir::Value applyTTNNActivations(mlir::OpBuilder &builder, mlir::Location loc,
                                  mlir::Value value,
                                  mlir::ArrayAttr activations) {
@@ -176,17 +181,82 @@ public:
       }
       return rw.create<ttir::TypecastOp>(loc, retype(t, t.getShape(), f32), v);
     };
+    auto inT = mlir::cast<mlir::RankedTensorType>(adaptor.getInput().getType());
+    int64_t rank = inT.getRank();
+    int64_t width = inT.getShape().back();
+    auto scalar = [&](float value, int64_t r) -> mlir::Value {
+      return rw.create<ttir::FullOp>(
+          loc,
+          mlir::RankedTensorType::get(llvm::SmallVector<int64_t>(r, 1), f32),
+          llvm::SmallVector<int32_t>(r, 1), rw.getF32FloatAttr(value));
+    };
+    const float eps = op.getEpsilon().convertToFloat();
+    // The weight [D] as it came: through the [1, D] -> [D] reshape the
+    // subgraph outlining adds for the TTNN op.
+    auto weightArg = [&]() -> mlir::Value {
+      mlir::Value w = adaptor.getWeight();
+      if (auto flat = w.getDefiningOp<ttir::ReshapeOp>();
+          flat && mlir::cast<mlir::RankedTensorType>(flat.getInput().getType())
+                          .getNumElements() == width) {
+        return flat.getInput();
+      }
+      return w;
+    };
+    // One tile row of more than 32 tiles: reduced in k chunks, one per core.
+    // x as [k, T, N / k] (the same tiles in the same order), each chunk's sum
+    // of squares [k, T, 1], summed over the chunks by an exchange between the
+    // cores inside the kernel (ttir.chunk_allreduce), and the normalized
+    // chunks viewed back: the whole norm is one row-merged kernel.
+    if (auto chunks = wideNormChunks(op, mlir::cast<mlir::RankedTensorType>(
+                                             op->getOperand(0).getType()))) {
+      const int64_t k = *chunks;
+      const int64_t T = inT.getDimSize(rank - 2);
+      auto split = retype(inT, {k, T, width / k}, f32);
+      auto sums = retype(inT, {k, T, 1}, f32);
+      // Views of the arguments (in DRAM), cast after: a view of an
+      // intermediate (sharded in L1 by its producer) addresses it wrongly.
+      auto view = [&](mlir::Value v, int64_t rows) {
+        auto t = mlir::cast<mlir::RankedTensorType>(v.getType());
+        return asF32(
+            reinterpret(rw, loc, v, withShape(t, {k, rows, width / k})));
+      };
+      mlir::Value x = view(adaptor.getInput(), T);
+      mlir::Value squares = rw.create<ttir::MultiplyOp>(loc, split, x, x);
+      mlir::Value part = rw.create<ttir::SumOp>(
+          loc, sums, squares, /*keep_dim=*/true, rw.getI32ArrayAttr({2}));
+      mlir::Value total = rw.create<ttir::ChunkAllReduceOp>(loc, sums, part);
+      mlir::Value mean = rw.create<ttir::MultiplyOp>(
+          loc, sums, total, scalar(1.0f / static_cast<float>(width), 3));
+      mlir::Value var = rw.create<ttir::AddOp>(loc, sums, mean, scalar(eps, 3));
+      // The factors of each element, multiplied in order; the last multiply
+      // is FP32 with the result's encoding, so D2M folds the narrowing into
+      // the pack (a separate typecast would narrow twice).
+      llvm::SmallVector<mlir::Value> factors{
+          x, rw.create<ttir::RsqrtOp>(loc, sums, var)};
+      if (adaptor.getWeight()) {
+        factors.push_back(view(weightArg(), 1));
+      }
+      if constexpr (std::is_same_v<SrcOp, mlir::tt::ttnn::RMSNormGatedOp>) {
+        factors.push_back(
+            rw.create<ttir::SiluOp>(loc, split, view(adaptor.getGate(), T)));
+      }
+      auto outSplit = withShape(outType, {k, T, width / k});
+      auto lastType = mlir::RankedTensorType::get(outSplit.getShape(), f32,
+                                                  outSplit.getEncoding());
+      mlir::Value y = factors.front();
+      for (size_t i = 1; i < factors.size(); ++i) {
+        bool last = i + 1 == factors.size();
+        y = rw.create<ttir::MultiplyOp>(loc, last ? lastType : split, y,
+                                        factors[i]);
+      }
+      if (!outType.getElementType().isF32()) {
+        y = rw.create<ttir::TypecastOp>(loc, outSplit, y);
+      }
+      rw.replaceOp(op, reinterpret(rw, loc, y, outType).getResult());
+      return mlir::success();
+    }
     mlir::Value x = asF32(adaptor.getInput());
     auto xt = mlir::cast<mlir::RankedTensorType>(x.getType());
-    int64_t rank = xt.getRank();
-    int64_t width = xt.getShape().back();
-    auto scalar = [&](float value) -> mlir::Value {
-      llvm::SmallVector<int64_t> ones(rank, 1);
-      llvm::SmallVector<int32_t> onesI32(rank, 1);
-      return rw.create<ttir::FullOp>(loc,
-                                     mlir::RankedTensorType::get(ones, f32),
-                                     onesI32, rw.getF32FloatAttr(value));
-    };
     llvm::SmallVector<int64_t> rowShape(xt.getShape());
     rowShape.back() = 1;
     auto rowType = retype(xt, rowShape, f32);
@@ -195,9 +265,9 @@ public:
         loc, rowType, squares, /*keep_dim=*/true,
         rw.getI32ArrayAttr({static_cast<int32_t>(rank - 1)}));
     mlir::Value mean = rw.create<ttir::MultiplyOp>(
-        loc, rowType, sum, scalar(1.0f / static_cast<float>(width)));
-    mlir::Value var = rw.create<ttir::AddOp>(
-        loc, rowType, mean, scalar(op.getEpsilon().convertToFloat()));
+        loc, rowType, sum, scalar(1.0f / static_cast<float>(width), rank));
+    mlir::Value var =
+        rw.create<ttir::AddOp>(loc, rowType, mean, scalar(eps, rank));
     mlir::Value rstd = rw.create<ttir::RsqrtOp>(loc, rowType, var);
     // The last multiply narrows as TTNN->TTIR's FP32-then-narrow binaries do:
     // FP32 with the result's encoding, then a typecast D2M folds into the pack.
@@ -216,15 +286,8 @@ public:
       return mlir::success();
     }
     mlir::Value normed = rw.create<ttir::MultiplyOp>(loc, xt, x, rstd);
-    // The weight [D] as one row [1, ..., 1, D] (the same tiles); through the
-    // [1, D] -> [D] reshape the subgraph outlining adds for the TTNN op.
-    mlir::Value w = adaptor.getWeight();
-    if (auto flat = w.getDefiningOp<ttir::ReshapeOp>();
-        flat && mlir::cast<mlir::RankedTensorType>(flat.getInput().getType())
-                        .getNumElements() == width) {
-      w = flat.getInput();
-    }
-    w = asF32(w);
+    // The weight [D] as one row [1, ..., 1, D] (the same tiles).
+    mlir::Value w = asF32(weightArg());
     auto wt = mlir::cast<mlir::RankedTensorType>(w.getType());
     if (wt.getRank() != rank) {
       llvm::SmallVector<int64_t> wShape(rank, 1);

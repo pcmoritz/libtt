@@ -2890,13 +2890,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 +++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-@@ -11,16 +11,19 @@
- #include "ttmlir/Conversion/TTNNToEmitPy/TTNNToEmitPy.h"
- #include "ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h"
- #include "ttmlir/Dialect/D2M/Pipelines/D2MPipelines.h"
-+
- #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
- #include "ttmlir/Dialect/TTCore/Transforms/Passes.h"
+@@ -16,11 +16,13 @@
  #include "ttmlir/Dialect/TTCore/Utils/PopulateArgumentTypes.h"
  #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
  #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
@@ -2910,68 +2904,7 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
  #include "mlir/Pass/PassManager.h"
  #include "mlir/Transforms/Passes.h"
  
-@@ -35,6 +38,60 @@ std::unique_ptr<Pass> createTTIRPhysicalLayoutsPass();
- } // namespace mlir::tt::ttir
- 
- namespace mlir::tt::ttnn {
-+namespace {
-+// libtt: the D2M stage (subgraph lowering, collapse, cleanup) as a dynamic
-+// pipeline that runs only on modules with D2M subgraphs. Building and
-+// initializing its ~70 passes cost ~6 ms per compile, and most programs of a
-+// served model (hundreds of small ones) have none.
-+class RunD2MStageIfSubgraphs
-+    : public PassWrapper<RunD2MStageIfSubgraphs, OperationPass<ModuleOp>> {
-+public:
-+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RunD2MStageIfSubgraphs)
-+
-+  explicit RunD2MStageIfSubgraphs(bool elementwiseFusion)
-+      : elementwiseFusion(elementwiseFusion) {}
-+  RunD2MStageIfSubgraphs(const RunD2MStageIfSubgraphs &other)
-+      : PassWrapper(other), elementwiseFusion(other.elementwiseFusion) {}
-+
-+  StringRef getArgument() const final {
-+    return "ttnn-run-d2m-stage-if-subgraphs";
-+  }
-+  StringRef getName() const final { return "TTNNRunD2MStageIfSubgraphs"; }
-+
-+  void getDependentDialects(DialectRegistry &registry) const override {
-+    buildStage().getDependentDialects(registry);
-+  }
-+
-+  void runOnOperation() final {
-+    bool any = false;
-+    getOperation().walk([&](D2MSubgraphOp) {
-+      any = true;
-+      return WalkResult::interrupt();
-+    });
-+    if (!any) {
-+      return;
-+    }
-+    OpPassManager stage = buildStage();
-+    if (failed(runPipeline(stage, getOperation()))) {
-+      signalPassFailure();
-+    }
-+  }
-+
-+private:
-+  OpPassManager buildStage() const {
-+    OpPassManager pm(ModuleOp::getOperationName());
-+    TTNNPipelineD2MPassOptions d2mOptions;
-+    d2mOptions.enableElementwiseFusion = elementwiseFusion;
-+    createTTNNPipelineD2MPass(pm, d2mOptions);
-+    pm.addPass(createTTNNCollaspeD2M());
-+    pm.addPass(createCanonicalizerPass());
-+    return pm;
-+  }
-+
-+  bool elementwiseFusion;
-+};
-+} // namespace
-+
- //===----------------------------------------------------------------------===//
- // Helper functions which combine multiple passes into logical groupings.
- //===----------------------------------------------------------------------===//
-@@ -519,13 +576,9 @@ void createTTIRToTTNNCommonPipeline(
+@@ -519,13 +521,9 @@ void createTTIRToTTNNCommonPipeline(
      devicePm.addPass(createTTNNSetComputeKernelConfig(setConfigOptions));
  
      if (options.enableCreateD2MSubgraphs) {
@@ -2988,7 +2921,7 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
        devicePm.addPass(tt::ttnn::createTTNNCreateD2MSubgraphs());
      }
  
-@@ -550,11 +603,8 @@ void createTTIRToTTNNCommonPipeline(
+@@ -550,11 +548,8 @@ void createTTIRToTTNNCommonPipeline(
      devicePm.addPass(mlir::tt::ttnn::createTTNNPrepareConv3dWeights());
  
      if (options.enableCreateD2MSubgraphs) {
@@ -3002,6 +2935,18 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
      }
  
      // We need to re-run const-eval to pick up const prepare conv2d weight ops
+@@ -799,7 +794,10 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+   ttmetalOptions.enableElementwiseFusion = options.enableElementwiseFusion;
+   ttmetal::createD2MFrontendPipeline(pm, ttmetalOptions);
+   ttmetal::createD2MBackendPipeline(pm, ttmetalOptions);
+-  ttmetal::createD2MToTTKernelPipeline(pm, ttmetalOptions);
++  // libtt: createD2MToTTKernelPipeline split around D2MToTTNN (as the TTNN
++  // backend pipeline orders them), so libtt's chunk all-reduce sees both the
++  // programs and the TTKernel ops.
++  ttmetal::createD2MToTTKernelPreEmitCPipeline(pm, ttmetalOptions);
+   ttmetal::createD2MToTTNNPipeline(pm, ttmetalOptions);
+ }
+ 
 diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp

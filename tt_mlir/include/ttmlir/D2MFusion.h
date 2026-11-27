@@ -53,6 +53,11 @@ void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &groups);
 // and slices of whole rows at tile-aligned columns (read in place).
 int64_t tileCount(RankedTensorType type);
 bool headDimSupported(int64_t width);
+// RMS norms over one tile row ([..., T, N] with T <= 32, leading dims 1) of
+// more than 32 tiles: the number of chunks k the row is reduced in, one per
+// core of a rectangle of op's device ([k, T, N / k], the same tiles in the
+// same order).
+std::optional<int64_t> wideNormChunks(Operation *op, RankedTensorType type);
 bool isTileColumnSlice(ttnn::SliceStaticOp slice);
 
 // A reshape the outliner drops: one element, the same shape once promoted to
@@ -134,11 +139,19 @@ LogicalResult fuseElementwiseProducer(d2m::GenericOp consumer,
 // Whether a compute kernel uses FP32 DST (32-bit CBs): the kernels the two
 // rewrites below apply to.
 bool usesFp32Dst(func::FuncOp kernel);
-// Keeps a whole kernel's values in DST across its phases if they fit; returns
-// whether it did.
+// Keeps a whole kernel's values in DST across its phases if they fit (a chunk
+// all-reduce's kernel in two sections, split where the partial leaves);
+// returns whether it did.
 bool keepKernelInDst(func::FuncOp kernel);
 // Fuses runs of elementwise SFPU tile ops into one SFPI function each.
 void fuseSFPUChains(func::FuncOp kernel);
+
+// After D2MToTTNN (lib/Conversion/D2MToTTKernel/ChunkAllReduce.cpp): each
+// program whose compute kernel has a libtt_chunk_allreduce_tile marker sums
+// the marked partial (row sums) over its cores inside the kernel: the reader
+// gathers every core's row sums on one core, which multicasts them back
+// (new CBs and a new semaphore); the compute phase sums them.
+LogicalResult insertChunkAllReduce(ModuleOp module);
 
 //===----------------------------------------------------------------------===//
 // TTKernelToCpp (lib/Target/TTKernel/SFPUHelpers.cpp)
@@ -149,6 +162,8 @@ void fuseSFPUChains(func::FuncOp kernel);
 llvm::StringRef sfpuChainHelpers();
 llvm::StringRef binaryCompatHelpers();
 llvm::StringRef tileOpHelpers();
+// C++ emitted into data-movement kernels that call libtt_*_dm helpers.
+llvm::StringRef dataMovementHelpers();
 
 } // namespace mlir::tt::d2m_fusion
 

@@ -1,12 +1,18 @@
 diff --git a/include/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.td b/include/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.td
 --- a/include/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.td
 +++ b/include/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.td
-@@ -796,6 +796,23 @@ def D2M_TileClampScalarOp : D2M_GenericRegionComputeUnaryDstOp<"tile_clamp_scala
+@@ -796,6 +796,29 @@ def D2M_TileClampScalarOp : D2M_GenericRegionComputeUnaryDstOp<"tile_clamp_scala
      let hasVerifier = 1;
  }
  
 +def D2M_TileRowToColumnOp : D2M_GenericRegionComputeUnaryDstOp<"tile_row_to_column", D2M_TileComputeOpTraitBundle> {
 +    let summary = "libtt: a tile's row 0 made its columns (element (i, j) = input (0, i))";
++    let arguments = (ins TTCore_Tile:$input);
++    let results = (outs TTCore_Tile:$result);
++}
++
++def D2M_TileChunkAllReduceOp : D2M_GenericRegionComputeUnaryDstOp<"tile_chunk_allreduce", D2M_TileComputeOpTraitBundle> {
++    let summary = "libtt: the tile summed over the cores of the generic's grid (see ttir.chunk_allreduce)";
 +    let arguments = (ins TTCore_Tile:$input);
 +    let results = (outs TTCore_Tile:$result);
 +}
@@ -28,7 +34,7 @@ diff --git a/include/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.td b/include/ttml
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -1357,6 +1357,31 @@ def TTIR_Exp2Op: TTIR_ElementwiseUnaryOp<"exp2"> {
+@@ -1357,6 +1357,43 @@ def TTIR_Exp2Op: TTIR_ElementwiseUnaryOp<"exp2"> {
      }];
  }
  
@@ -39,6 +45,18 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +      tile, the values in its row 0. The result is the column: value i in row i (column 0, and in
 +      libtt's lowering repeated across the row). Lets a per-token [T] factor enter a D2M subgraph
 +      without a TTNN reshape.
++    }];
++
++    let arguments = (ins AnyRankedTensor:$input);
++    let results = (outs AnyRankedTensor:$result);
++}
++
++def TTIR_ChunkAllReduceOp : TTIR_ElementwiseOp<"chunk_allreduce", [OneOperand, TTIR_ElementwiseUnary]> {
++    let summary = "libtt: each chunk's partial [k, T, 1] replaced by the sum over the k chunks.";
++    let description = [{
++      result[i, t, 0] = sum_j input[j, t, 0]: an all-reduce over dim 0. Only for a wide-row reduction
++      split in k chunks of one tile row, one chunk per core of its D2M generic: libtt's lowering
++      exchanges the partial tiles between those cores inside the kernel (d2m_fusion::insertChunkAllReduce).
 +    }];
 +
 +    let arguments = (ins AnyRankedTensor:$input);
@@ -88,7 +106,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverse
 diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 --- a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 +++ b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
-@@ -2313,6 +2313,29 @@ def TTKernel_SqrtTileOp : TTKernel_SFPUOp<"sqrt_tile", [TTKernel_UnaryOpTrait]>
+@@ -2313,6 +2313,38 @@ def TTKernel_SqrtTileOp : TTKernel_SFPUOp<"sqrt_tile", [TTKernel_UnaryOpTrait]>
      }];
  }
  
@@ -98,6 +116,15 @@ diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/
 +
 +def TTKernel_LibttRowToColumnTileOp : TTKernel_SFPUOp<"libtt_row_to_column_tile", [TTKernel_UnaryOpTrait]> {
 +    let summary = "libtt: element (i, j) of the tile in DST becomes its element (0, i), in place";
++    let arguments = (ins IndexLike:$tile_index);
++}
++
++def TTKernel_LibttChunkAllReduceTileInitOp : TTKernel_InitOp<"libtt_chunk_allreduce_tile_init"> {
++    let summary = "libtt: chunk all-reduce init";
++}
++
++def TTKernel_LibttChunkAllReduceTileOp : TTKernel_SFPUOp<"libtt_chunk_allreduce_tile", [TTKernel_UnaryOpTrait]> {
++    let summary = "libtt: the tile in DST summed over the program's cores (the exchange: d2m_fusion::insertChunkAllReduce)";
 +    let arguments = (ins IndexLike:$tile_index);
 +}
 +
@@ -121,21 +148,23 @@ diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/
 diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
 --- a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
 +++ b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
-@@ -977,6 +977,8 @@ using ComputeOpMap = OpMap<
+@@ -977,6 +977,9 @@ using ComputeOpMap = OpMap<
    std::pair<d2m::TileCeilOp,        std::pair<ttkernel::RoundingTileInitOp,        ttkernel::CeilTileOp>>,
    std::pair<d2m::TileClampScalarOp, std::pair<ttkernel::ClampScalarTileInitOp,     ttkernel::ClampScalarTileOp>>,
    std::pair<d2m::TileSeluOp,       std::pair<ttkernel::SeluTileInitOp,            ttkernel::SeluTileOp>>,
 +  std::pair<d2m::TileGroupSumOp,   std::pair<ttkernel::LibttGroupSumTileInitOp,   ttkernel::LibttGroupSumTileOp>>,
 +  std::pair<d2m::TileRowToColumnOp, std::pair<ttkernel::LibttRowToColumnTileInitOp, ttkernel::LibttRowToColumnTileOp>>,
++  std::pair<d2m::TileChunkAllReduceOp, std::pair<ttkernel::LibttChunkAllReduceTileInitOp, ttkernel::LibttChunkAllReduceTileOp>>,
    std::pair<d2m::TileCosOp,         std::pair<ttkernel::CosTileInitOp,             ttkernel::CosTileOp>>,
    std::pair<d2m::TileErfOp,         std::pair<ttkernel::ErfTileInitOp,             ttkernel::ErfTileOp>>,
    std::pair<d2m::TileErfcOp,        std::pair<ttkernel::ErfcTileInitOp,            ttkernel::ErfcTileOp>>,
-@@ -4379,6 +4381,8 @@ void populateD2MToTTKernelPatterns(
+@@ -4379,6 +4382,9 @@ void populateD2MToTTKernelPatterns(
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileCeilOp>,
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileClampScalarOp>,
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileSeluOp>,
 +               ttkernel::D2MSFPUOpsRewriter<d2m::TileGroupSumOp>,
 +               ttkernel::D2MSFPUOpsRewriter<d2m::TileRowToColumnOp>,
++               ttkernel::D2MSFPUOpsRewriter<d2m::TileChunkAllReduceOp>,
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileCosOp>,
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileErfOp>,
                 ttkernel::D2MSFPUOpsRewriter<d2m::TileErfcOp>,
@@ -409,16 +438,17 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  
      // Express the data rearrangement as a view. The allocator will later
      // decide whether to insert a CB allocation for any GenericOp that
-@@ -5411,6 +5471,8 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5411,6 +5471,9 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
      D2MNamedElementwiseRewriter<ttir::SignOp,            d2m::TileSignOp>,
      D2MNamedElementwiseRewriter<ttir::SignbitOp,        d2m::TileSignbitOp>,
      D2MNamedElementwiseRewriter<ttir::SeluOp,           d2m::TileSeluOp>,
 +    D2MNamedElementwiseRewriter<ttir::GroupSumOp,       d2m::TileGroupSumOp>,
 +    D2MNamedElementwiseRewriter<ttir::RowToColumnOp,    d2m::TileRowToColumnOp>,
++    D2MNamedElementwiseRewriter<ttir::ChunkAllReduceOp, d2m::TileChunkAllReduceOp>,
      D2MNamedElementwiseRewriter<ttir::SiluOp,            d2m::TileSiluOp>,
      D2MNamedElementwiseRewriter<ttir::SoftsignOp,       d2m::TileSoftsignOp>,
      D2MNamedElementwiseRewriter<ttir::SinOp,             d2m::TileSinOp>,
-@@ -5536,6 +5598,7 @@ public:
+@@ -5536,6 +5599,7 @@ public:
    void runOnOperation() override {
      MLIRContext *ctx = &getContext();
      ModuleOp module = getOperation();
@@ -475,12 +505,14 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
      populateArithToEmitCPatterns(typeConverter, patterns);
      populateSCFToEmitCConversionPatterns(patterns, typeConverter);
      populateMemRefToEmitCTypeConversion(typeConverter);
-@@ -2889,6 +2914,10 @@ public:
+@@ -2889,6 +2914,12 @@ public:
          TTKernelToEmitCOpaqueRewriter<ttkernel::SeluTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::RandTileInitOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::RandTileOp>,
 +        TTKernelToEmitCOpaqueRewriter<ttkernel::LibttRowToColumnTileInitOp>,
 +        TTKernelToEmitCOpaqueRewriter<ttkernel::LibttRowToColumnTileOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::LibttChunkAllReduceTileInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::LibttChunkAllReduceTileOp>,
 +        TTKernelToEmitCOpaqueRewriter<ttkernel::LibttGroupSumTileInitOp>,
 +        TTKernelToEmitCOpaqueRewriter<ttkernel::LibttGroupSumTileOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::RsqrtTileInitOp>,
@@ -640,6 +672,27 @@ diff --git a/lib/Dialect/D2M/Analysis/GridAnalysis.cpp b/lib/Dialect/D2M/Analysi
      perOperandTargetGrids.push_back(opTarget);
    }
  
+@@ -461,6 +483,20 @@ GenericGridAnalysisResult GridAnalysis::analyzeGenericOp(
+     physicalShapes.push_back(physShape);
+     auto optimalGrid =
+         utils::computeOptimalGrid(operandType, physShape, targetGrid);
++    // libtt: a wide row reduced in chunks (d2m.chunk_rows, RowMerge.cpp) has
++    // one chunk (tile row) per core, on a virtual grid when there are more
++    // chunks than grid rows.
++    if (genericOp->hasAttr("d2m.chunk_rows") && physShape.size() == 2) {
++      const int64_t volume = ttmlir::utils::volume<int64_t>(targetGridShape);
++      for (int64_t f = std::min(physShape[0], volume); f >= 1; --f) {
++        if (physShape[0] % f == 0 &&
++            !utils::findLegalPhysicalGridForVolume(f, targetGridShape)
++                 .empty()) {
++          optimalGrid = {f, 1};
++          break;
++        }
++      }
++    }
+     optimalOperandGrids.push_back(optimalGrid);
+ 
+     OperandGridInfo info;
 diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
 --- a/lib/Dialect/D2M/IR/D2MOps.cpp
 +++ b/lib/Dialect/D2M/IR/D2MOps.cpp
@@ -750,7 +803,30 @@ diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Tran
  
  #include "ttmlir/AffineMapUtils.h"
  #include "ttmlir/Asserts.h"
-@@ -942,6 +944,7 @@ public:
+@@ -805,6 +807,22 @@ static LogicalResult applyGridDecisions(d2m::GenericOp genericOp,
+     genericOp.emitOpError() << "grid selection failed to recreate generic op";
+     return failure();
+   }
++  // libtt: a wide row reduced in chunks (d2m.chunk_rows) with more chunks
++  // than grid rows. Its operands are DRAM-interleaved views (no virtual grid
++  // of their own), so the generic's grid gets the virtual-to-physical maps.
++  if ((*newGenericOp)->hasAttr("d2m.chunk_rows") &&
++      newGenericOp->getGrid().getVirtToPhysicalMap().isEmpty()) {
++    llvm::SmallVector<int64_t> shape(newGenericOp->getGrid().getShape());
++    auto [inverse, forward] =
++        deriveVirtualGridAttrs(shape, effectiveTargetGridRange, builder);
++    if (forward && inverse) {
++      if (auto maps = utils::getGridMapsFromVirtualGridMapping(
++              forward.getAffineMap(), inverse.getAffineMap(), shape)) {
++        newGenericOp->setGridAttr(
++            builder.getAttr<ttcore::GridAttr>(shape, maps->first, maps->second));
++      }
++    }
++  }
+ 
+   normalizeSpatialOpContainingGeneric(*newGenericOp);
+   return success();
+@@ -942,6 +960,7 @@ public:
  
    void runOnOperation() override {
      ModuleOp module = getOperation();
@@ -825,7 +901,100 @@ diff --git a/lib/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.cpp b/l
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 +++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-@@ -847,6 +847,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+@@ -11,6 +11,12 @@
+ #include "ttmlir/Conversion/TTNNToEmitPy/TTNNToEmitPy.h"
+ #include "ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h"
+ #include "ttmlir/Dialect/D2M/Pipelines/D2MPipelines.h"
++#include "ttmlir/D2MFusion.h"
++#include "ttmlir/Dialect/TTKernel/IR/TTKernel.h"
++#include "ttmlir/Dialect/TTKernel/Transforms/Passes.h"
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/EmitC/IR/EmitC.h"
++
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/Transforms/Passes.h"
+ #include "ttmlir/Dialect/TTCore/Utils/PopulateArgumentTypes.h"
+@@ -37,6 +43,79 @@ std::unique_ptr<Pass> createTTIRPhysicalLayoutsPass();
+ } // namespace mlir::tt::ttir
+ 
+ namespace mlir::tt::ttnn {
++namespace {
++// libtt: the D2M stage (subgraph lowering, collapse, cleanup) as a dynamic
++// pipeline that runs only on modules with D2M subgraphs. Building and
++// initializing its ~70 passes cost ~6 ms per compile, and most programs of a
++// served model (hundreds of small ones) have none.
++class RunD2MStageIfSubgraphs
++    : public PassWrapper<RunD2MStageIfSubgraphs, OperationPass<ModuleOp>> {
++public:
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RunD2MStageIfSubgraphs)
++
++  explicit RunD2MStageIfSubgraphs(bool elementwiseFusion)
++      : elementwiseFusion(elementwiseFusion) {}
++  RunD2MStageIfSubgraphs(const RunD2MStageIfSubgraphs &other)
++      : PassWrapper(other), elementwiseFusion(other.elementwiseFusion) {}
++
++  StringRef getArgument() const final {
++    return "ttnn-run-d2m-stage-if-subgraphs";
++  }
++  StringRef getName() const final { return "TTNNRunD2MStageIfSubgraphs"; }
++
++  void getDependentDialects(DialectRegistry &registry) const override {
++    buildStage().getDependentDialects(registry);
++  }
++
++  void runOnOperation() final {
++    bool any = false;
++    getOperation().walk([&](D2MSubgraphOp) {
++      any = true;
++      return WalkResult::interrupt();
++    });
++    if (!any) {
++      return;
++    }
++    OpPassManager stage = buildStage();
++    if (failed(runPipeline(stage, getOperation()))) {
++      signalPassFailure();
++    }
++  }
++
++private:
++  OpPassManager buildStage() const {
++    OpPassManager pm(ModuleOp::getOperationName());
++    TTNNPipelineD2MPassOptions d2mOptions;
++    d2mOptions.enableElementwiseFusion = elementwiseFusion;
++    createTTNNPipelineD2MPass(pm, d2mOptions);
++    pm.addPass(createTTNNCollaspeD2M());
++    pm.addPass(createCanonicalizerPass());
++    return pm;
++  }
++
++  bool elementwiseFusion;
++};
++
++// libtt: the in-kernel chunk all-reduce (d2m_fusion::insertChunkAllReduce),
++// after D2MToTTNN made the programs and before EmitC.
++class ChunkAllReduce
++    : public PassWrapper<ChunkAllReduce, OperationPass<ModuleOp>> {
++public:
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ChunkAllReduce)
++  StringRef getArgument() const final { return "libtt-chunk-allreduce"; }
++  StringRef getName() const final { return "LibttChunkAllReduce"; }
++  void getDependentDialects(DialectRegistry &registry) const override {
++    registry.insert<ttkernel::TTKernelDialect, mlir::arith::ArithDialect,
++                    mlir::emitc::EmitCDialect>();
++  }
++  void runOnOperation() final {
++    if (failed(d2m_fusion::insertChunkAllReduce(getOperation()))) {
++      signalPassFailure();
++    }
++  }
++};
++} // namespace
++
+ //===----------------------------------------------------------------------===//
+ // Helper functions which combine multiple passes into logical groupings.
+ //===----------------------------------------------------------------------===//
+@@ -792,6 +871,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
    ttmetal::D2MPipelineOptions ttmetalOptions;
    ttmetalOptions.ttnnMode = true;
    ttmetalOptions.enableElementwiseFusion = options.enableElementwiseFusion;
@@ -833,7 +1002,19 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
 +  ttmetalOptions.enableEltwiseReductionFusion = true;
    ttmetal::createD2MFrontendPipeline(pm, ttmetalOptions);
    ttmetal::createD2MBackendPipeline(pm, ttmetalOptions);
-   ttmetal::createD2MToTTKernelPipeline(pm, ttmetalOptions);
+   // libtt: createD2MToTTKernelPipeline split around D2MToTTNN (as the TTNN
+@@ -799,6 +880,11 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+   // programs and the TTKernel ops.
+   ttmetal::createD2MToTTKernelPreEmitCPipeline(pm, ttmetalOptions);
+   ttmetal::createD2MToTTNNPipeline(pm, ttmetalOptions);
++  pm.addPass(std::make_unique<ChunkAllReduce>());
++  OpPassManager &kernelPm = pm.nest<func::FuncOp>();
++  kernelPm.addPass(ttkernel::createTTKernelHoistInits());
++  kernelPm.addPass(ttkernel::createTTKernelDedupInits());
++  ttmetal::createD2MEmitCPipeline(pm, ttmetalOptions);
+ }
+ 
+ //===----------------------------------------------------------------------===//
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp b/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
@@ -875,7 +1056,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
-@@ -67,14 +68,249 @@ public:
+@@ -67,14 +68,253 @@ public:
      if (!op) {
        return false;
      }
@@ -1101,10 +1282,14 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          return false;
 +        }
 +      }
-+      // Decode-sized: larger ones overflowed L1 (whole rows per core). The
-+      // weight is optional (Inkling 2's clips and value norm have none).
-+      if (input.getRank() < 2 || bias || input.getShape().back() > 32 * 32 ||
-+          d2m_fusion::tileCount(input) > 64 ||
++      // Decode-sized: larger ones overflowed L1 (whole rows per core), but
++      // for one tile row of more than 32 tiles, reduced in chunks over cores
++      // (d2m_fusion::wideNormChunks). The weight is optional (Inkling 2's
++      // clips and value norm have none).
++      bool fits = input.getShape().back() <= 32 * 32 &&
++                  d2m_fusion::tileCount(input) <= 64;
++      if (input.getRank() < 2 || bias ||
++          (!fits && !d2m_fusion::wideNormChunks(op, input)) ||
 +          (weight && cast<RankedTensorType>(weight.getType()).getNumElements() !=
 +                         input.getShape().back())) {
 +        return false;
@@ -1131,7 +1316,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      // Eltwise binary ops.
      if (mlir::isa<AddOp, DivideOp, MultiplyOp, SubtractOp, EqualOp, NotEqualOp,
                    GreaterEqualOp, LessEqualOp, LessThanOp, GreaterThanOp,
-@@ -84,7 +320,7 @@ public:
+@@ -84,7 +324,7 @@ public:
        return true;
      }
  
@@ -1140,7 +1325,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
-@@ -139,7 +375,9 @@ private:
+@@ -139,7 +379,9 @@ private:
        }
        FusionGroup group = buildFusionGroup(exitOp);
  
@@ -1151,7 +1336,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
          for (Operation *op : group) {
            visitedOps.insert(op);
          }
-@@ -256,12 +494,15 @@ public:
+@@ -256,12 +498,15 @@ public:
  
    void runOnOperation() final {
      ModuleOp moduleOp = getOperation();
@@ -1168,7 +1353,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
  
      IRRewriter rewriter(&getContext());
      for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
-@@ -411,6 +652,25 @@ private:
+@@ -411,6 +656,25 @@ private:
            result.setType(
                normalizeSubgraphType(cast<RankedTensorType>(result.getType())));
          }
@@ -1194,7 +1379,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        }
      }
      llvm::SmallVector<Value> returnValues;
-@@ -455,3 +715,11 @@ private:
+@@ -455,3 +719,11 @@ private:
  } // namespace
  
  } // namespace mlir::tt::ttnn
@@ -1222,7 +1407,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
  
  #include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
  
-@@ -89,6 +94,25 @@ public:
+@@ -89,6 +94,30 @@ public:
      region->walk([&](emitc::CallOpaqueOp callOp) {
        llvm::StringRef callee = callOp.getCallee();
  
@@ -1235,8 +1420,13 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
 +          llksToEmit.push_back(d2m_fusion::binaryCompatHelpers());
 +        }
 +      }
-+      // libtt tile ops: SFPI helpers plus their wrappers.
-+      if (callee.starts_with("libtt_")) {
++      // libtt data-movement helpers; libtt tile ops: SFPI helpers plus their
++      // wrappers.
++      if (callee.starts_with("libtt_dm_")) {
++        if (emittedLlks.insert(d2m_fusion::dataMovementHelpers()).second) {
++          llksToEmit.push_back(d2m_fusion::dataMovementHelpers());
++        }
++      } else if (callee.starts_with("libtt_")) {
 +        for (llvm::StringRef snippet : {d2m_fusion::sfpuChainHelpers(),
 +                                        d2m_fusion::tileOpHelpers()}) {
 +          if (emittedLlks.insert(snippet).second) {
@@ -1248,7 +1438,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
        auto it = headerMap.find(callee);
        if (it != headerMap.end()) {
          insertHeaders(it->second);
-@@ -184,6 +208,15 @@ public:
+@@ -184,6 +213,15 @@ public:
          }
        }
  
@@ -1264,7 +1454,7 @@ diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKerne
        if (value.starts_with("experimental::invoke_sfpi")) {
          emitLlk(experimental_invoke_sfpi_llks_generated,
                  experimental_invoke_sfpi_llks_generated_len);
-@@ -354,7 +387,39 @@ LogicalResult translateKernelFuncToCpp(func::FuncOp entry,
+@@ -354,7 +392,39 @@ LogicalResult translateKernelFuncToCpp(func::FuncOp entry,
      return failure();
    }
    auto moduleCleanup = llvm::make_scope_exit([&]() { kernelModule->erase(); });
