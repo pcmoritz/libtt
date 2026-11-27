@@ -716,6 +716,41 @@ static void foldNarrowingCasts(ModuleOp moduleOp) {
   }
 }
 
+// Each wide norm (d2m_fusion::wideNormChunks) alone, with the reshape of
+// its weight: its in-kernel exchange needs the norm's whole row-merged
+// kernel, one exchange per kernel. (Inkling 2 chains three 2304-wide norms
+// in one group: split into programs, the exchange met a partial from DRAM.)
+// The rest of the group stays a group.
+static void
+isolateWideNorms(SmallVectorImpl<SmallVector<Operation *>> &groups) {
+  SmallVector<SmallVector<Operation *>> out;
+  for (auto &group : groups) {
+    llvm::SetVector<Operation *> rest(group.begin(), group.end());
+    for (Operation *op : group) {
+      if (!isa<RMSNormOp, RMSNormGatedOp>(op) ||
+          !d2m_fusion::wideNormChunks(
+              op, cast<RankedTensorType>(op->getOperand(0).getType()))) {
+        continue;
+      }
+      SmallVector<Operation *> alone;
+      if (op->getNumOperands() > 1) {
+        auto weight = op->getOperand(1).getDefiningOp<ReshapeOp>();
+        if (weight && rest.contains(weight) && weight->hasOneUse()) {
+          alone.push_back(weight);
+          rest.remove(weight);
+        }
+      }
+      alone.push_back(op);
+      rest.remove(op);
+      out.push_back(std::move(alone));
+    }
+    if (!rest.empty()) {
+      out.push_back(rest.takeVector());
+    }
+  }
+  groups.assign(out.begin(), out.end());
+}
+
 } // namespace
 } // namespace mlir::tt::ttnn
 
@@ -730,6 +765,7 @@ void prepareForOutlining(ModuleOp moduleOp) {
 
 void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &fusionGroups) {
   using namespace ttnn;
+  isolateWideNorms(fusionGroups);
   SmallVector<SmallVector<Operation *>> split;
   for (auto &group : fusionGroups) {
     for (auto &part : splitHeadGroup(group)) {
