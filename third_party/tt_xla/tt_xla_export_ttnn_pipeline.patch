@@ -1,0 +1,93 @@
+diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
+--- a/pjrt_implementation/inc/api/module_builder/module_builder.h
++++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
+@@ -278,7 +278,8 @@ private:
+   static void printModule(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+                           const std::optional<std::string> &export_path,
+                           const std::string &stage_name,
+-                          const std::string &model_name = "");
++                          const std::string &model_name = "",
++                          const std::string &header = "");
+ 
+   // Enables IR printing between passes with VERBOSE or higher logger level.
+   static void enableVerboseIRPrinting(mlir::PassManager &pm);
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -20,6 +20,7 @@
+ 
+ // llvm includes
+ #include "llvm/ADT/StringExtras.h"
++#include "llvm/ADT/StringMap.h"
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/LogicalResult.h"
+ #include "llvm/Support/SHA256.h"
+@@ -1469,6 +1470,50 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+           : client_instance->computeFabricConfig(devices_mesh_shape);
+   options.meshTopology = fabricConfigToMeshTopology(mesh_fabric_for_topology);
+ 
++  // libtt: export the pipeline's input with the exact pipeline as its first
++  // line (an MLIR comment), so that ttmlir-opt reruns this compile:
++  // ttmlir_opt FILE "$(sed -n '1s#^// ##p' FILE)". The options listed are
++  // those that differ from tt-mlir's defaults (ttmlir-opt's too); some
++  // options' printers do not round-trip, and the plugin leaves those at their
++  // defaults. The tt-lang passes added below only rewrite ttnn.tt_lang_op ops.
++  if (compile_options.export_path.has_value()) {
++    auto printOptions = [](const auto &pipeline_options) {
++      std::string printed;
++      llvm::raw_string_ostream stream(printed);
++      pipeline_options.print(stream);
++      std::replace(printed.begin(), printed.end(), '\n', ' ');
++      return printed;
++    };
++    // `{name=value name=value ...}` -> its options.
++    auto splitOptions = [](llvm::StringRef printed,
++                           llvm::SmallVectorImpl<llvm::StringRef> &split) {
++      printed = printed.trim();
++      printed.consume_front("{");
++      printed.consume_back("}");
++      printed.split(split, ' ', -1, /*KeepEmpty=*/false);
++    };
++    std::string actual = printOptions(options);
++    std::string defaults =
++        printOptions(mlir::tt::ttnn::TTIRToTTNNCommonPipelineOptions());
++    llvm::SmallVector<llvm::StringRef> actual_options, default_options;
++    splitOptions(actual, actual_options);
++    splitOptions(defaults, default_options);
++    llvm::StringMap<llvm::StringRef> default_by_name;
++    for (llvm::StringRef option : default_options) {
++      default_by_name[option.split('=').first] = option;
++    }
++    std::string changed;
++    for (llvm::StringRef option : actual_options) {
++      auto it = default_by_name.find(option.split('=').first);
++      if (it == default_by_name.end() || it->second != option) {
++        changed += (changed.empty() ? "" : " ") + option.str();
++      }
++    }
++    printModule(mlir_module, compile_options.export_path, "ttir_to_ttnn",
++                compile_options.export_model_name,
++                "// --ttir-to-ttnn-common-pipeline=" + changed + "\n");
++  }
++
+   // Run the common TTIR-to-TTNN pipeline.
+   mlir::tt::ttnn::createTTIRToTTNNCommonPipeline(ttir_to_ttnn_pm, options);
+ 
+@@ -1619,7 +1664,8 @@ tt_pjrt_status ModuleBuilder::checkOutputShardingShapes(
+ void ModuleBuilder::printModule(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+                                 const std::optional<std::string> &export_path,
+                                 const std::string &stage_name,
+-                                const std::string &model_name) {
++                                const std::string &model_name,
++                                const std::string &header) {
+   if (loguru::g_stderr_verbosity >= LOG_DEBUG) {
+     VLOG_F(LOG_DEBUG, "MLIR Module %s:", stage_name.c_str());
+     mlir_module->print(llvm::errs(), mlir::OpPrintingFlags().enableDebugInfo());
+@@ -1644,6 +1690,7 @@ void ModuleBuilder::printModule(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+ 
+   std::error_code err_code;
+   llvm::raw_fd_ostream out_stream(ir_file_path.string(), err_code);
++  out_stream << header;
+   mlir_module->print(out_stream, mlir::OpPrintingFlags().enableDebugInfo());
+   out_stream.close();
+ }

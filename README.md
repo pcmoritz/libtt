@@ -146,6 +146,32 @@ Pass pytest arguments with `--test_arg`, for example to run only integer-sum tes
 bazel test //tests:libtt_test_suite --test_arg=-k --test_arg=int32_sum
 ```
 
+## Compile a program offline
+
+The compile option `export_path=DIR` makes the plugin write each program's IR at
+every stage to `DIR/irs/` (with torch_tpu, set
+`TORCH_TPU_INTERNAL_XLA_OPTIONS="export_path=DIR"`). Among them,
+`DIR/irs/ttir_to_ttnn_<id>.mlir` is the input of the TTIR-to-TTNN pipeline, and
+its first line is a comment holding that pipeline with the options the plugin
+set (those that differ from tt-mlir's defaults). Build `ttmlir-opt` from this
+checkout's patched tt-mlir and rerun the compile:
+
+```bash
+bazel build -c opt @tt_mlir_src//:ttmlir_opt
+F=DIR/irs/ttir_to_ttnn_<id>.mlir
+bazel-bin/external/+git_repository+tt_mlir_src/ttmlir_opt $F "$(sed -n '1s#^// ##p' $F)" -o ttnn.mlir
+```
+
+With `--mlir-print-debuginfo`, the output is the plugin's own `ttnn_<id>.mlir`,
+but for a final newline and the numbers in trace function names (`trace_<n>_`),
+which count the traced programs the process compiled before. Processes sharing
+one `export_path` (the ranks of a TP server) name files by the millisecond, so a
+few files written at the same moment overwrite each other. At
+`optimization_level` 1 and above, the optimizer
+asks TTNN's op model about each candidate layout. The plugin answers those
+queries on the live device; offline, tt-mlir opens a mock device that it models
+on the machine's chips when they are present (it reads their descriptions).
+
 ## Qwen3 With SGLang-JAX
 
 Build the plugin wheel first:

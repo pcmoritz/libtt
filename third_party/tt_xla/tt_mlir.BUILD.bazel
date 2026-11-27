@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -1286,6 +1286,25 @@ cc_library(
     ],
     deps = _TTMLIR_COMMON_DEPS + ["@//tt_mlir:compiler_headers"],
     alwayslink = True,
+)
+
+# ttmlir-opt over libtt's patched tt-mlir, for compiling programs the plugin
+# exported (export_path) offline: bazel build -c opt @tt_mlir_src//:ttmlir_opt
+# (see README.md, "Compile a program offline"). Manual: not part of the wheel.
+cc_binary(
+    name = "ttmlir_opt",
+    srcs = ["@//third_party/tt_xla:tt_mlir_opt.cc"],
+    copts = _TTMLIR_COMMON_COPTS,
+    tags = ["manual"],
+    deps = [
+        ":ttmlir_compiler",
+        ":ttmlir_runtime",
+        # tt-metal's runtime files (TT_METAL_RUNTIME_ROOT), as in libtt.so:
+        # the optimizer (optimization-level >= 1) opens a mock device.
+        "@//:tt_metal_runtime_auto_setup",
+        "@llvm-project//mlir:MlirOptLib",
+        "@llvm-project//mlir:Transforms",
+    ],
 )
 
 cc_library(
