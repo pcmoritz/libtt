@@ -208,7 +208,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      auto gammaType = mlir::cast<RankedTensorType>(gamma.getType());
      // Gamma must be [D] or [1, ..., 1, D]. Validate before creating any ops.
      auto gammaShape = gammaType.getShape();
-@@ -4139,6 +4234,139 @@ public:
+@@ -4139,6 +4234,148 @@ public:
    }
  };
  
@@ -327,6 +327,15 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      return mlir::failure();
 +    }
 +    auto type = mlir::cast<RankedTensorType>(op->getResult(0).getType());
++    // Cheap test first: findReshapedOperand traces operands to constants
++    // (whole use-def chains), quadratic when run for every op of a model.
++    if (llvm::none_of(op->getOperands(), [&](Value v) {
++          auto r = v.getDefiningOp<ReshapeOp>();
++          return r && r->hasOneUse() &&
++                 tileCount(r.getInput().getType()) < tileCount(type);
++        })) {
++      return mlir::failure();
++    }
 +    std::optional<unsigned> data = findReshapedOperand(op, type);
 +    if (!data) {
 +      return mlir::failure();
@@ -348,7 +357,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -4188,7 +4416,8 @@ public:
+@@ -4188,7 +4425,8 @@ public:
        }
        patterns.add<RepVGGConvSumFusionPattern>(&getContext());
        patterns.add<ConcatenateHeadsUpdatePattern>(&getContext());
@@ -358,7 +367,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
-@@ -4203,6 +4432,7 @@ public:
+@@ -4203,6 +4441,7 @@ public:
        patterns.add<GeluFusionPattern>(&getContext());
        patterns.add<Relu6FusionPattern>(&getContext());
        patterns.add<SiluFusionPattern>(&getContext());
@@ -366,7 +375,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
        patterns.add<HardsigmoidFusionPattern>(&getContext());
        patterns.add<MishFusingPattern>(&getContext());
        patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
-@@ -4221,6 +4451,13 @@ public:
+@@ -4221,6 +4460,13 @@ public:
        config.setUseTopDownTraversal(true);
        (void)applyPatternsGreedily(getOperation(), std::move(patterns), config);
      }
