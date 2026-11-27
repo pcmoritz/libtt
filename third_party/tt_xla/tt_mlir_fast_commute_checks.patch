@@ -1,0 +1,25 @@
+diff --git a/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h b/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h
+--- a/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h
++++ b/include/ttmlir/Dialect/TTIR/Transforms/EraseInverseOps/EraseInverseOps.h
+@@ -85,15 +85,17 @@ protected:
+ 
+     } else if constexpr (commuteDirection == CommuteDirection::DOWNWARDS) {
+       for (Value operand : op->getOperands()) {
++        // libtt: the cheap test first; tracesToConstantArgs walks the whole
++        // use-def chain (quadratic when run for every operand of a model).
++        auto tmOperand = operand.getDefiningOp<TMOpType>();
++        if (!tmOperand) {
++          continue;
++        }
+         // We do not want to commute any tms downwards which are already a part
+         // of a consteval-able path
+         if (tracesToConstantArgs(operand)) {
+           continue;
+         }
+-        auto tmOperand = operand.getDefiningOp<TMOpType>();
+-        if (!tmOperand) {
+-          continue;
+-        }
+         if constexpr (std::is_same_v<TMOpType, ttir::ReshapeOp>) {
+           if (isHighRankReductionReshape(tmOperand)) {
+             continue;

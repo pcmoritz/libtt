@@ -531,6 +531,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_copy_to_host_execution_lock.patch",
         "//third_party/tt_xla:tt_xla_tokens_as_empty_arrays.patch",
         "//third_party/tt_xla:tt_xla_free_donated_inputs.patch",
+        "//third_party/tt_xla:tt_xla_verify_once.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -600,6 +601,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
         "//third_party/tt_xla:tt_mlir_fast_is_sharded_module.patch",
+        "//third_party/tt_xla:tt_mlir_fast_commute_checks.patch",
         "//third_party/tt_xla:tt_mlir_fuse_jax_rms_norm.patch",
         "//third_party/tt_xla:tt_mlir_fuse_expanded_silu.patch",
         "//third_party/tt_xla:tt_mlir_fuse_shared_lhs_matmul_pairs.patch",
