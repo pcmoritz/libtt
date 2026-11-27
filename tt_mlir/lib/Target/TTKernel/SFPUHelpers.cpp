@@ -43,6 +43,36 @@ sfpi_inline sfpi::vFloat recip(sfpi::vFloat x) {
   y = y * (2.0f - x * y);
   return y;
 }
+// FP32 x / y as tt-metal's div_binary_tile (calculate_sfpu_binary_div with
+// FP32 DST), bit for bit: the quotient of the mantissas refined once, the
+// exponent restored in two factors, exceptional divisors by their inverted
+// exponent. (Its reciprocal's 2.0 is vConstFloatPrgm0 there.)
+sfpi_inline sfpi::vFloat div(sfpi::vFloat in0, sfpi::vFloat in1) {
+  sfpi::vFloat ma = sfpi::setexp(in0, 127);
+  sfpi::vFloat mb = sfpi::setexp(in1, 127);
+  sfpi::vFloat r = sfpi::approx_recip(mb);
+  sfpi::vFloat t = mb * r - 2.0f;
+  r = r * -t - 0.0f;
+  sfpi::vFloat q = ma * r;
+  sfpi::vFloat residual = ma - q * mb;
+  q = q + residual * r;
+  sfpi::vInt ea = sfpi::exexp(in0, sfpi::ExponentMode::Biased);
+  sfpi::vInt eb = sfpi::exexp(in1);
+  sfpi::vInt exponent = ea - eb + sfpi::exexp(q, sfpi::ExponentMode::Biased);
+  sfpi::vInt half =
+      sfpi::as<sfpi::vInt>(sfpi::as<sfpi::vUInt>(exponent) >> 1);
+  sfpi::vFloat result = sfpi::setexp(q, half) *
+                        sfpi::setexp(sfpi::vFloat(1.0f), exponent - half);
+  v_if(!(ea >= 1 && ea < 255 && eb >= -126 && eb < 128)) {
+    sfpi::vFloat scale =
+        sfpi::setman(sfpi::as<sfpi::vFloat>(~sfpi::as<sfpi::vInt>(in1)), 0);
+    sfpi::vFloat nan_divisor = sfpi::as<sfpi::vFloat>(
+        sfpi::mask(sfpi::setsgn(in1, 0) > __builtin_inff()));
+    result = nan_divisor - in0 * scale;
+  }
+  v_endif;
+  return result;
+}
 // Accurate FP32 exp (tt-llk's), sigmoid without overflow: t = exp(-|x|) is in
 // (0, 1]; sigmoid(x) = 1 / (1 + t) for x >= 0, t / (1 + t) otherwise.
 sfpi_inline sfpi::vFloat exp(sfpi::vFloat x) {
@@ -78,19 +108,28 @@ sfpi_inline sfpi::vInt or_lanes8(sfpi::vInt v) {
   return v;
 }
 // dst = src (slices as template arguments: compile-time DST addresses).
-template <uint32_t src, uint32_t dst>
+// The in-DST helpers' rows: only rows < rows of dst are written (libtt
+// tile_rows kernels); vector i of a tile holds rows 16 (i / 16) +
+// 4 (i % 8 / 2) .. + 3.
+constexpr bool vec_has_rows(uint32_t i, uint32_t rows) {
+  return 16 * (i / 16) + 4 * (i % 8 / 2) < rows;
+}
+template <uint32_t src, uint32_t dst, uint32_t rows = 32>
 inline void copy_dst() {
   llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
   _llk_math_eltwise_sfpu_start_(0);
 #pragma GCC unroll 32
   for (uint32_t i = 0; i < 32; ++i) {
+    if (!vec_has_rows(i, rows)) {
+      continue;
+    }
     sfpi::vInt v = sfpi::dst_reg[src * 32 + i];
     sfpi::dst_reg[dst * 32 + i] = v;
   }
   _llk_math_eltwise_sfpu_done_();
 }
 // dst = column 0 of src spread across each row.
-template <uint32_t src, uint32_t dst>
+template <uint32_t src, uint32_t dst, uint32_t rows = 32>
 inline void bcast_col0() {
   llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
   _llk_math_eltwise_sfpu_start_(0);
@@ -98,6 +137,9 @@ inline void bcast_col0() {
   for (uint32_t half = 0; half < 2; ++half) {
 #pragma GCC unroll 4
     for (uint32_t band = 0; band < 4; ++band) {
+      if (16 * half + 4 * band >= rows) {
+        continue;
+      }
       // Integer loads and stores: raw bits (float loads flush denormals,
       // which int32 data looks like).
       sfpi::vInt bits = sfpi::dst_reg[src * 32 + 2 * half * 8 + 2 * band];
@@ -115,7 +157,7 @@ inline void bcast_col0() {
 // dst = row 0 of src spread down each column (in place allowed): a
 // subvector transpose of four copies of a row-0 vector repeats its first
 // subvector (row 0) in every subvector.
-template <uint32_t src, uint32_t dst>
+template <uint32_t src, uint32_t dst, uint32_t rows = 32>
 inline void bcast_row0() {
   llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
   _llk_math_eltwise_sfpu_start_(0);
@@ -128,8 +170,12 @@ inline void bcast_row0() {
       sfpi::subvec_transp(a, b, c, d, e, f, g, h);
 #pragma GCC unroll 4
       for (uint32_t band = 0; band < 4; ++band) {
-        sfpi::dst_reg[dst * 32 + face * 8 + 2 * band + parity] = a;
-        sfpi::dst_reg[dst * 32 + (face + 2) * 8 + 2 * band + parity] = a;
+        if (4 * band < rows) {
+          sfpi::dst_reg[dst * 32 + face * 8 + 2 * band + parity] = a;
+        }
+        if (16 + 4 * band < rows) {
+          sfpi::dst_reg[dst * 32 + (face + 2) * 8 + 2 * band + parity] = a;
+        }
       }
     }
   }
@@ -167,6 +213,180 @@ inline void group_sum16(uint32_t idst) {
       sfpi::dst_reg += 2;
     }
     _llk_math_eltwise_sfpu_inc_dst_face_addr_();
+  }
+  _llk_math_eltwise_sfpu_done_();
+}
+// Row r of DST tile t: its vector of column half h (face 2 (r / 16) + h) and
+// parity p; the row is subvector r % 4 of it.
+sfpi_inline uint32_t row_vec(uint32_t t, uint32_t r, uint32_t h, uint32_t p) {
+  return t * 32 + (2 * (r / 16) + h) * 8 + 2 * (r % 16 / 4) + p;
+}
+// v's subvector s in every subvector.
+sfpi_inline sfpi::vInt replicate_subvec(sfpi::vInt v, uint32_t s) {
+  sfpi::vInt a = v, b = v, c = v, d = v, e = v, f = v, g = v, h = v;
+  sfpi::subvec_transp(a, b, c, d, e, f, g, h);
+  return s == 0 ? a : s == 1 ? b : s == 2 ? c : d;
+}
+// Tile out = each column's sum (max) over tile in's rows [0, n) in every row:
+// the bands' vectors combined elementwise (rows past n at the identity),
+// then the four subvectors of the result (a subvector transpose, which
+// needs all eight registers: nothing else is live across it). Only out's
+// rows < rows are written (libtt.tile_rows kernels); with col0, only column
+// 0 (the even vectors of faces 0 and 2).
+sfpi_inline void column_reduce(uint32_t in, uint32_t out, bool max, uint32_t n,
+                               uint32_t rows = 32, bool col0 = false) {
+  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
+  _llk_math_eltwise_sfpu_start_(0);
+  const float identity = max ? -3.4028235e38f : 0.0f;
+#pragma GCC unroll 1
+  for (uint32_t h = 0; h < (col0 ? 1u : 2u); ++h) {
+#pragma GCC unroll 1
+    for (uint32_t p = 0; p < (col0 ? 1u : 2u); ++p) {
+      sfpi::vFloat acc = identity;
+      for (uint32_t b = 0; 4 * b < n; ++b) {
+        sfpi::vFloat v = sfpi::dst_reg[in * 32 + (2 * (b / 4) + h) * 8 +
+                                       2 * (b % 4) + p];
+        if (4 * b + 4 > n) {
+          sfpi::vInt sub = sfpi::as<sfpi::vInt>(sfpi::as<sfpi::vUInt>(
+                               sfpi::vInt(sfpi::vConstTileId)) >> 4) &
+                           3;
+          v_if(sub >= static_cast<int>(n - 4 * b)) { v = identity; }
+          v_endif;
+        }
+        if (max) {
+          v_if(acc < v) { acc = v; }
+          v_endif;
+        } else {
+          acc = acc + v;
+        }
+      }
+      sfpi::vFloat a0 = acc, a1 = acc, a2 = acc, a3 = acc, a4 = acc, a5 = acc,
+                   a6 = acc, a7 = acc;
+      sfpi::subvec_transp(a0, a1, a2, a3, a4, a5, a6, a7);
+      sfpi::vFloat r;
+      if (max) {
+        v_if(a0 < a1) { a0 = a1; }
+        v_endif;
+        v_if(a2 < a3) { a2 = a3; }
+        v_endif;
+        v_if(a0 < a2) { a0 = a2; }
+        v_endif;
+        r = a0;
+      } else {
+        r = (a0 + a1) + (a2 + a3);
+      }
+#pragma GCC unroll 8
+      for (uint32_t band = 0; band < 8; ++band) {
+        if (4 * band < rows) {
+          sfpi::dst_reg[out * 32 + (2 * (band / 4) + h) * 8 +
+                        2 * (band % 4) + p] = r;
+        }
+      }
+    }
+  }
+  _llk_math_eltwise_sfpu_done_();
+}
+// out = dst with rows [to, to + count) = src's rows [from, from + count)
+// (libtt_place_rows_tile); any of the three may be the same tile. Raw bits.
+// Always inlined, with constant arguments: a partly constant clone
+// (place_rows.constprop) crashed the SFPI compiler. Rows >= rows of out are
+// left undefined (libtt.tile_rows kernels), and with col0 every column but 0
+// (the even vectors of faces 0 and 2).
+sfpi_inline void place_rows(uint32_t dst, uint32_t src, uint32_t out,
+                            uint32_t to, uint32_t from, uint32_t count,
+                            uint32_t rows = 32, bool col0 = false) {
+  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
+  _llk_math_eltwise_sfpu_start_(0);
+  // Each lane's subvector (row in its band); recomputed where used: the
+  // subvector transpose needs all eight registers.
+  auto sub = []() __attribute__((always_inline)) {
+    return sfpi::as<sfpi::vInt>(
+               sfpi::as<sfpi::vUInt>(sfpi::vInt(sfpi::vConstTileId)) >> 4) &
+           3;
+  };
+  // The vectors holding rows < rows: up to 16 rows, the first
+  // 2 ceil(rows / 4) of faces 0 and 1; else all.
+  const uint32_t faceVecs = rows > 16 ? 8 : 2 * ((rows + 3) / 4);
+  const uint32_t numVecs = rows > 16 ? 32 : 16;
+  if (out != src && out != dst) {
+#pragma GCC unroll 8
+    for (uint32_t i = 0; i < numVecs; ++i) {
+      if (i % 8 >= faceVecs || (col0 && (i / 8 % 2 != 0 || i % 2 != 0))) {
+        continue;
+      }
+      sfpi::vInt v = sfpi::dst_reg[dst * 32 + i];
+      sfpi::dst_reg[out * 32 + i] = v;
+    }
+  }
+  auto move = [&](uint32_t i) __attribute__((always_inline)) {
+    const uint32_t r = to + i, q = from + i;
+#pragma GCC unroll 2
+    for (uint32_t h = 0; h < (col0 ? 1u : 2u); ++h) {
+#pragma GCC unroll 2
+      for (uint32_t p = 0; p < (col0 ? 1u : 2u); ++p) {
+        const uint32_t sa = row_vec(src, q, h, p), oa = row_vec(out, r, h, p);
+        sfpi::vInt v = sfpi::dst_reg[sa];
+        if (sa != oa) {
+          if (q % 4 != r % 4) {
+            v = replicate_subvec(v, q % 4);
+          }
+          sfpi::vInt o = sfpi::dst_reg[oa];
+          v_if(sub() == static_cast<int>(r % 4)) { o = v; }
+          v_endif;
+          sfpi::dst_reg[oa] = o;
+        } else if (q != r) {
+          // Both rows in one vector: rebuild it from its subvectors. (A
+          // reload of the vector after the transpose is the load above,
+          // which the compiler then keeps live across it: "too few lregs".)
+          sfpi::vInt a = v, b = v, c = v, d = v, e = v, f = v, g = v, k = v;
+          sfpi::subvec_transp(a, b, c, d, e, f, g, k);
+          // Subvector j of the result: v's, q's for j = r.
+          auto pick = [&](uint32_t j) __attribute__((always_inline)) {
+            const uint32_t s = j == r % 4 ? q % 4 : j;
+            return s == 0 ? a : s == 1 ? b : s == 2 ? c : d;
+          };
+          sfpi::vInt o = pick(0);
+          v_if(sub() == 1) { o = pick(1); }
+          v_endif;
+          v_if(sub() == 2) { o = pick(2); }
+          v_endif;
+          v_if(sub() == 3) { o = pick(3); }
+          v_endif;
+          sfpi::dst_reg[oa] = o;
+        }
+      }
+    }
+  };
+  // Within one tile, each row is read before it is written. Unrolled: a
+  // move's code depends on its rows (v_if under a runtime branch does not
+  // compile).
+  if (out != src || to <= from) {
+#pragma GCC unroll 32
+    for (uint32_t i = 0; i < count; ++i) {
+      move(i);
+    }
+  } else {
+#pragma GCC unroll 32
+    for (uint32_t i = count; i-- > 0;) {
+      move(i);
+    }
+  }
+  if (out == src && out != dst) {
+    // dst's rows outside [to, to + count); vector i's first row is base.
+    for (uint32_t i = 0; i < numVecs; ++i) {
+      if (i % 8 >= faceVecs || (col0 && (i / 8 % 2 != 0 || i % 2 != 0))) {
+        continue;
+      }
+      const int base = static_cast<int>(16 * (i / 16) + 4 * (i % 8 / 2));
+      sfpi::vInt v = sfpi::dst_reg[out * 32 + i];
+      const sfpi::vInt row = sub() + base;
+      v_if(row < static_cast<int>(to) ||
+           row >= static_cast<int>(to + count)) {
+        v = sfpi::dst_reg[dst * 32 + i];
+      }
+      v_endif;
+      sfpi::dst_reg[out * 32 + i] = v;
+    }
   }
   _llk_math_eltwise_sfpu_done_();
 }
@@ -212,6 +432,117 @@ inline void row_to_column(uint32_t idst) {
         sfpi::dst_reg[idst * 32 + (2 * face + cf) * 8 + 2 * band] = v;
         sfpi::dst_reg[idst * 32 + (2 * face + cf) * 8 + 2 * band + 1] = v;
       }
+    }
+  }
+  _llk_math_eltwise_sfpu_done_();
+}
+// The chunk all-reduce's gather tiles: each core's partial row t in column
+// t of its slot, gather_slot(rows) columns (libtt_gather_slot), 32 / slot
+// slots per row.
+constexpr uint32_t gather_slot(uint32_t rows) {
+  uint32_t w = 1;
+  while (w < rows) {
+    w *= 2;
+  }
+  return w;
+}
+// dst += src (gather tiles).
+sfpi_inline void add_gather(uint32_t dst, uint32_t src, uint32_t rows) {
+  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
+  _llk_math_eltwise_sfpu_start_(0);
+#pragma GCC unroll 32
+  for (uint32_t i = 0; i < 32; ++i) {
+    sfpi::vFloat a = sfpi::dst_reg[dst * 32 + i];
+    sfpi::vFloat b = sfpi::dst_reg[src * 32 + i];
+    sfpi::dst_reg[dst * 32 + i] = a + b;
+  }
+  _llk_math_eltwise_sfpu_done_();
+}
+// The exchanged partial from the gather tiles' sum in t: partial row c (the
+// sum of column c of every slot, over the 32 gather rows) in every column of
+// row c, rows c < rows. Per column half (one with slots of <= 16 columns:
+// the halves fold) and parity: the faces' band vectors summed, the slots
+// within a face folded (lane rotations), the band's four rows summed
+// (subvectors, a transpose); then row_to_column's spreading on the rows
+// that exist.
+sfpi_inline void gather_combine(uint32_t t, uint32_t rows) {
+  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
+  _llk_math_eltwise_sfpu_start_(0);
+  const uint32_t slot = gather_slot(rows);
+#pragma GCC unroll 2
+  for (uint32_t h = 0; h < (slot > 16 ? 2u : 1u); ++h) {
+#pragma GCC unroll 2
+    for (uint32_t p = 0; p < 2; ++p) {
+      sfpi::vFloat acc = sfpi::dst_reg[t * 32 + h * 8 + p];
+#pragma GCC unroll 16
+      for (uint32_t k = 1; k < (slot > 16 ? 8u : 16u); ++k) {
+        // Faces h, h + 2 (and with slots <= 16 columns h + 1, h + 3).
+        const uint32_t face = slot > 16 ? 2 * (k / 4) + h : k / 4;
+        sfpi::vFloat x = sfpi::dst_reg[t * 32 + face * 8 + 2 * (k % 4) + p];
+        acc += x;
+      }
+      // Slots of `slot` columns, slot / 2 lanes apart within a subvector.
+#pragma GCC unroll 3
+      for (uint32_t step = 8; step >= 2; step /= 2) {
+        if (slot <= step) {
+          sfpi::vFloat moved = acc;
+#pragma GCC unroll 4
+          for (uint32_t r = 0; r < step / 2; ++r) {
+            moved = rotate8f(moved);
+          }
+          acc = acc + moved;
+        }
+      }
+      sfpi::vFloat a0 = acc, a1 = acc, a2 = acc, a3 = acc, a4 = acc,
+                   a5 = acc, a6 = acc, a7 = acc;
+      sfpi::subvec_transp(a0, a1, a2, a3, a4, a5, a6, a7);
+      sfpi::dst_reg[t * 32 + h * 8 + p] = (a0 + a1) + (a2 + a3);
+    }
+  }
+  if (slot == 1) {
+    // One column per core: the odd columns too.
+    sfpi::vFloat e = sfpi::dst_reg[t * 32];
+    sfpi::vFloat o = sfpi::dst_reg[t * 32 + 1];
+    sfpi::dst_reg[t * 32] = e + o;
+  }
+  sfpi::vInt id = sfpi::vConstTileId;
+  sfpi::vInt sub = sfpi::as<sfpi::vInt>(sfpi::as<sfpi::vUInt>(id) >> 4) & 3;
+  sfpi::vInt lane2 = id & 14;
+#pragma GCC unroll 2
+  for (int face = 1; face >= 0; --face) {
+#pragma GCC unroll 4
+    for (int band = 3; band >= 0; --band) {
+      if (16 * face + 4 * band < static_cast<int>(rows)) {
+        sfpi::vInt v = sfpi::dst_reg[t * 32 + face * 8];
+        v_if((sub & 1) != 0) { v = sfpi::dst_reg[t * 32 + face * 8 + 1]; }
+        v_endif;
+        v_if(lane2 != (sub & 2) + 4 * band) { v = 0; }
+        v_endif;
+        v = or_lanes8(v);
+#pragma GCC unroll 2
+        for (uint32_t cf = 0; cf < 2; ++cf) {
+          sfpi::dst_reg[t * 32 + (2 * face + cf) * 8 + 2 * band] = v;
+          sfpi::dst_reg[t * 32 + (2 * face + cf) * 8 + 2 * band + 1] = v;
+        }
+      }
+    }
+  }
+  _llk_math_eltwise_sfpu_done_();
+}
+// sfpu_reduce<SUM, Float32, REDUCE_ROW> on rows < rows (<= 16): each row's
+// sum over its 32 columns in column 0 (the even columns of face 0 hold it).
+sfpi_inline void row_sum(uint32_t t, uint32_t rows) {
+  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
+  _llk_math_eltwise_sfpu_start_(0);
+#pragma GCC unroll 4
+  for (uint32_t b = 0; b < 4; ++b) {
+    if (4 * b < rows) {
+      sfpi::vFloat a = sfpi::dst_reg[t * 32 + 2 * b];
+      sfpi::vFloat c = sfpi::dst_reg[t * 32 + 2 * b + 1];
+      sfpi::vFloat d = sfpi::dst_reg[t * 32 + 8 + 2 * b];
+      sfpi::vFloat e = sfpi::dst_reg[t * 32 + 8 + 2 * b + 1];
+      sfpi::vFloat v = (a + c) + (d + e);
+      sfpi::dst_reg[t * 32 + 2 * b] = sum_lanes8f(v);
     }
   }
   _llk_math_eltwise_sfpu_done_();
@@ -266,12 +597,25 @@ ALWI void libtt_group_sum_tile(uint32_t idst) {
 // The chunk all-reduce (d2m_fusion::insertChunkAllReduce): the gather tile in
 // DST (row j: core j's row sums, row t's in column t) summed over its rows,
 // then row 0 made the columns: row t holds row t's total in every column.
-ALWI void libtt_chunk_allreduce_tile_init() {}
-ALWI void libtt_chunk_allreduce_tile(uint32_t idst) {
-  sfpu_reduce_init<PoolType::SUM, DataFormat::Float32>();
-  sfpu_reduce<PoolType::SUM, DataFormat::Float32, ReduceDim::REDUCE_COL>(idst);
-  MATH((libtt_sfpu::row_to_column(idst)));
-})libtt";
+// The end of a DST section that keeps DST for the next one: the packer's
+// release with clear_dest off (math may write again once the packer has read
+// DST). A kernel kept in DST across a chunk all-reduce's exchange.
+ALWI void libtt_tile_regs_release_keep() {
+  PACK((_llk_pack_dest_section_done_<DST_SYNC_MODE, DST_ACCUM_MODE, false>()));
+}
+// DST[out] = each column's sum (max) over DST[in]'s rows [0, n), in every row
+// (ttir.column_reduce; libtt_sfpu::column_reduce).
+ALWI void libtt_column_reduce_tile_init() {}
+ALWI void libtt_column_reduce_tile(uint32_t in, uint32_t out, uint32_t max,
+                                   uint32_t n) {
+  MATH((libtt_sfpu::column_reduce(in, out, max != 0, n)));
+}
+ALWI void libtt_place_rows_tile_init() {}
+ALWI void libtt_place_rows_tile(uint32_t dst, uint32_t src, uint32_t out,
+                                uint32_t to, uint32_t from, uint32_t count) {
+  MATH((libtt_sfpu::place_rows(dst, src, out, to, from, count)));
+}
+)libtt";
 
 // libtt data-movement helpers (kernels that call libtt_*_dm functions).
 static const char *const kLibttDataMovement = R"libtt(
@@ -280,17 +624,28 @@ static const char *const kLibttDataMovement = R"libtt(
 inline uint32_t libtt_gather_row_offset(uint32_t g) {
   return (g / 32) * 4096 + (g % 32 / 16) * 2048 + (g % 16) * 64;
 }
+// Columns per core in a gather row: the partial's rows rounded up to a power
+// of two (32 / slot cores share a row). Also libtt_sfpu::gather_slot and
+// insertChunkAllReduce's tile count.
+inline uint32_t libtt_gather_slot(uint32_t rows) {
+  uint32_t w = 1;
+  while (w < rows) {
+    w *= 2;
+  }
+  return w;
+}
 // The chunk all-reduce's exchange (d2m_fusion::insertChunkAllReduce) on the k
 // cores of the logical rectangle (x0, y0)-(x1, y1). Each core's row sums
 // (column 0 of the FP32 tile in send_cb, rows 0..rows-1) go, as row t's in
-// column t, to gather row `me` of recv_cb on the root core (x0, y0), with a
+// column t of its slot (libtt_gather_slot columns; slot me % (32 / slot) of
+// gather row me / (32 / slot)), to recv_cb on the root core (x0, y0), with a
 // semaphore bump after it (the same NoC and VC, so the bump lands after the
 // row). Once all k - 1 bumps arrived, the root multicasts its gather tiles
 // to the others, each NoC-contiguous rectangle once, with a flag on the same
 // path (linked); then every core pushes recv_cb. (Every core writing every
 // core, unicast, took 72 x 72 transactions; every core multicasting, 72
 // multicasts to the same rectangles, serialized: 260 us.) The root zeroes
-// the gather rows past k (NoC reads of the zero region).
+// the slots past k (NoC reads of the zero region).
 inline void libtt_dm_chunk_allreduce(uint32_t send_cb, uint32_t recv_cb,
                                      uint32_t sem_id, uint32_t x0, uint32_t y0,
                                      uint32_t x1, uint32_t y1, uint32_t rows,
@@ -301,25 +656,35 @@ inline void libtt_dm_chunk_allreduce(uint32_t send_cb, uint32_t recv_cb,
   const uint32_t mx = (uint32_t)get_absolute_logical_x();
   const uint32_t my = (uint32_t)get_absolute_logical_y();
   const uint32_t me = (my - y0) * w + (mx - x0);
-  const uint32_t halves = rows > 16 ? 2 : 1;
+  const uint32_t slot = libtt_gather_slot(rows);
+  const uint32_t per_row = 32 / slot;
+  const uint32_t used_rows = (k + per_row - 1) / per_row;
   recv.reserve_back(recv_tiles);
   const uint32_t base = recv.get_write_ptr();
   if (me == 0) {
     const uint64_t zeros =
         get_noc_addr(my_x[noc], my_y[noc], MEM_ZEROS_BASE, noc);
-    for (uint32_t g0 = 0; g0 < recv_tiles * 32; g0 += 16) {
-      if (g0 + 16 <= k) {
-        continue;
+    // Bytes [at, at + n) zeroed (the zeros' address congruent mod 16).
+    auto zero = [&](uint32_t at, uint32_t n) {
+      while (n > 0) {
+        const uint32_t m = n < MEM_ZEROS_SIZE - 16 ? n : MEM_ZEROS_SIZE - 16;
+        noc_async_read(zeros + (at & 15), at, m, noc);
+        at += m;
+        n -= m;
       }
-      const uint32_t from = g0 < k ? k - g0 : 0;
-      for (uint32_t h = 0; h < 2; ++h) {
-        uint32_t at = base + libtt_gather_row_offset(g0 + from) + h * 1024;
-        for (uint32_t left = (16 - from) * 64; left > 0;) {
-          const uint32_t n = left < MEM_ZEROS_SIZE ? left : MEM_ZEROS_SIZE;
-          noc_async_read(zeros, at, n, noc);
-          at += n;
-          left -= n;
-        }
+    };
+    // The free slots of the last used row, then the unused rows.
+    for (uint32_t c = (k % per_row) * slot; k % per_row != 0 && c < 32;
+         c = (c / 16 + 1) * 16) {
+      zero(base + libtt_gather_row_offset(used_rows - 1) + c / 16 * 1024 +
+               c % 16 * 4,
+           (16 - c % 16) * 4);
+    }
+    for (uint32_t g0 = used_rows / 16 * 16; g0 < recv_tiles * 32; g0 += 16) {
+      const uint32_t from = g0 < used_rows ? used_rows - g0 : 0;
+      for (uint32_t h = 0; h < 2 && from < 16; ++h) {
+        zero(base + libtt_gather_row_offset(g0 + from) + h * 1024,
+             (16 - from) * 64);
       }
     }
   }
@@ -327,21 +692,32 @@ inline void libtt_dm_chunk_allreduce(uint32_t send_cb, uint32_t recv_cb,
   const uint32_t src = send.get_read_ptr();
   volatile tt_l1_ptr uint32_t *p =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(src);
-  // Row t's sum (column 0) to column t of row 0: faces 0 and 2 to 0 and 1.
+  // Row t's sum (column 0) to column t of row 0 (faces 0 and 2 to 0 and 1),
+  // at the slot's offset mod 16 bytes (the NoC needs equal alignment).
   // (A transpose in the compute phase instead measured the same: +0.1 us at
   // T = 1, -0.1 us at T = 32.)
-  for (uint32_t t = 1; t < rows && t < 16; ++t) {
-    p[t] = p[t * 16];
+  const uint32_t col = me % per_row * slot;
+  const uint32_t off = col % 4;
+  if (off != 0) {
+    const uint32_t v1 = rows > 1 ? p[16] : 0;
+    p[off] = p[0];
+    p[off + 1] = v1;
+  } else {
+    for (uint32_t t = 1; t < rows && t < 16; ++t) {
+      p[t] = p[t * 16];
+    }
+    for (uint32_t t = 16; t < rows; ++t) {
+      p[256 + t - 16] = p[512 + (t - 16) * 16];
+    }
   }
-  for (uint32_t t = 16; t < rows; ++t) {
-    p[256 + t - 16] = p[512 + (t - 16) * 16];
-  }
-  const uint32_t dst = base + libtt_gather_row_offset(me);
+  const uint32_t dst = base + libtt_gather_row_offset(me / per_row) +
+                       col / 16 * 1024 + col % 16 * 4;
   const uint32_t rx = worker_logical_col_to_virtual_col[x0];
   const uint32_t ry = worker_logical_row_to_virtual_row[y0];
-  for (uint32_t h = 0; h < halves; ++h) {
-    noc_async_write(src + h * 1024, get_noc_addr(rx, ry, dst + h * 1024, noc),
-                    64, noc);
+  for (uint32_t h = 0; h < (slot > 16 ? 2u : 1u); ++h) {
+    noc_async_write(src + off * 4 + h * 1024,
+                    get_noc_addr(rx, ry, dst + h * 1024, noc),
+                    (slot > 16 ? 16 : slot) * 4, noc);
   }
   const uint32_t sem = get_semaphore(sem_id);
   volatile tt_l1_ptr uint32_t *s =

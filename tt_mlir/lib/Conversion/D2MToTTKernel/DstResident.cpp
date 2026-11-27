@@ -102,6 +102,9 @@ public:
       bin(m.getDst0Index(), m.getDst1Index(), m.getOdstIndex(), "{0} + {1}");
     } else if (auto m = dyn_cast<ttkernel::SubBinaryTilesOp>(op)) {
       bin(m.getDst0Index(), m.getDst1Index(), m.getOdstIndex(), "{0} - {1}");
+    } else if (auto m = dyn_cast<ttkernel::DivBinaryTilesOp>(op)) {
+      bin(m.getDst0Index(), m.getDst1Index(), m.getOdstIndex(),
+          "libtt_sfpu::div({0}, {1})");
     } else if (auto m = dyn_cast<ttkernel::BinaryMaxTileOp>(op)) {
       std::string x = read(slot(m.getDst0Index()));
       std::string y = read(slot(m.getDst1Index()));
@@ -271,7 +274,8 @@ public:
 
   static bool isInit(Operation *op) {
     return isa<ttkernel::MulBinaryTilesInitOp, ttkernel::AddBinaryTilesInitOp,
-               ttkernel::SubBinaryTilesInitOp, ttkernel::BinaryMaxTileInitOp,
+               ttkernel::SubBinaryTilesInitOp, ttkernel::DivBinaryTilesInitOp,
+               ttkernel::BinaryMaxTileInitOp,
                ttkernel::BinaryMinTileInitOp,
                ttkernel::BinopWithScalarTileInitOp, ttkernel::AbsTileInitOp,
                ttkernel::NegativeTileInitOp, ttkernel::SignTileInitOp,
@@ -441,6 +445,43 @@ public:
         return false;
       }
     }
+    // The exp-based helpers and div use most SFPU registers: few chain
+    // values may be live across one (the compiler cannot spill: "too few
+    // lregs"). Checked on one iteration's body: unrolled copies reuse names.
+    {
+      std::regex def("sfpi::vFloat (t[0-9_eo]+)");
+      std::regex use("\\bt[0-9]+(_e|_o)?\\b");
+      std::vector<std::string> blines;
+      std::istringstream in(body);
+      for (std::string l; std::getline(in, l);) {
+        blines.push_back(l);
+      }
+      std::map<std::string, size_t> first, last;
+      for (size_t i = 0; i < blines.size(); ++i) {
+        for (auto it =
+                 std::sregex_iterator(blines[i].begin(), blines[i].end(), use);
+             it != std::sregex_iterator(); ++it) {
+          first.try_emplace(it->str(), i);
+          last[it->str()] = i;
+        }
+      }
+      for (size_t i = 0; i < blines.size(); ++i) {
+        const std::string &l = blines[i];
+        if (l.find("libtt_sfpu::exp(") == std::string::npos &&
+            l.find("libtt_sfpu::div(") == std::string::npos &&
+            l.find("libtt_sfpu::sigmoid(") == std::string::npos &&
+            l.find("libtt_sfpu::silu(") == std::string::npos) {
+          continue;
+        }
+        int across = 0;
+        for (auto [t, f] : first) {
+          across += f < i && last[t] > i;
+        }
+        if (across > 2) {
+          return false;
+        }
+      }
+    }
     const bool unroll = col0Only || tileRows > 0;
     if (unroll) {
       // FP32 DST lane layout: vector d (0..7) of face f is dst_reg offset
@@ -474,41 +515,6 @@ public:
         }
       }
       body = unrolled;
-    }
-    // The exp-based helpers use most SFPU registers: few chain values may be
-    // live across one (the compiler cannot spill: "too few lregs").
-    {
-      std::regex def("sfpi::vFloat (t[0-9_eo]+)");
-      std::regex use("\\bt[0-9]+(_e|_o)?\\b");
-      std::vector<std::string> blines;
-      std::istringstream in(body);
-      for (std::string l; std::getline(in, l);) {
-        blines.push_back(l);
-      }
-      std::map<std::string, size_t> first, last;
-      for (size_t i = 0; i < blines.size(); ++i) {
-        for (auto it =
-                 std::sregex_iterator(blines[i].begin(), blines[i].end(), use);
-             it != std::sregex_iterator(); ++it) {
-          first.try_emplace(it->str(), i);
-          last[it->str()] = i;
-        }
-      }
-      for (size_t i = 0; i < blines.size(); ++i) {
-        const std::string &l = blines[i];
-        if (l.find("libtt_sfpu::exp(") == std::string::npos &&
-            l.find("libtt_sfpu::sigmoid(") == std::string::npos &&
-            l.find("libtt_sfpu::silu(") == std::string::npos) {
-          continue;
-        }
-        int across = 0;
-        for (auto [t, f] : first) {
-          across += f < i && last[t] > i;
-        }
-        if (across > 2) {
-          return false;
-        }
-      }
     }
     std::string fn =
         unroll ? llvm::formatv("ALWI void NAME({0}) {{\n"
@@ -657,6 +663,137 @@ bool usesFp32Dst(func::FuncOp funcOp) {
   return fp32;
 }
 
+// Runs of row moves into one tile in place (libtt_place_rows_tile with dst
+// == out, src != out, each row from the same row of its band: from % 4 ==
+// to % 4) become one SFPU pass: each vector of the tile they write is loaded
+// and stored once, each moved row is one predicated copy (one helper call
+// per move cost about 65 ns, mostly its own pass).
+static void fusePlaceRuns(func::FuncOp funcOp, int64_t tileRows) {
+  auto cst = [](Value v) { return getConstantIntValue(v); };
+  struct Move {
+    mutable ttkernel::LibttPlaceRowsTileOp op;
+    int64_t src, to, from, count;
+  };
+  auto emit = [&](ArrayRef<Move> run, int64_t out, bool col0) {
+    // Arguments: the out slot, then each distinct source slot.
+    SmallVector<Value> args{run.front().op.getDst0Index()};
+    SmallVector<int64_t> slots{out};
+    auto argOf = [&](int64_t slot, Value v) {
+      auto it = llvm::find(slots, slot);
+      if (it != slots.end()) {
+        return static_cast<int>(it - slots.begin());
+      }
+      slots.push_back(slot);
+      args.push_back(v);
+      return static_cast<int>(slots.size() - 1);
+    };
+    // Vector -> its predicated copies, in run order.
+    std::map<int, std::string> vecs;
+    for (const Move &m : run) {
+      int a = argOf(m.src, m.op.getDst1Index());
+      for (int64_t i = 0; i < m.count; ++i) {
+        const int64_t r = m.to + i, q = m.from + i;
+        for (int h = 0; h < (col0 ? 1 : 2); ++h) {
+          for (int p = 0; p < (col0 ? 1 : 2); ++p) {
+            const int64_t vr = (2 * (r / 16) + h) * 8 + 2 * (r % 16 / 4) + p;
+            const int64_t vq = (2 * (q / 16) + h) * 8 + 2 * (q % 16 / 4) + p;
+            vecs[static_cast<int>(vr)] += llvm::formatv(
+                "    {{ sfpi::vInt x = sfpi::dst_reg[d{0} * 32 + {1}]; "
+                "v_if(sub == {2}) {{ v = x; } v_endif; }\n",
+                a, vq, r % 4).str();
+          }
+        }
+      }
+    }
+    std::string sig, body;
+    for (size_t i = 0; i < args.size(); ++i) {
+      sig += llvm::formatv("{0}uint32_t d{1}", i ? ", " : "", i).str();
+    }
+    for (auto &[vr, copies] : vecs) {
+      body += llvm::formatv("  {{\n    sfpi::vInt v = sfpi::dst_reg[d0 * 32 + "
+                            "{0}];\n{1}    sfpi::dst_reg[d0 * 32 + {0}] = v;\n"
+                            "  }\n",
+                            vr, copies)
+                  .str();
+    }
+    std::string text = llvm::formatv(
+        "ALWI void NAME({0}) {{\n"
+        "  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, "
+        "DST_ACCUM_MODE>();\n"
+        "  _llk_math_eltwise_sfpu_start_(0);\n"
+        "  const sfpi::vInt sub = sfpi::as<sfpi::vInt>(sfpi::as<sfpi::vUInt>("
+        "sfpi::vInt(sfpi::vConstTileId)) >> 4) & 3;\n"
+        "{1}"
+        "  _llk_math_eltwise_sfpu_done_();\n"
+        "}\n",
+        sig, body).str();
+    std::string name =
+        llvm::formatv("places_{0:x}",
+                      static_cast<uint64_t>(llvm::hash_value(text)))
+            .str();
+    text.replace(text.find("NAME"), 4, name);
+    std::string call = "MATH((libtt_sfpu::" + name + "(";
+    for (size_t i = 0; i < args.size(); ++i) {
+      call += i ? ", {}" : "{}";
+    }
+    call += ")));";
+    Operation *last = run.back().op;
+    OpBuilder b(last);
+    OperationState state(last->getLoc(),
+                         emitc::VerbatimOp::getOperationName());
+    state.addOperands(args);
+    state.addAttribute("value", b.getStringAttr(call));
+    state.addAttribute(
+        "libtt.sfpu_def",
+        b.getStringAttr("#ifdef TRISC_MATH\nnamespace libtt_sfpu {\n" + text +
+                        "} // namespace libtt_sfpu\n#endif"));
+    b.create(state);
+    for (const Move &m : run) {
+      m.op->erase();
+    }
+  };
+  SmallVector<Block *> blocks;
+  funcOp.walk([&](Block *block) { blocks.push_back(block); });
+  for (Block *block : blocks) {
+    SmallVector<Move> run;
+    int64_t runOut = -1;
+    bool runCol0 = false;
+    auto flush = [&]() {
+      if (run.size() >= 2) {
+        emit(run, runOut, runCol0);
+      }
+      run.clear();
+      runOut = -1;
+    };
+    for (Operation &op : llvm::make_early_inc_range(*block)) {
+      if (auto pr = dyn_cast<ttkernel::LibttPlaceRowsTileOp>(op)) {
+        auto d = cst(pr.getDst0Index()), s = cst(pr.getDst1Index()),
+             o = cst(pr.getOdstIndex()), to = cst(pr->getOperand(3)),
+             from = cst(pr->getOperand(4)), count = cst(pr->getOperand(5));
+        const bool col0 = op.hasAttr("libtt.col0_only");
+        const bool ok = d && s && o && to && from && count && *d == *o &&
+                        *s != *o && *to % 4 == *from % 4 &&
+                        *to + *count <= tileRows && *from + *count <= 32;
+        if (!ok || (runOut >= 0 && (*o != runOut || col0 != runCol0))) {
+          flush();
+        }
+        if (ok) {
+          run.push_back({pr, *s, *to, *from, *count});
+          runOut = *o;
+          runCol0 = col0;
+        }
+        continue;
+      }
+      if (isa<ttkernel::LibttPlaceRowsTileInitOp>(op) ||
+          (isPure(&op) && op.getNumRegions() == 0)) {
+        continue;
+      }
+      flush();
+    }
+    flush();
+  }
+}
+
 void fuseSFPUChains(func::FuncOp funcOp) {
   if (!usesFp32Dst(funcOp)) {
     return;
@@ -666,6 +803,77 @@ void fuseSFPUChains(func::FuncOp funcOp) {
   int64_t tileRows = 0;
   if (auto rows = funcOp->getAttrOfType<IntegerAttr>("libtt.tile_rows")) {
     tileRows = rows.getInt();
+  }
+  // place_rows, column_reduce and FP32 row sums on the rows that exist
+  // (their tile-op calls cover whole tiles).
+  if (tileRows > 0 && tileRows <= 16) {
+    fusePlaceRuns(funcOp, tileRows);
+    SmallVector<Operation *> calls;
+    funcOp.walk([&](Operation *op) {
+      if (isa<ttkernel::LibttPlaceRowsTileOp,
+              ttkernel::LibttColumnReduceTileOp>(op)) {
+        calls.push_back(op);
+      }
+      auto reduce = dyn_cast<ttkernel::SFPUReduceTileOp>(op);
+      if (reduce && reduce.getReduceType() == ttkernel::ReduceType::Sum &&
+          reduce.getDataFormat() == ttcore::DataType::Float32 &&
+          reduce.getReduceDim() == ttkernel::ReduceDim::Row) {
+        calls.push_back(op);
+      }
+    });
+    for (Operation *op : calls) {
+      if (auto reduce = dyn_cast<ttkernel::SFPUReduceTileOp>(op)) {
+        OpBuilder b(op);
+        OperationState state(op->getLoc(),
+                             emitc::VerbatimOp::getOperationName());
+        state.addOperands(reduce.getDstIndex());
+        state.addAttribute(
+            "value", b.getStringAttr(llvm::formatv(
+                                         "MATH((libtt_sfpu::row_sum({{}, {0})));",
+                                         tileRows)
+                                         .str()));
+        state.addAttribute("libtt.sfpu_def",
+                           b.getStringAttr("// libtt in-DST tile helpers"));
+        b.create(state);
+        op->erase();
+        continue;
+      }
+      std::string args;
+      for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+        args += "{}, ";
+      }
+      OpBuilder b(op);
+      OperationState state(op->getLoc(),
+                           emitc::VerbatimOp::getOperationName());
+      state.addOperands(op->getOperands());
+      state.addAttribute(
+          "value",
+          b.getStringAttr(llvm::formatv(
+                              "MATH((libtt_sfpu::{0}({1}{2}, {3})));",
+                              isa<ttkernel::LibttPlaceRowsTileOp>(op)
+                                  ? "place_rows"
+                                  : "column_reduce",
+                              args, tileRows,
+                              op->hasAttr("libtt.col0_only") ? "true"
+                                                             : "false")
+                              .str()));
+      state.addAttribute("libtt.sfpu_def",
+                         b.getStringAttr("// libtt in-DST tile helpers"));
+      b.create(state);
+      op->erase();
+    }
+    // Their inits, when no SFPU reduce is left.
+    SmallVector<Operation *> inits;
+    bool reduces = false;
+    funcOp.walk([&](Operation *op) {
+      if (isa<ttkernel::SFPUReduceInitOp>(op)) {
+        inits.push_back(op);
+      }
+      reduces |= isa<ttkernel::SFPUReduceTileOp>(op);
+    });
+    for (Operation *init : reduces ? SmallVector<Operation *>{} : inits) {
+      init->erase();
+    }
   }
   for (Block *block : blocks) {
     SmallVector<Operation *> run;
@@ -694,11 +902,13 @@ void fuseSFPUChains(func::FuncOp funcOp) {
       // chain the parts around them (they stay LLK / helper calls).
       auto heavy = [](Operation *op) {
         return isa<ttkernel::LibttGroupSumTileOp, ttkernel::SiluTileOp,
-                   ttkernel::SigmoidTileOp, ttkernel::ExpTileOp>(op);
+                   ttkernel::SigmoidTileOp, ttkernel::ExpTileOp,
+                   ttkernel::DivBinaryTilesOp>(op);
       };
       auto heavyInit = [](Operation *op) {
         return isa<ttkernel::LibttGroupSumTileInitOp, ttkernel::SiluTileInitOp,
-                   ttkernel::SigmoidTileInitOp, ttkernel::ExpTileInitOp>(op);
+                   ttkernel::SigmoidTileInitOp, ttkernel::ExpTileInitOp,
+                   ttkernel::DivBinaryTilesInitOp>(op);
       };
       if (!emitted && llvm::any_of(run, heavy)) {
         SmallVector<SmallVector<Operation *>> parts(1);
@@ -794,9 +1004,10 @@ namespace {
 //
 // A chunk all-reduce (insertChunkAllReduce) sends its partial out of the
 // kernel and reads the exchanged one back: the partial's pack and the copy
-// at the libtt_chunk_allreduce_tile marker stay, with a DST section boundary
-// between them (the release clears DST). Nothing else may be live across
-// it; copies of input tiles are reloaded after it.
+// at each libtt_chunk_allreduce_tile marker stay, with a DST section
+// boundary between them, whose release keeps DST (insertChunkAllReduce
+// makes it libtt_tile_regs_release_keep): every other value stays in DST
+// across it.
 struct DstResidentRewriter {
   func::FuncOp funcOp;
   // Move loads from input CBs to the top (after the acquire), so the
@@ -870,6 +1081,12 @@ struct DstResidentRewriter {
       a.inPlace = true;
       return a;
     }
+    // A unary op with its own result slot (libtt_column_reduce_tile).
+    if (indices.size() == 2) {
+      a.readSlot0 = idx(indices[0]);
+      a.writeSlot = idx(indices[1]);
+      return a;
+    }
     return std::nullopt;
   }
 
@@ -894,8 +1111,11 @@ struct DstResidentRewriter {
 
   // Moves each load from an input CB (with its unpacker setup ops) to just
   // after the first acquire, in order, when its CB was waited on before the
-  // acquire and not popped before the load.
-  void hoistInputLoads(Block &block, const llvm::DenseSet<Value> &internal) {
+  // acquire and not popped before the load. A load after a chunk all-reduce's
+  // partial pack (in `boundaries`) moves only to just after that pack: it
+  // runs during the exchange instead of delaying the partial.
+  void hoistInputLoads(Block &block, const llvm::DenseSet<Value> &internal,
+                       const llvm::DenseSet<Operation *> &boundaries) {
     Operation *acquire = nullptr;
     llvm::DenseMap<Value, int64_t> waited;
     for (Operation &op : block) {
@@ -913,8 +1133,15 @@ struct DstResidentRewriter {
       return;
     }
     llvm::DenseSet<Value> popped;
-    SmallVector<SmallVector<Operation *>> groups;
+    // Per section: where its loads go, and the loads.
+    SmallVector<std::pair<Operation *, SmallVector<SmallVector<Operation *>>>>
+        sections;
+    sections.push_back({acquire, {}});
     for (Operation *op = acquire->getNextNode(); op; op = op->getNextNode()) {
+      if (boundaries.contains(op)) {
+        sections.push_back({op, {}});
+        continue;
+      }
       if (auto pop = dyn_cast<ttkernel::CBPopFrontOp>(op)) {
         popped.insert(pop->getOperand(0));
         continue;
@@ -956,32 +1183,34 @@ struct DstResidentRewriter {
         }
         group.push_back(next);
       }
-      groups.push_back(group);
+      sections.back().second.push_back(group);
     }
-    // Plain copies first, then broadcasts (fewer unpacker reconfigurations:
-    // rel 3.16 -> 3.04 us).
-    std::stable_partition(groups.begin(), groups.end(), [](auto &group) {
-      return llvm::none_of(group, [](Operation *op) {
-        return isa<ttkernel::UnaryBcastTileOp>(op);
+    for (auto &[anchor, groups] : sections) {
+      // Plain copies first, then broadcasts (fewer unpacker
+      // reconfigurations: rel 3.16 -> 3.04 us).
+      std::stable_partition(groups.begin(), groups.end(), [](auto &group) {
+        return llvm::none_of(group, [](Operation *op) {
+          return isa<ttkernel::UnaryBcastTileOp>(op);
+        });
       });
-    });
-    Operation *insertAfter = acquire;
-    for (auto &group : groups) {
-      for (Operation *op : group) {
-        for (Value v : op->getOperands()) {
-          Operation *def = v.getDefiningOp();
-          if (def && def->getBlock() == &block &&
-              insertAfter->isBeforeInBlock(def)) {
-            if (!isa<arith::ConstantOp>(def)) {
-              return;
+      Operation *insertAfter = anchor;
+      for (auto &group : groups) {
+        for (Operation *op : group) {
+          for (Value v : op->getOperands()) {
+            Operation *def = v.getDefiningOp();
+            if (def && def->getBlock() == &block &&
+                insertAfter->isBeforeInBlock(def)) {
+              if (!isa<arith::ConstantOp>(def)) {
+                return;
+              }
+              def->moveBefore(acquire);
             }
-            def->moveBefore(acquire);
           }
         }
-      }
-      for (Operation *op : group) {
-        op->moveAfter(insertAfter);
-        insertAfter = op;
+        for (Operation *op : group) {
+          op->moveAfter(insertAfter);
+          insertAfter = op;
+        }
       }
     }
   }
@@ -1072,40 +1301,38 @@ struct DstResidentRewriter {
       }
       ops.push_back(&op);
     }
-    // The chunk all-reduce's partial: its pack and the marker's copy of it.
-    Operation *exchangePack = nullptr, *exchangeLoad = nullptr;
-    SmallVector<ttkernel::LibttChunkAllReduceTileOp> markers;
-    funcOp.walk(
-        [&](ttkernel::LibttChunkAllReduceTileOp m) { markers.push_back(m); });
-    if (markers.size() > 1) {
-      return false;
-    }
-    if (!markers.empty()) {
-      auto slot = ci(markers.front().getTileIndex());
-      for (Operation *op = markers.front()->getPrevNode(); op && slot;
+    // Each chunk all-reduce's partial: its pack and the marker's copy of it.
+    llvm::DenseSet<Operation *> exchangePacks, exchangeLoads;
+    WalkResult found = funcOp.walk([&](ttkernel::LibttChunkAllReduceTileOp m) {
+      auto slot = ci(m.getTileIndex());
+      Operation *load = nullptr, *pack = nullptr;
+      for (Operation *op = m->getPrevNode(); op && slot && !load;
            op = op->getPrevNode()) {
         if (auto c = dyn_cast<ttkernel::CopyTileOp>(op);
             c && ci(c.getTileIndexDst()) == slot) {
-          exchangeLoad = c;
-          break;
+          load = c;
         }
       }
-      if (!exchangeLoad || !internal.contains(cbOf(exchangeLoad))) {
-        return false;
+      auto page = load ? ci(load->getOperand(1)) : std::nullopt;
+      if (!page || !internal.contains(cbOf(load))) {
+        return WalkResult::interrupt();
       }
-      auto page = ci(exchangeLoad->getOperand(1));
-      for (Operation *op = exchangeLoad->getPrevNode(); op && page;
+      for (Operation *op = load->getPrevNode(); op && !pack;
            op = op->getPrevNode()) {
         if (auto p = dyn_cast<ttkernel::PackTileOp>(op);
-            p && p.getOutCb() == cbOf(exchangeLoad) &&
-            ci(p.getOutIndex()) == page) {
-          exchangePack = p;
-          break;
+            p && p.getOutCb() == cbOf(load) && ci(p.getOutIndex()) == page) {
+          pack = p;
         }
       }
-      if (!exchangePack) {
-        return false;
+      if (!pack) {
+        return WalkResult::interrupt();
       }
+      exchangeLoads.insert(load);
+      exchangePacks.insert(pack);
+      return WalkResult::advance();
+    });
+    if (found.wasInterrupted()) {
+      return false;
     }
 
     // Values: slot -> current value; (cb, tile) -> value.
@@ -1211,17 +1438,14 @@ struct DstResidentRewriter {
         vals.push_back(Val{def, -1, -1});
         return static_cast<int>(vals.size() - 1);
       };
-      if (op == exchangePack) {
+      if (exchangePacks.contains(op)) {
         info.in0 = cur(acc->readSlot0);
         if (info.in0 < 0) {
           return false;
         }
         use(info.in0, at);
         info.exchange = true;
-        // Loads after the boundary are new values.
-        externalLoads.clear();
-        internalBcasts.clear();
-      } else if (op == exchangeLoad) {
+      } else if (exchangeLoads.contains(op)) {
         info.out = fresh(op);
         slotVal[acc->writeSlot] = info.out;
       } else if (auto copy = dyn_cast<ttkernel::CopyTileOp>(op)) {
@@ -1305,6 +1529,38 @@ struct DstResidentRewriter {
           }
           bool row = type.getValue() == ttkernel::BcastType::Row;
           info.bcastRow = row;
+          // A broadcast of a plain copy of an input tile: the unpacker
+          // broadcasts from that input instead (its pop moves to the end).
+          auto src =
+              dyn_cast_or_null<ttkernel::CopyTileOp>(vals[it->second].def);
+          if (src && reloadable.contains(src.getCb0()) &&
+              ci(src.getTileIndexCb())) {
+            // Its own unpacker setup (the internal CB's goes with that CB).
+            Value cb = src.getCb0();
+            OpBuilder rb(op);
+            rb.create<ttkernel::ReconfigDataFormatSrcAOp>(op->getLoc(), cb);
+            rb.create<ttkernel::ReconfigDataFormatSrcBOp>(op->getLoc(), cb);
+            rb.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, Value(),
+                                                  type);
+            rb.setInsertionPointAfter(op);
+            rb.create<ttkernel::UnaryBcastUninitOp>(op->getLoc(), cb, type);
+            op->setOperand(0, cb);
+            op->setOperand(1, src.getTileIndexCb());
+            delayedPops.insert(cb);
+            auto key = std::make_tuple(cbKey(cb), *ci(src.getTileIndexCb()),
+                                       static_cast<int>(type.getValue()));
+            if (auto ext = externalLoads.find(key);
+                ext != externalLoads.end()) {
+              slotVal[acc->writeSlot] = ext->second;
+              info.erase = true;
+            } else {
+              info.out = fresh(op);
+              slotVal[acc->writeSlot] = info.out;
+              externalLoads[key] = info.out;
+            }
+            infos.push_back(info);
+            continue;
+          }
           auto hit = internalBcasts.find({it->second, row ? 2 : 1});
           if (hit != internalBcasts.end()) {
             slotVal[acc->writeSlot] = hit->second;
@@ -1365,7 +1621,7 @@ struct DstResidentRewriter {
     }
     if (hoistLoads || !delayedPops.empty()) {
       if (hoistLoads) {
-        hoistInputLoads(block, internal);
+        hoistInputLoads(block, internal, exchangePacks);
       }
       std::stable_sort(infos.begin(), infos.end(),
                        [](const OpInfo &a, const OpInfo &b) {
@@ -1427,6 +1683,9 @@ struct DstResidentRewriter {
           uniform[info.out] =
               isa<ttkernel::LibttChunkAllReduceTileOp, ttkernel::FillTileOp>(
                   info.op) ||
+              (isa<ttkernel::LibttPlaceRowsTileOp>(info.op) &&
+               info.in0 >= 0 && info.in1 >= 0 && uniform[info.in0] &&
+               uniform[info.in1]) ||
               (!info.bcastInternal && elementwise(info.op) &&
                (info.in0 >= 0 || info.in1 >= 0) &&
                (info.in0 < 0 || uniform[info.in0]) &&
@@ -1443,7 +1702,10 @@ struct DstResidentRewriter {
                                                                     : kCol0);
         } else if (info.out >= 0 && demand[info.out] != kNone) {
           int d = demand[info.out];
-          if (!elementwise(info.op)) {
+          // Row moves and column reductions keep columns apart too.
+          if (!elementwise(info.op) &&
+              !isa<ttkernel::LibttPlaceRowsTileOp,
+                   ttkernel::LibttColumnReduceTileOp>(info.op)) {
             d = kFull;
           }
           need(info.in0, d);
@@ -1466,7 +1728,9 @@ struct DstResidentRewriter {
           continue;
         }
         if (info.out >= 0 && demand[info.out] == kCol0 &&
-            elementwise(info.op)) {
+            (elementwise(info.op) ||
+             isa<ttkernel::LibttPlaceRowsTileOp,
+                 ttkernel::LibttColumnReduceTileOp>(info.op))) {
           info.op->setAttr("libtt.col0_only",
                            UnitAttr::get(funcOp.getContext()));
         }
@@ -1491,26 +1755,6 @@ struct DstResidentRewriter {
       }
       if (info.undefined && info.out >= 0) {
         return false;
-      }
-    }
-
-    // Nothing but the partial crosses the exchange's section boundary.
-    if (exchangePack) {
-      int boundary = -1;
-      std::vector<int> defAt(vals.size(), -1);
-      for (size_t i = 0; i < infos.size(); ++i) {
-        if (infos[i].exchange) {
-          boundary = static_cast<int>(i);
-        }
-        if (infos[i].out >= 0) {
-          defAt[infos[i].out] = static_cast<int>(i);
-        }
-      }
-      for (size_t v = 0; v < vals.size(); ++v) {
-        if (defAt[v] >= 0 && defAt[v] < boundary &&
-            vals[v].lastUse > boundary) {
-          return false;
-        }
       }
     }
 
@@ -1571,6 +1815,17 @@ struct DstResidentRewriter {
       if (info.out >= 0 && vals[info.out].lastUse < 0) {
         busy[vals[info.out].slot] = false;
       }
+      // A chunk all-reduce's marker gets a slot free there: the exchange
+      // sums its received tiles in it (insertChunkAllReduce).
+      if (isa<ttkernel::LibttChunkAllReduceTileOp>(info.op)) {
+        auto free = llvm::find(busy, false);
+        if (free == busy.end()) {
+          return false;
+        }
+        info.op->setAttr("libtt.tmp_slot",
+                         IntegerAttr::get(IntegerType::get(funcOp.getContext(), 64),
+                                          std::distance(busy.begin(), free)));
+      }
     }
 
     for (OpInfo &info : infos) {
@@ -1601,13 +1856,19 @@ struct DstResidentRewriter {
       b.setInsertionPoint(at);
       return b.create<arith::ConstantIndexOp>(at->getLoc(), v);
     };
+    // libtt.tile_rows: the helpers write only the rows that exist.
+    std::string rowsArg;
+    if (auto rows = funcOp->getAttrOfType<IntegerAttr>("libtt.tile_rows");
+        rows && rows.getInt() > 0 && rows.getInt() <= 16) {
+      rowsArg = llvm::formatv(", {0}", rows.getInt()).str();
+    }
     auto helperCall = [&](Operation *at, StringRef fn, int from, int to) {
       b.setInsertionPoint(at);
       OperationState state(at->getLoc(), emitc::VerbatimOp::getOperationName());
       state.addAttribute(
           "value", b.getStringAttr(llvm::formatv("MATH((libtt_sfpu::{0}<{1}, "
-                                                 "{2}>()));",
-                                                 fn, from, to)
+                                                 "{2}{3}>()));",
+                                                 fn, from, to, rowsArg)
                                        .str()));
       state.addAttribute("libtt.sfpu_def",
                          b.getStringAttr("// libtt in-DST tile helpers"));
@@ -1666,7 +1927,7 @@ struct DstResidentRewriter {
         b.create<ttkernel::TileRegsAcquireOp>(loc);
         continue;
       }
-      if (op == exchangeLoad) {
+      if (exchangeLoads.contains(op)) {
         b.setInsertionPoint(op);
         b.create<ttkernel::ReconfigDataFormatSrcAOp>(op->getLoc(), cbOf(op));
         b.create<ttkernel::CopyTileInitOp>(op->getLoc(), cbOf(op));
@@ -1692,6 +1953,9 @@ struct DstResidentRewriter {
           idxOperands[0]->set(idxConst(op, vals[info.in0].slot));
           idxOperands[1]->set(idxConst(op, vals[info.in1].slot));
           idxOperands[2]->set(idxConst(op, vals[info.out].slot));
+        } else if (idxOperands.size() == 2) {
+          idxOperands[0]->set(idxConst(op, vals[info.in0].slot));
+          idxOperands[1]->set(idxConst(op, vals[info.out].slot));
         } else if (idxOperands.size() == 1) {
           idxOperands[0]->set(idxConst(op, vals[info.out].slot));
         }

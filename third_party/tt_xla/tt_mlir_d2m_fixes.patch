@@ -1,7 +1,17 @@
 diff --git a/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h b/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h
 --- a/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h
 +++ b/include/ttmlir/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.h
-@@ -316,6 +316,17 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
+@@ -154,6 +154,9 @@ public:
+   unsigned getInputSliceIndex(unsigned n) const;
+ 
+   void deallocateIntermediate(unsigned id);
++  // libtt: an input slice whose load was consumed (its one reader ran), for
++  // later intermediates.
++  void releaseInput(unsigned id);
+   void deallocateAllButFirstInput();
+ 
+ private:
+@@ -316,6 +319,17 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
  
  bool isDstScopeIV(Value iv, Operation *linalgRoot);
  
@@ -1218,7 +1228,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
        : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
          D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
                                 ttnnMode, collapseTensors,
-@@ -2141,7 +2116,22 @@ private:
+@@ -2141,7 +2116,25 @@ private:
        return rewriter.notifyMatchFailure(
            op, "integer tile reduction is not supported for this op");
      }
@@ -1235,14 +1245,17 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +              mlir::cast<IntegerAttr>(attr).getInt(),
 +              inputTensorType.getRank())] = true;
 +        }
-+        sfpuFloatRow = dims.back() && llvm::count(dims, true) == 1;
++        // libtt: also the columns (dim -2) alone, on the SFPU's column
++        // reduce: the FPU path computes in TF32.
++        sfpuFloatRow = (dims.back() || dims[dims.size() - 2]) &&
++                       llvm::count(dims, true) == 1;
 +      }
 +    }
 +    const bool hasScaler = isFloat && !sfpuFloatRow;
      SmallVector<mlir::Value> newInputs(origInputs.begin(), origInputs.end());
      if (hasScaler) {
        newInputs.emplace_back(this->createScaler(rewriter, loc, inputTensorType,
-@@ -2221,6 +2211,7 @@ private:
+@@ -2221,6 +2214,7 @@ private:
                  yield = bbBuilder.create<FloatTileOp>(
                      loc, resultType, aArg, bArg, cArg, reduceDimAttr);
                } else {
@@ -1250,7 +1263,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                  if constexpr (kIntSupported) {
                    yield = bbBuilder.create<IntTileOp>(loc, resultType, aArg,
                                                        cArg, reduceDimAttr);
-@@ -2262,7 +2253,7 @@ private:
+@@ -2262,14 +2256,15 @@ private:
    static SmallVector<mlir::AffineMap>
    getAffineMapsArray(mlir::OpBuilder &builder, ConcreteOp op, std::size_t arity,
                       std::size_t rank, bool hasScaler) {
@@ -1259,7 +1272,16 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  
      mlir::AffineExpr zero =
          mlir::getAffineConstantExpr(0, builder.getContext());
-@@ -2293,7 +2284,7 @@ private:
+ 
+     mlir::MutableAffineMap accumulator(builder.getMultiDimIdentityMap(rank));
++    const bool inTile = reducesWithinTileRows(op, rank);
+     forAllDims(rank, dimArg, [&](std::size_t index, bool dropped) {
+-      if (dropped) {
++      if (dropped && !(inTile && index == rank - 2)) {
+         accumulator.setResult(index, zero);
+       }
+     });
+@@ -2293,7 +2288,7 @@ private:
    static SmallVector<mlir::Attribute>
    getIteratorTypesArray(mlir::OpBuilder &builder, ConcreteOp op,
                          std::size_t rank) {
@@ -1268,7 +1290,44 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  
      auto parallel = ttcore::IteratorTypeAttr::get(
          builder.getContext(), ttcore::IteratorType::Parallel);
-@@ -2327,12 +2318,36 @@ private:
+@@ -2301,14 +2296,35 @@ private:
+         builder.getContext(), ttcore::IteratorType::Reduction);
+ 
+     SmallVector<mlir::Attribute> iterators(rank, parallel);
++    const bool inTile = reducesWithinTileRows(op, rank);
+     forAllDims(rank, dimArg, [&](std::size_t index, bool dropped) {
+-      if (dropped) {
++      if (dropped && !(inTile && index == rank - 2)) {
+         iterators[index] = reduction;
+       }
+     });
+     return iterators;
+   }
+ 
++  /// libtt: a reduction over logical dim -2 of a tensor whose leading dims
++  /// fold into the physical rows ([k, R, c], R <= 32: each leading index's R
++  /// rows start a tile row) reduces within each tile, not across the tile
++  /// rows: the physical row iterator stays parallel (it reduced over the
++  /// leading dims too, into tile row 0).
++  static bool reducesWithinTileRows(ConcreteOp op, std::size_t rank) {
++    auto inputType = mlir::cast<RankedTensorType>(op.getInput().getType());
++    const std::size_t logicalRank = inputType.getRank();
++    if (logicalRank <= rank) {
++      return false;
++    }
++    mlir::ArrayAttr dimArg = getDimArg(op);
++    if (dimArg.size() != 1) {
++      return false;
++    }
++    std::size_t d = normalizeReductionDimIndex(
++        mlir::cast<IntegerAttr>(dimArg[0]).getInt(), logicalRank);
++    return d == logicalRank - 2 && inputType.getDimSize(d) <= 32;
++  }
++
+   // For mean reduction, the scaler must encode 1/N where N is the product of
+   // the reduction dimension sizes. For all other reductions, the scaler is 1.0.
+   static double getScaleValue(ConcreteOp op) {
+@@ -2327,12 +2343,36 @@ private:
      return 1.0;
    }
  
@@ -1754,7 +1813,50 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
        if (linalgRoot && current == linalgRoot) {
          break;
        }
-@@ -610,8 +612,32 @@ void setDstScratchIndex(OperandLoadStoreRegisterOpInterface computeOp,
+@@ -154,7 +156,10 @@ void debugDumpDstSliceAllocator(StringRef header, ArrayRef<unsigned> sliceStack,
+ } // namespace
+ 
+ unsigned DstSliceAllocator::allocateInput() {
+-  TT_assertv(!sliceStack.empty(), "Out of dst slices");
++  // libtt: also in release builds (an empty pop gave slice 16, past DST).
++  if (sliceStack.empty()) {
++    llvm::report_fatal_error("D2M: out of DST slices");
++  }
+ 
+   unsigned id = sliceStack.pop_back_val();
+   currSliceIndex = id;
+@@ -193,7 +198,10 @@ unsigned DstSliceAllocator::allocateInputStrided(unsigned stride) {
+ }
+ 
+ unsigned DstSliceAllocator::allocateOutput() {
+-  TT_assertv(!sliceStack.empty(), "Out of dst slices");
++  // libtt: also in release builds (an empty pop gave slice 16, past DST).
++  if (sliceStack.empty()) {
++    llvm::report_fatal_error("D2M: out of DST slices");
++  }
+ 
+   unsigned id = sliceStack.pop_back_val();
+   currSliceIndex = id;
+@@ -237,6 +245,18 @@ unsigned DstSliceAllocator::getInputSliceIndex(unsigned n) const {
+   return inputStack[n];
+ }
+ 
++void DstSliceAllocator::releaseInput(unsigned id) {
++  auto it = llvm::find(inputStack, id);
++  if (it == inputStack.end() || llvm::is_contained(sliceStack, id)) {
++    return;
++  }
++  inputStack.erase(it);
++  sliceStack.push_back(id);
++  if (currSliceIndex && *currSliceIndex == id) {
++    currSliceIndex = std::nullopt;
++  }
++}
++
+ void DstSliceAllocator::deallocateIntermediate(unsigned id) {
+   if (llvm::is_contained(inputStack, id)) {
+     return;
+@@ -610,8 +630,32 @@ void setDstScratchIndex(OperandLoadStoreRegisterOpInterface computeOp,
    TT_assertv(computeOp.getNumDstScratchSlices() == 1,
               "setDstScratchIndex supports exactly one scratch slice");
    Operation *op = computeOp.getOperation();
@@ -1788,7 +1890,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
    op->setAttr("dst_scratch_index",
                mlir::IntegerAttr::get(
                    mlir::IntegerType::get(op->getContext(), 64), dstIndex));
-@@ -1177,27 +1203,34 @@ cloneAffineLoopSkeleton(PatternRewriter &rewriter, Operation *loopNestOrOp) {
+@@ -1177,27 +1221,34 @@ cloneAffineLoopSkeleton(PatternRewriter &rewriter, Operation *loopNestOrOp) {
  void replaceLoadWithDst(PatternRewriter &rewriter, const DstAccess &access,
                          Value dst, AffineMap dstAccessMap,
                          ValueRange dstAccessIndices) {
@@ -1834,7 +1936,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
    default:
      llvm_unreachable("replaceLoadWithDst expects a load access");
    }
-@@ -1210,13 +1243,28 @@ void replaceStoreWithDst(PatternRewriter &rewriter, const DstAccess &access,
+@@ -1210,13 +1261,28 @@ void replaceStoreWithDst(PatternRewriter &rewriter, const DstAccess &access,
    case DstAccessKind::AffineStore: {
      auto storeOp = cast<affine::AffineStoreOp>(access.op);
      Value valueToStore = storeOp.getValue();
@@ -1868,7 +1970,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
      }
      rewriter.replaceOpWithNewOp<affine::AffineStoreOp>(
          storeOp, valueToStore, dst, dstAccessMap, dstAccessIndices);
-@@ -1600,7 +1648,23 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
+@@ -1600,7 +1666,23 @@ void fixDstIntermediateResults(PatternRewriter &rewriter, Location loc,
    }
  }
  
@@ -1892,7 +1994,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
    if (!linalgRoot) {
      return true;
    }
-@@ -1661,10 +1725,25 @@ buildIndices(PatternRewriter &rewriter, Location loc,
+@@ -1661,10 +1743,25 @@ buildIndices(PatternRewriter &rewriter, Location loc,
      }
    }
  
@@ -1920,7 +2022,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
      return {l1AccessMap, l1AccessIndices, dstAccessMap, {}};
    }
  
-@@ -1678,7 +1757,8 @@ buildIndices(PatternRewriter &rewriter, Location loc,
+@@ -1678,7 +1775,8 @@ buildIndices(PatternRewriter &rewriter, Location loc,
    }
  
    AffineExpr linearExpr = getAffineConstantExpr(
@@ -1941,10 +2043,72 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
  #include "mlir/Dialect/SCF/IR/SCF.h"
  #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
  
-@@ -64,6 +65,10 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -64,6 +65,72 @@ collectDstAccesses(GenericOp gOp, Region &region,
      remainingUses[computeOp.getOperation()] = useCount;
    });
  
++  // libtt: a nest's CB->DST loads run ahead of its compute ops (the copy
++  // nest), so every load takes its slice before any intermediate does: an
++  // input placed in a slice an earlier intermediate had freed was
++  // overwritten when that intermediate was computed. A CB tile read by
++  // several compute ops gets a load per read: each access replaces its load
++  // with a DST read, so a second access of the same load used an erased op
++  // (softmax: x feeds max(x) and x - max(x)).
++  llvm::DenseMap<Operation *, int> inputSlices;
++  // Broadcasts of CB tiles unpack in the copy nest too.
++  llvm::DenseMap<Operation *, int> cbBcastSlices;
++  {
++    // Load -> the compute op that reads it (an op reading one load twice,
++    // x * x, shares its slice).
++    llvm::DenseMap<Operation *, Operation *> loadReader;
++    region.walk([&](OperandLoadStoreRegisterOpInterface computeOp) {
++      if (mlir::isa<d2m::TileBcastOp>(computeOp)) {
++        if (auto load = computeOp->getOperand(0)
++                            .getDefiningOp<affine::AffineLoadOp>();
++            load && ttcore::getMemorySpace(load.getMemRef()) !=
++                        ttcore::MemorySpace::RegisterDst) {
++          if (!loadReader.try_emplace(load.getOperation(),
++                                      computeOp.getOperation())
++                   .second) {
++            OpBuilder b(computeOp.getOperation());
++            Operation *clone = b.clone(*load.getOperation());
++            computeOp->setOperand(0, clone->getResult(0));
++            loadReader[clone] = computeOp.getOperation();
++          }
++          cbBcastSlices[computeOp.getOperation()] =
++              static_cast<int>(dstAllocator.allocateInput());
++        }
++        return;
++      }
++      for (int64_t operandIdx : computeOp.getOperandsLoadFromDstRegister()) {
++        if (computeOp.isScalarOperand(operandIdx)) {
++          continue;
++        }
++        auto load = computeOp->getOperand(operandIdx)
++                        .getDefiningOp<affine::AffineLoadOp>();
++        if (!load || ttcore::getMemorySpace(load.getMemRef()) ==
++                         ttcore::MemorySpace::RegisterDst) {
++          continue;
++        }
++        auto [it, first] =
++            loadReader.try_emplace(load.getOperation(), computeOp.getOperation());
++        if (!first) {
++          if (it->second == computeOp.getOperation()) {
++            continue;
++          }
++          OpBuilder b(computeOp.getOperation());
++          load = mlir::cast<affine::AffineLoadOp>(
++              b.clone(*load.getOperation()));
++          computeOp->setOperand(operandIdx, load.getResult());
++          loadReader[load.getOperation()] = computeOp.getOperation();
++        }
++        inputSlices[load.getOperation()] =
++            static_cast<int>(dstAllocator.allocateInputStrided(
++                static_cast<unsigned>(computeOp.getDstInputSliceStride())));
++      }
++    });
++  }
++
 +  // libtt: slices of broadcasts of CB tiles (not DST intermediates), so an
 +  // in-place op on such a broadcast writes where the LLK writes (its
 +  // operand's slice); a fresh slice here left the result unwritten.
@@ -1952,7 +2116,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
    auto getInPlaceDstSlice =
        [&](OperandLoadStoreRegisterOpInterface op) -> std::optional<int> {
      for (int64_t operandIdx : op.getOperandsLoadFromDstRegister()) {
-@@ -72,6 +77,13 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -72,6 +139,13 @@ collectDstAccesses(GenericOp gOp, Region &region,
        }
        auto *defOp = op->getOperand(operandIdx).getDefiningOp();
        if (defOp) {
@@ -1966,7 +2130,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          auto *it = dstIntermediates.find(defOp);
          auto remainingIt = remainingUses.find(defOp);
          if (it != dstIntermediates.end() &&
-@@ -83,9 +95,46 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -83,9 +157,46 @@ collectDstAccesses(GenericOp gOp, Region &region,
      return std::nullopt;
    };
  
@@ -2013,7 +2177,28 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          for (Value operand : op->getOperands()) {
            Operation *defOp = operand.getDefiningOp();
            auto *dstIt = dstIntermediates.find(defOp);
-@@ -185,13 +234,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -134,10 +245,6 @@ collectDstAccesses(GenericOp gOp, Region &region,
+     const SmallVector<int64_t> accumOperandIndices =
+         getAccumClassificationOperandIndices(computeOp);
+ 
+-    // Ops whose LLK addresses hidden slices relative to an operand slot need
+-    // their DST inputs spread apart (see `getDstInputSliceStride`).
+-    const unsigned inputSliceStride =
+-        static_cast<unsigned>(computeOp.getDstInputSliceStride());
+ 
+     int numLoads = 0;
+     std::optional<int> firstInputDstSlice;
+@@ -149,8 +256,7 @@ collectDstAccesses(GenericOp gOp, Region &region,
+       auto potentialLoad = computeOp->getOperand(operandIdx)
+                                .getDefiningOp<affine::AffineLoadOp>();
+       if (potentialLoad && notDstMemspace(potentialLoad)) {
+-        int dstSlice = static_cast<int>(
+-            dstAllocator.allocateInputStrided(inputSliceStride));
++        int dstSlice = inputSlices.lookup(potentialLoad.getOperation());
+         if (numLoads == 0) {
+           firstInputDstSlice = dstSlice;
+         }
+@@ -185,13 +291,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
      for (auto *user : computeOp->getUsers()) {
        if (auto potentialStore = mlir::dyn_cast<affine::AffineStoreOp>(user);
            notDstMemspace(potentialStore)) {
@@ -2033,7 +2218,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            bool isUnaryOp = computeOp->getNumOperands() == 1;
            bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
            bool isReduction = isTileReductionOp(computeOp);
-@@ -199,9 +251,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -199,9 +308,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
                       "in-place DST only supported for unary, tile matmul, "
                       "reductions, and tile+scalar ops");
            dstSlice = getReusableOrFallbackDstSlice();
@@ -2051,7 +2236,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          } else {
            dstSlice = static_cast<int>(dstAllocator.allocateOutput());
            dstAllocator.setStoreToDst();
-@@ -210,13 +269,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -210,13 +326,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
          collectDstStoreAccess(potentialStore, copyInfos, dstSlice,
                                outermostInnerComputeLoop);
        } else if (auto scratchStore = mlir::dyn_cast<memref::StoreOp>(user)) {
@@ -2071,7 +2256,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            bool isUnaryOp = computeOp->getNumOperands() == 1;
            bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
            bool isReduction = isTileReductionOp(computeOp);
-@@ -224,9 +286,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -224,9 +343,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
                       "in-place DST only supported for unary, tile matmul, "
                       "reductions, and tile+scalar ops");
            dstSlice = getReusableOrFallbackDstSlice();
@@ -2089,9 +2274,16 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          } else {
            dstSlice = static_cast<int>(dstAllocator.allocateOutput());
            dstAllocator.setStoreToDst();
-@@ -244,8 +313,10 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -242,10 +368,16 @@ collectDstAccesses(GenericOp gOp, Region &region,
+         }
+ 
          int dstSlice;
-         if (computeOp.getDstRegInPlace() || computeOp.isScalarOperand(1)) {
+-        if (computeOp.getDstRegInPlace() || computeOp.isScalarOperand(1)) {
++        if (auto bit = cbBcastSlices.find(computeOp.getOperation());
++            bit != cbBcastSlices.end()) {
++          dstSlice = bit->second;
++        } else if (computeOp.getDstRegInPlace() ||
++                   computeOp.isScalarOperand(1)) {
            dstSlice = getReusableOrFallbackDstSlice();
 -        } else if (numLoads >= 2) {
 +        } else if (numLoads >= 1) {
@@ -2101,7 +2293,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          } else {
            dstSlice = static_cast<int>(dstAllocator.allocateOutput());
          }
-@@ -256,6 +327,7 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -256,6 +388,7 @@ collectDstAccesses(GenericOp gOp, Region &region,
                computeOp->getOperand(0).getDefiningOp<affine::AffineLoadOp>();
            auto bcastOp = mlir::cast<d2m::TileBcastOp>(computeOp);
            producedDstSlice = dstSlice;
@@ -2109,9 +2301,33 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
            recordDstAccess(loadOp, bcastOp, copyInfos, dstSlice,
                            outermostInnerComputeLoop, /*emitGuard=*/true);
          } else {
-@@ -267,7 +339,15 @@ collectDstAccesses(GenericOp gOp, Region &region,
+@@ -266,8 +399,39 @@ collectDstAccesses(GenericOp gOp, Region &region,
+     }
  
      releaseConsumedIntermediates(computeOp, producedDstSlice);
++    // libtt: the CB tiles this op read (each load has this one reader) free
++    // their slices for later intermediates: the loads ran ahead of the
++    // compute ops. Not across reduction iterations (each reloads them).
++    if (llvm::all_of(excludedDstIVs(), [](Value iv) {
++          auto loop = affine::getForInductionVarOwner(iv);
++          return loop && loop.getConstantLowerBound() == 0 &&
++                 loop.hasConstantBounds() &&
++                 loop.getConstantUpperBound() == loop.getStepAsInt();
++        })) {
++      for (int64_t operandIdx : computeOp.getOperandsLoadFromDstRegister()) {
++        if (computeOp.isScalarOperand(operandIdx)) {
++          continue;
++        }
++        auto load = computeOp->getOperand(operandIdx)
++                        .getDefiningOp<affine::AffineLoadOp>();
++        auto it = load ? inputSlices.find(load.getOperation())
++                       : inputSlices.end();
++        if (it != inputSlices.end() &&
++            (!producedDstSlice || *producedDstSlice != it->second)) {
++          dstAllocator.releaseInput(static_cast<unsigned>(it->second));
++        }
++      }
++    }
  
 -    // Reserve any per-op DST scratch slices.
 +    // Reserve any per-op DST scratch slices. A fused SFPU reduction reduces
@@ -2126,7 +2342,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
      for (int64_t i = 0, n = computeOp.getNumDstScratchSlices(); i < n; ++i) {
        setDstScratchIndex(computeOp, dstAllocator.allocateScratch(),
                           outermostInnerComputeLoop);
-@@ -288,8 +368,43 @@ static void dataCopyGenerate(PatternRewriter &rewriter, Location loc, Value dst,
+@@ -288,8 +452,52 @@ static void dataCopyGenerate(PatternRewriter &rewriter, Location loc, Value dst,
      auto insertionPointAfterLoopNest = rewriter.saveInsertionPoint();
  
      rewriter.setInsertionPoint(loopNestOrOp);
@@ -2165,14 +2381,23 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
 +                      /*isLoadSide=*/true, /*cloneLoopNest=*/false,
 +                      disableL1Acc);
 +    } else {
-+      emitDstCopyNest(rewriter, loopNestOrOp, dst, copyInfo.loads,
++      // libtt: a load read twice by one op (f(x, x)) is copied once;
++      // its uses share the slice.
++      SmallVector<DstAccess> loads;
++      llvm::SmallPtrSet<Operation *, 8> loadOps;
++      for (const DstAccess &load : copyInfo.loads) {
++        if (loadOps.insert(load.op).second) {
++          loads.push_back(load);
++        }
++      }
++      emitDstCopyNest(rewriter, loopNestOrOp, dst, loads,
 +                      /*isLoadSide=*/true, /*cloneLoopNest=*/true,
 +                      disableL1Acc);
 +    }
  
      rewriter.restoreInsertionPoint(insertionPointAfterLoopNest);
      emitDstCopyNest(rewriter, loopNestOrOp, dst, copyInfo.stores,
-@@ -355,9 +470,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -355,9 +563,18 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
            return WalkResult::advance();
          }
  
@@ -2193,7 +2418,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          }
  
          if (loopOp->hasAttr("d2m.dst_access_inserted")) {
-@@ -375,6 +499,37 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -375,6 +592,37 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
              disableL1Acc || !hasTileMatmul(loopOp) ||
              !allTileMatmulOutputsSupportPackerL1Acc(loopOp);
  
@@ -2231,7 +2456,7 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp 
          auto [copyInfos, dstIntermediates] =
              collectDstAccesses(gOp, *loopRegion, loopOp, dstCapacity);
  
-@@ -385,6 +540,7 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
+@@ -385,6 +633,7 @@ struct D2MInsertDstRegisterAccessUnscheduledRewriter final
                 const CopyInfoMap &ci, bool disableL1Acc) {
                dataCopyGenerate(rw, loc, dst, ci, disableL1Acc);
              });

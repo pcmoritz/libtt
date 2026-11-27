@@ -5,15 +5,17 @@
 // ttmlir/D2MFusion.h, ttir.chunk_allreduce). A wide-row reduction split in k
 // chunks runs as one row-merged kernel with one chunk per core; each core's
 // row sums (one FP32 tile, column 0) are packed by one compute phase and read
-// by a later one at the libtt_chunk_allreduce_tile marker. Here, after
+// by a later one at a libtt_chunk_allreduce_tile marker (one exchange per
+// marker, in order). Here, after
 // D2MToTTNN, that pack goes to a new one-tile CB P, which the reader kernel
 // takes (libtt_dm_chunk_allreduce): it writes the row sums into row `me` of
 // the root core's new gather CB R (ceil(k / 32) tiles) and bumps the root's
 // semaphore; the root multicasts R to the others once all rows arrived, and
 // every core pushes R. The consuming phase reads R instead, adds its tiles
-// and, at the marker, sums the rows and turns row 0 into the columns
-// (libtt_chunk_allreduce_tile). tt-metal's sharded layernorm kernels gather
-// and multicast partials the same way.
+// and, at the marker, sums the rows and turns the row into the columns
+// (libtt_sfpu::add_gather, gather_combine: only the partial's rows).
+// tt-metal's sharded layernorm kernels gather and multicast partials the
+// same way.
 
 #include "ttmlir/D2MFusion.h"
 
@@ -57,13 +59,6 @@ Value newArg(func::FuncOp func, int64_t index, Type type) {
   Location loc = func.getLoc();
   Value i = b.create<arith::ConstantIndexOp>(loc, index);
   return b.create<ttk::GetCommonArgValOp>(loc, type, i);
-}
-
-SmallVector<Attribute> withArgs(ArrayRef<Attribute> args,
-                                ArrayRef<Attribute> extra) {
-  SmallVector<Attribute> all(args.begin(), args.end());
-  all.append(extra.begin(), extra.end());
-  return all;
 }
 
 // The marker's operand: the tile copied from CB `cb` at index `index` into
@@ -113,12 +108,30 @@ FailureOr<Partial> findPartial(func::FuncOp compute,
   return p;
 }
 
+// An SFPU helper call (libtt_sfpu::<fn>(slots..., rows)) before `at`.
+void helperCall(OpBuilder &b, Operation *at, StringRef fn, ValueRange slots,
+                int64_t rows) {
+  b.setInsertionPoint(at);
+  std::string call = "MATH((libtt_sfpu::" + fn.str() + "(";
+  for (size_t i = 0; i < slots.size(); ++i) {
+    call += "{}, ";
+  }
+  call += std::to_string(rows) + ")));";
+  OperationState state(at->getLoc(), emitc::VerbatimOp::getOperationName());
+  state.addOperands(slots);
+  state.addAttribute("value", b.getStringAttr(call));
+  state.addAttribute("libtt.sfpu_def",
+                     b.getStringAttr("// libtt in-DST tile helpers"));
+  b.create(state);
+}
+
 // The pack of the partial goes to `send`; the phase that read it reads R's
-// tiles instead and adds them before the marker (which combines the gather
-// tile's rows).
+// tiles instead and adds them (the columns < rows), then combines the gather
+// rows where the marker was (libtt_sfpu::gather_combine).
 LogicalResult rewriteCompute(func::FuncOp compute,
                              ttk::LibttChunkAllReduceTileOp marker, Partial p,
-                             Value send, Value recv, int64_t recvTiles) {
+                             Value send, Value recv, int64_t recvTiles,
+                             int64_t rows) {
   Location loc = marker.getLoc();
   OpBuilder top(compute.getContext());
   top.setInsertionPointToStart(&compute.getBody().front());
@@ -148,12 +161,25 @@ LogicalResult rewriteCompute(func::FuncOp compute,
   p.copy.getTileIndexCbMutable().assign(zero);
   b.setInsertionPointAfter(marker);
   b.create<ttk::CBPopFrontOp>(loc, recv, pages);
-  if (recvTiles == 1) {
-    return success();
+  Operation *at = marker->getPrevNode();
+  if (!isa_and_nonnull<ttk::LibttChunkAllReduceTileInitOp>(at)) {
+    at = marker;
   }
-  // A free DST slot for the other tiles: one no tile op of the marker's
-  // acquired section names (its indices are constants). FP32 DST holds 4
-  // tiles in half-sync mode, 8 in full-sync mode (keepKernelInDst).
+  auto combine = [&]() {
+    helperCall(b, marker, "gather_combine", marker.getTileIndex(), rows);
+    if (at != marker) {
+      at->erase();
+    }
+    marker->erase();
+    return success();
+  };
+  if (recvTiles == 1) {
+    return combine();
+  }
+  // A free DST slot for the other tiles: in a kernel kept in DST, the one
+  // keepKernelInDst found free at the marker (libtt.tmp_slot); else one no
+  // tile op of the marker's acquired section names (its indices are
+  // constants; FP32 DST holds 4 tiles in half-sync mode).
   Operation *acquire = nullptr, *commit = nullptr;
   for (Operation *op = marker->getPrevNode(); op && !acquire;
        op = op->getPrevNode()) {
@@ -184,12 +210,10 @@ LogicalResult rewriteCompute(func::FuncOp compute,
   while (used.contains(tmp)) {
     ++tmp;
   }
-  if (tmp >= (compute->hasAttr("libtt.dst_full_sync") ? 8 : 4)) {
+  if (auto slot = marker->getAttrOfType<IntegerAttr>("libtt.tmp_slot")) {
+    tmp = slot.getInt();
+  } else if (tmp >= 4) {
     return marker.emitError("libtt: chunk all-reduce: no free DST slot");
-  }
-  Operation *at = marker->getPrevNode();
-  if (!isa_and_nonnull<ttk::LibttChunkAllReduceTileInitOp>(at)) {
-    at = marker;
   }
   b.setInsertionPoint(at);
   Value tmpIdx = b.create<arith::ConstantIndexOp>(loc, tmp);
@@ -197,11 +221,9 @@ LogicalResult rewriteCompute(func::FuncOp compute,
     Value tile = b.create<arith::ConstantIndexOp>(loc, i);
     b.create<ttk::CopyTileInitOp>(loc, recv);
     b.create<ttk::CopyTileOp>(loc, recv, tile, tmpIdx);
-    b.create<ttk::AddBinaryTilesInitOp>(loc);
-    b.create<ttk::AddBinaryTilesOp>(loc, marker.getTileIndex(), tmpIdx,
-                                    marker.getTileIndex());
+    helperCall(b, at, "add_gather", {marker.getTileIndex(), tmpIdx}, rows);
   }
-  return success();
+  return combine();
 }
 
 // The exchange in the reader (libtt_dm_chunk_allreduce), before the kernel's
@@ -269,8 +291,8 @@ LogicalResult insertChunkAllReduce(ModuleOp module) {
     };
     ArrayRef<ttnn::CoreRangeAttr> ranges =
         compute.getCoreRanges().getCoreRanges();
-    if (markers.size() != 1 || ranges.size() != 1) {
-      return fail("needs one marker and one core range");
+    if (ranges.size() != 1) {
+      return fail("needs one core range");
     }
     ttnn::CoreRangeAttr range = ranges.front();
     const int64_t k =
@@ -295,39 +317,9 @@ LogicalResult insertChunkAllReduce(ModuleOp module) {
     }
     auto readerFunc =
         symbols.lookup<func::FuncOp>(reader.getSymbolRef().getRootReference());
-
-    // The partial's CB format (FP32 tiles), new CB indices for P and R and a
-    // new semaphore.
-    FailureOr<Partial> partial = findPartial(computeFunc, markers.front());
-    if (failed(partial)) {
-      result = failure();
-      return;
-    }
-    auto xArg = argIndex(partial->copy.getCb0());
-    auto xBuffer = xArg ? dyn_cast<ttnn::KernelArgCBBufferIndexAttr>(
-                              compute.getCommonRtArgs()[*xArg])
-                        : nullptr;
-    if (!xBuffer) {
-      return fail("the partial's CB is not an argument");
-    }
-    ttnn::KernelCBFormatAttr xFormat;
-    uint32_t nextIndex = 0;
-    for (ttnn::KernelCBAttr cb : program.getCbs()) {
-      for (ttnn::KernelCBFormatAttr f : cb.getFormats()) {
-        nextIndex = std::max<uint32_t>(nextIndex, f.getBufferIndex() + 1);
-        if (f.getBufferIndex() == xBuffer.getBufferIndex()) {
-          xFormat = f;
-        }
-      }
-    }
-    if (!xFormat || xFormat.getDtype() != ttcore::DataType::Float32 ||
-        xFormat.getPageSize() != 4096) {
-      return fail("the partial is not an FP32 tile");
-    }
-    const uint32_t sendIndex = nextIndex, recvIndex = nextIndex + 1;
-    const int64_t recvTiles = (k + 31) / 32;
-    const size_t semId = program.getSemaphores().size();
-    // The rows the sums cover: the subgraph's [.., T, N] tensors (T <= 32).
+    // The rows the sums cover: the program's [.., T, N] tensors (T <= 32),
+    // or more rows of its values (libtt.tile_rows: a partial with several
+    // values per token, attention residuals).
     int64_t rows = 1;
     for (Value v : generic->getOperands()) {
       if (auto t = dyn_cast<RankedTensorType>(v.getType());
@@ -335,47 +327,132 @@ LogicalResult insertChunkAllReduce(ModuleOp module) {
         rows = std::max(rows, t.getDimSize(t.getRank() - 2));
       }
     }
+    if (auto tileRows = computeFunc->getAttrOfType<IntegerAttr>("libtt.tile_rows")) {
+      rows = std::max(rows, tileRows.getInt());
+    }
     if (rows > 32) {
       return fail("rows over one tile");
     }
-
-    // Compute: P and R as its last arguments.
-    auto tile = mlir::cast<ttk::CBType>(partial->copy.getCb0().getType())
-                    .getElementType();
-    const int64_t computeBase = compute.getCommonRtArgs().size();
-    Value sendC =
-        newArg(computeFunc, computeBase, ttk::CBType::get(ctx, 1, tile));
-    Value recvC = newArg(computeFunc, computeBase + 1,
-                         ttk::CBType::get(ctx, recvTiles, tile));
-    if (failed(rewriteCompute(computeFunc, markers.front(), *partial, sendC,
-                              recvC, recvTiles))) {
-      result = failure();
-      return;
+    uint32_t nextIndex = 0;
+    for (ttnn::KernelCBAttr cb : program.getCbs()) {
+      for (ttnn::KernelCBFormatAttr f : cb.getFormats()) {
+        nextIndex = std::max<uint32_t>(nextIndex, f.getBufferIndex() + 1);
+      }
     }
-    // Reader: P, R and the semaphore as its last arguments.
-    const int64_t base = reader.getCommonRtArgs().size();
-    auto i32 = IntegerType::get(ctx, 32);
-    insertExchange(
-        readerFunc,
-        {newArg(readerFunc, base, i32), newArg(readerFunc, base + 1, i32),
-         newArg(readerFunc, base + 2, i32)},
-        range, rows, recvTiles, static_cast<int64_t>(reader.getNocIndex()));
-
-    // The program: R's CB, the semaphore and the new kernel arguments.
+    // Gather slots: the partial's rows rounded up to a power of two columns,
+    // 32 / slot cores per gather row (libtt_gather_slot).
+    int64_t slot = 1;
+    while (slot < rows) {
+      slot *= 2;
+    }
+    const int64_t perRow = 32 / slot;
+    const int64_t recvTiles = ((k + perRow - 1) / perRow + 31) / 32;
+    const bool keepDst = computeFunc->hasAttr("libtt.dst_full_sync");
     auto cbArg = [&](uint32_t i) {
       return ttnn::KernelArgCBBufferIndexAttr::get(ctx, i);
     };
+    auto i32 = IntegerType::get(ctx, 32);
+    SmallVector<Attribute> computeArgs(compute.getCommonRtArgs().begin(),
+                                       compute.getCommonRtArgs().end());
+    SmallVector<Attribute> readerArgs(reader.getCommonRtArgs().begin(),
+                                      reader.getCommonRtArgs().end());
     SmallVector<ttnn::ComputeKernelUnpackToDestMode> modes(
         compute.getUnpackToDestModes().begin(),
         compute.getUnpackToDestModes().end());
-    auto xMode = xBuffer.getBufferIndex() < modes.size()
-                     ? modes[xBuffer.getBufferIndex()]
-                     : ttnn::ComputeKernelUnpackToDestMode::Default;
-    while (modes.size() <= recvIndex) {
-      modes.push_back(ttnn::ComputeKernelUnpackToDestMode::Default);
+    SmallVector<ttnn::KernelCBAttr> cbs(program.getCbs().begin(),
+                                        program.getCbs().end());
+    SmallVector<ttnn::KernelSemaphoreAttr> sems(program.getSemaphores().begin(),
+                                                program.getSemaphores().end());
+
+    // Each marker in order: its partial (an FP32 tile) goes out through a
+    // new one-tile CB P, the exchanged tiles come back in a new CB R, with a
+    // new semaphore; the reader runs the exchanges in the same order.
+    for (ttk::LibttChunkAllReduceTileOp marker : markers) {
+      FailureOr<Partial> partial = findPartial(computeFunc, marker);
+      if (failed(partial)) {
+        result = failure();
+        return;
+      }
+      auto xArg = argIndex(partial->copy.getCb0());
+      auto xBuffer = xArg ? dyn_cast<ttnn::KernelArgCBBufferIndexAttr>(
+                                compute.getCommonRtArgs()[*xArg])
+                          : nullptr;
+      if (!xBuffer) {
+        return fail("the partial's CB is not an argument");
+      }
+      ttnn::KernelCBFormatAttr xFormat;
+      for (ttnn::KernelCBAttr cb : program.getCbs()) {
+        for (ttnn::KernelCBFormatAttr f : cb.getFormats()) {
+          if (f.getBufferIndex() == xBuffer.getBufferIndex()) {
+            xFormat = f;
+          }
+        }
+      }
+      if (!xFormat || xFormat.getDtype() != ttcore::DataType::Float32 ||
+          xFormat.getPageSize() != 4096) {
+        return fail("the partial is not an FP32 tile");
+      }
+      const uint32_t sendIndex = nextIndex++, recvIndex = nextIndex++;
+      const size_t semId = sems.size();
+
+      auto tile = mlir::cast<ttk::CBType>(partial->copy.getCb0().getType())
+                      .getElementType();
+      Value sendC = newArg(computeFunc, computeArgs.size(),
+                           ttk::CBType::get(ctx, 1, tile));
+      Value recvC = newArg(computeFunc, computeArgs.size() + 1,
+                           ttk::CBType::get(ctx, recvTiles, tile));
+      computeArgs.append({cbArg(sendIndex), cbArg(recvIndex)});
+      if (failed(rewriteCompute(computeFunc, marker, *partial, sendC, recvC,
+                                recvTiles, rows))) {
+        result = failure();
+        return;
+      }
+      // A kernel kept in DST keeps its values across the exchange: the
+      // release after the partial's pack leaves DST as it is.
+      if (keepDst) {
+        Operation *release = partial->pack->getNextNode();
+        while (release && !isa<ttk::TileRegsReleaseOp>(release)) {
+          release = release->getNextNode();
+        }
+        if (!release) {
+          return fail("no release after the partial's pack");
+        }
+        OpBuilder(release).create<emitc::CallOpaqueOp>(
+            release->getLoc(), TypeRange{}, "libtt_tile_regs_release_keep",
+            ValueRange{});
+        release->erase();
+      }
+      const int64_t base = readerArgs.size();
+      insertExchange(
+          readerFunc,
+          {newArg(readerFunc, base, i32), newArg(readerFunc, base + 1, i32),
+           newArg(readerFunc, base + 2, i32)},
+          range, rows, recvTiles, static_cast<int64_t>(reader.getNocIndex()));
+      readerArgs.append({cbArg(sendIndex), cbArg(recvIndex),
+                         ttnn::KernelArgSemaphoreAtAttr::get(ctx, semId)});
+
+      auto xMode = xBuffer.getBufferIndex() < modes.size()
+                       ? modes[xBuffer.getBufferIndex()]
+                       : ttnn::ComputeKernelUnpackToDestMode::Default;
+      while (modes.size() <= recvIndex) {
+        modes.push_back(ttnn::ComputeKernelUnpackToDestMode::Default);
+      }
+      modes[sendIndex] = xMode;
+      modes[recvIndex] = xMode;
+      for (auto [index, tiles] : {std::pair<uint32_t, int64_t>{sendIndex, 1},
+                                  {recvIndex, recvTiles}}) {
+        cbs.push_back(ttnn::KernelCBAttr::get(
+            ctx, tiles * 4096, compute.getCoreRanges(),
+            {ttnn::KernelCBFormatAttr::get(ctx, index, xFormat.getDtype(),
+                                           4096)},
+            nullptr));
+      }
+      sems.push_back(ttnn::KernelSemaphoreAttr::get(
+          ctx, semId, ttnn::KernelCoreType::Worker, compute.getCoreRanges(),
+          0));
     }
-    modes[sendIndex] = xMode;
-    modes[recvIndex] = xMode;
+
+    // The program: the new CBs, semaphores and kernel arguments.
     SmallVector<Attribute> kernels;
     for (Attribute kernel : program.getKernels()) {
       if (kernel == compute) {
@@ -383,35 +460,16 @@ LogicalResult insertChunkAllReduce(ModuleOp module) {
             ctx, compute.getSymbolRef(), compute.getCoreRanges(),
             compute.getMathFidelity(), compute.getFp32DestAccEn(),
             compute.getDstFullSyncEn(), modes, compute.getBfp8PackPrecise(),
-            compute.getMathApproxMode(),
-            withArgs(compute.getCommonRtArgs(),
-                     {cbArg(sendIndex), cbArg(recvIndex)}),
-            compute.getCtArgs()));
+            compute.getMathApproxMode(), computeArgs, compute.getCtArgs()));
       } else if (kernel == reader) {
         kernels.push_back(ttnn::DataMovementKernelAttr::get(
             ctx, reader.getSymbolRef(), reader.getCoreRanges(),
             reader.getProcessor(), reader.getNocIndex(), reader.getNocMode(),
-            withArgs(reader.getCommonRtArgs(),
-                     {cbArg(sendIndex), cbArg(recvIndex),
-                      ttnn::KernelArgSemaphoreAtAttr::get(ctx, semId)}),
-            reader.getCtArgs()));
+            readerArgs, reader.getCtArgs()));
       } else {
         kernels.push_back(kernel);
       }
     }
-    SmallVector<ttnn::KernelCBAttr> cbs(program.getCbs().begin(),
-                                        program.getCbs().end());
-    for (auto [index, tiles] :
-         {std::pair<uint32_t, int64_t>{sendIndex, 1}, {recvIndex, recvTiles}}) {
-      cbs.push_back(ttnn::KernelCBAttr::get(
-          ctx, tiles * 4096, compute.getCoreRanges(),
-          {ttnn::KernelCBFormatAttr::get(ctx, index, xFormat.getDtype(), 4096)},
-          nullptr));
-    }
-    SmallVector<ttnn::KernelSemaphoreAttr> sems(program.getSemaphores().begin(),
-                                                program.getSemaphores().end());
-    sems.push_back(ttnn::KernelSemaphoreAttr::get(
-        ctx, semId, ttnn::KernelCoreType::Worker, compute.getCoreRanges(), 0));
     generic->setAttr("program",
                      ttnn::ProgramAttr::get(ctx, kernels, cbs, sems));
   });

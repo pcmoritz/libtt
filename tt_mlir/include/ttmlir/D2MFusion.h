@@ -58,6 +58,9 @@ bool headDimSupported(int64_t width);
 // core of a rectangle of op's device ([k, T, N / k], the same tiles in the
 // same order).
 std::optional<int64_t> wideNormChunks(Operation *op, RankedTensorType type);
+// Inkling 2's attention residuals (ttnn.attn_res) D2M takes: one token, one
+// query row and up to 8 sources over one such wide row; the number of chunks.
+std::optional<int64_t> attnResChunks(Operation *op);
 bool isTileColumnSlice(ttnn::SliceStaticOp slice);
 
 // A reshape the outliner drops: one element, the same shape once promoted to

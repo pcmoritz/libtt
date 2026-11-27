@@ -85,6 +85,26 @@ std::optional<int64_t> wideNormChunks(Operation *op, RankedTensorType t) {
   return std::nullopt;
 }
 
+std::optional<int64_t> attnResChunks(Operation *op) {
+  auto attn = dyn_cast<ttnn::AttnResOp>(op);
+  if (!attn || attn.getSources().size() > 8) {
+    return std::nullopt;
+  }
+  auto source = cast<RankedTensorType>(attn.getSources().front().getType());
+  auto queries = cast<RankedTensorType>(attn.getQueries().getType());
+  for (Value v : attn.getSources()) {
+    if (v.getType() != source) {
+      return std::nullopt;
+    }
+  }
+  if (source.getRank() != 2 || source.getDimSize(0) != 1 ||
+      queries.getRank() != 2 || queries.getDimSize(0) != 1 ||
+      queries.getDimSize(1) != source.getDimSize(1)) {
+    return std::nullopt;
+  }
+  return wideNormChunks(op, source);
+}
+
 // A slice of whole rows of x [T, N] (T <= 32) at tile-aligned columns:
 // D2M reads it in place (a tile-offset view of x).
 bool isTileColumnSlice(ttnn::SliceStaticOp s) {
@@ -392,7 +412,8 @@ static void keepEscapingSlicesOnTTNN(SmallVector<Operation *> &group) {
     kept.push_back(copy);
   }
   group = std::move(kept);
-  if (group.size() == 1 && !isa<RMSNormOp, RMSNormGatedOp>(group[0])) {
+  if (group.size() == 1 &&
+      !isa<RMSNormOp, RMSNormGatedOp, AttnResOp>(group[0])) {
     group.clear();
   }
 }
@@ -716,20 +737,21 @@ static void foldNarrowingCasts(ModuleOp moduleOp) {
   }
 }
 
-// Each wide norm (d2m_fusion::wideNormChunks) alone, with the reshape of
-// its weight: its in-kernel exchange needs the norm's whole row-merged
-// kernel, one exchange per kernel. (Inkling 2 chains three 2304-wide norms
+// Each wide norm (d2m_fusion::wideNormChunks) or attention residual alone,
+// a norm with the reshape of its weight: their in-kernel exchanges need the
+// op's whole row-merged kernel. (Inkling 2 chains three 2304-wide norms
 // in one group: split into programs, the exchange met a partial from DRAM.)
 // The rest of the group stays a group.
-static void
-isolateWideNorms(SmallVectorImpl<SmallVector<Operation *>> &groups) {
+static void isolateWideNorms(SmallVectorImpl<SmallVector<Operation *>> &groups) {
   SmallVector<SmallVector<Operation *>> out;
   for (auto &group : groups) {
     llvm::SetVector<Operation *> rest(group.begin(), group.end());
     for (Operation *op : group) {
-      if (!isa<RMSNormOp, RMSNormGatedOp>(op) ||
-          !d2m_fusion::wideNormChunks(
-              op, cast<RankedTensorType>(op->getOperand(0).getType()))) {
+      bool wideNorm =
+          isa<RMSNormOp, RMSNormGatedOp>(op) &&
+          d2m_fusion::wideNormChunks(
+              op, cast<RankedTensorType>(op->getOperand(0).getType()));
+      if (!wideNorm && !d2m_fusion::attnResChunks(op)) {
         continue;
       }
       SmallVector<Operation *> alone;
@@ -769,9 +791,11 @@ void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &fusionGroups) {
   SmallVector<SmallVector<Operation *>> split;
   for (auto &group : fusionGroups) {
     for (auto &part : splitHeadGroup(group)) {
-      // A composite norm alone is worth a generic (the outliner's rule).
+      // A composite norm or attention residual alone is worth a generic (the
+      // outliner's rule).
       if (part.size() >= 2 ||
-          (part.size() == 1 && isa<RMSNormOp, RMSNormGatedOp>(part[0]))) {
+          (part.size() == 1 &&
+           isa<RMSNormOp, RMSNormGatedOp, AttnResOp>(part[0]))) {
         split.push_back(std::move(part));
       }
     }
