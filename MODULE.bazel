@@ -759,7 +759,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_const_eval_private_constants.patch",
         "//third_party/tt_xla:tt_mlir_attn_res.patch",
         "//third_party/tt_xla:tt_mlir_l2_clip.patch",
-        "//third_party/tt_xla:tt_mlir_loop_mix.patch",
         "//third_party/tt_xla:tt_mlir_moe_route.patch",
         "//third_party/tt_xla:tt_mlir_window_bias.patch",
         "//third_party/tt_xla:tt_mlir_moe_combine.patch",

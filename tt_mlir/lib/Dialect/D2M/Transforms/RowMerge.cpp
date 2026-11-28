@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
@@ -25,6 +26,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Transforms/CSE.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "ttmlir/AffineMapUtils.h"
 #include "ttmlir/Asserts.h"
@@ -39,6 +42,7 @@
 #include "ttmlir/Dialect/D2M/Utils/DstRegisterAnalysis.h"
 #include "ttmlir/Dialect/D2M/Utils/GridSelectionUtils.h"
 #include "ttmlir/Dialect/D2M/Utils/SpatialOpNormalizeUtil.h"
+#include "ttmlir/Dialect/D2M/Utils/SynchronizableOpInterfaceUtils.h"
 #include "ttmlir/Dialect/D2M/Utils/TopKUtils.h"
 #include "ttmlir/Dialect/D2M/Utils/Utils.h"
 #include "ttmlir/Dialect/D2M/Utils/VirtualGrid.h"
@@ -105,7 +109,8 @@ static void annotateRowMergeCandidates(ModuleOp module) {
     bool hasReduction = llvm::any_of(generics, [](GenericOp g) {
       return g.getIteratorTypesValue()[1] == ttcore::IteratorType::Reduction;
     });
-    if (!hasReduction) {
+    // (A function split over cores is one kernel: its exchanges need it.)
+    if (!hasReduction && !func->hasAttr("libtt.chunks")) {
       return;
     }
     auto tiles = [](Value v) -> std::optional<std::pair<int64_t, int64_t>> {
@@ -117,6 +122,9 @@ static void annotateRowMergeCandidates(ModuleOp module) {
       auto s = t.getShape();
       return std::make_pair(s[0] * s[2], s[1] * s[3]);
     };
+    // A function split over k cores (libtt.chunks, splitWideRows): each
+    // operand is k chunks of whole tile rows (or one, broadcast).
+    auto chunks = func->getAttrOfType<IntegerAttr>("libtt.chunks");
     int64_t rows = 1, cols = 1;
     for (GenericOp g : generics) {
       for (Value v : g->getOperands()) {
@@ -131,8 +139,9 @@ static void annotateRowMergeCandidates(ModuleOp module) {
     for (GenericOp g : generics) {
       for (Value v : g->getOperands()) {
         auto t = *tiles(v);
-        if ((t.first != rows && t.first != 1) ||
-            (t.second != cols && t.second != 1)) {
+        bool rowsOk = chunks ? t.first % chunks.getInt() == 0 || t.first == 1
+                             : t.first == rows || t.first == 1;
+        if (!rowsOk || (!chunks && t.second != cols && t.second != 1)) {
           return;
         }
       }
@@ -202,7 +211,8 @@ static void annotateRowMergeCandidates(ModuleOp module) {
           llvm::all_of(g->getOperands(),
                        [&](Value v) { return tiles(v)->second == 1; });
       if (chunked) {
-        g->setAttr("d2m.chunk_rows", b.getUnitAttr());
+        g->setAttr("d2m.chunk_rows",
+                   chunks ? Attribute(chunks) : Attribute(b.getUnitAttr()));
       }
       if (keepRow) {
         g->setAttr("d2m.unsplit_dims", b.getI64ArrayAttr({1}));
@@ -224,6 +234,13 @@ static void mergeRowGroups(ModuleOp module) {
   SmallVector<func::FuncOp> funcs;
   module.walk([&](func::FuncOp f) { funcs.push_back(f); });
   for (func::FuncOp func : funcs) {
+    // A function split over cores reads each argument through views made
+    // per consumer: identical ones become one input (one CB) of the merge.
+    if (func->hasAttr("libtt.chunks")) {
+      IRRewriter cseRewriter(func.getContext());
+      DominanceInfo dom(func);
+      mlir::eliminateCommonSubExpressions(cseRewriter, dom, func);
+    }
     SmallVector<GenericOp> generics;
     for (Operation &op : func.getBody().getOps()) {
       if (auto g = dyn_cast<GenericOp>(op)) {
@@ -309,8 +326,21 @@ static void mergeRowGroups(ModuleOp module) {
     MLIRContext *ctx = module.getContext();
     const bool spreadGroup = llvm::any_of(
         generics, [&](GenericOp g) { return g.getGrid() != first.getGrid(); });
+    const bool chunkGroup =
+        mlir::isa_and_nonnull<IntegerAttr>(first->getAttr("d2m.chunk_rows"));
     auto mapFor = [&](Value v) {
       AffineExpr zero = getAffineConstantExpr(0, ctx);
+      if (chunkGroup) {
+        // Rows by the operand's grid (k chunks, or one broadcast); columns as
+        // below (each core's blocks may differ: K tiles of a weight).
+        auto shape = mlir::cast<ShapedType>(v.getType()).getShape();
+        auto [r, c] = tiles(v);
+        return AffineMap::get(
+            2, 0,
+            {shape[0] == mergedGrid[0] ? getAffineDimExpr(0, ctx) : zero,
+             c == cols ? getAffineDimExpr(1, ctx) : zero},
+            ctx);
+      }
       if (spreadGroup) {
         // By the operand's own grid: a dim it does not split is block 0.
         auto shape = mlir::cast<ShapedType>(v.getType()).getShape();
@@ -378,7 +408,53 @@ static void mergeRowGroups(ModuleOp module) {
     }
     // The merged generic sits after the last group member, so every outside
     // user of a group result must come after it too (a mask between two
-    // members would otherwise use a value defined later).
+    // members would otherwise use a value defined later). Views and layout
+    // casts of a result (an output on its way out) move after it, with their
+    // own view and cast users, if nothing else before it reads them.
+    {
+      Block &top = func.getBody().front();
+      auto isViewOrCast = [](Operation *op) {
+        return isa<ViewLayoutOp, ttir::TTNNMetalLayoutCastOp>(op);
+      };
+      for (auto [g, r] : escaping) {
+        SmallVector<Operation *> chain;
+        bool movable = true;
+        for (Operation *user : g->getResult(r).getUsers()) {
+          Operation *anc = top.findAncestorOpInBlock(*user);
+          if (!anc || group.contains(anc) ||
+              generics.back()->isBeforeInBlock(anc)) {
+            continue;
+          }
+          SmallVector<Operation *> work{anc};
+          while (!work.empty() && movable) {
+            Operation *op = work.pop_back_val();
+            if (!isViewOrCast(op) || op->getNumOperands() != 1) {
+              movable = false;
+              break;
+            }
+            chain.push_back(op);
+            for (Operation *u : op->getUsers()) {
+              Operation *a = top.findAncestorOpInBlock(*u);
+              if (a && !group.contains(a) && !generics.back()->isBeforeInBlock(a)) {
+                work.push_back(a);
+              }
+            }
+          }
+        }
+        if (!movable) {
+          continue;
+        }
+        llvm::sort(chain, [](Operation *a, Operation *b) {
+          return a->isBeforeInBlock(b);
+        });
+        chain.erase(std::unique(chain.begin(), chain.end()), chain.end());
+        Operation *after = generics.back();
+        for (Operation *op : chain) {
+          op->moveAfter(after);
+          after = op;
+        }
+      }
+    }
     bool usersAfter = llvm::all_of(escaping, [&](auto gr) {
       return llvm::all_of(
           gr.first->getResult(gr.second).getUsers(), [&](Operation *user) {
@@ -535,7 +611,18 @@ static void mergeRowGroups(ModuleOp module) {
         }
         for (auto consumer :
              llvm::make_early_inc_range(block.getOps<linalg::GenericOp>())) {
+          // A matmul unpacks its operands from L1 (no DST intermediates).
+          if (!consumer.getBody()->getOps<TileMatmulOp>().empty()) {
+            continue;
+          }
           for (OpOperand &operand : consumer->getOpOperands()) {
+            // A chunk all-reduce's partial leaves the kernel from L1 (packed).
+            if (operand.getOperandNumber() < consumer.getNumDpsInputs() &&
+                llvm::any_of(
+                    consumer.getMatchingBlockArgument(&operand).getUsers(),
+                    [](Operation *u) { return isa<TileChunkAllReduceOp>(u); })) {
+              continue;
+            }
             auto producer = operand.get().getDefiningOp<linalg::GenericOp>();
             // A broadcast unpacks its operand from L1 (unary_bcast), so a
             // broadcast operand cannot become a DST intermediate.

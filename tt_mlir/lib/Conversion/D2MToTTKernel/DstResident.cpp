@@ -42,6 +42,7 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <map>
+#include <set>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1262,6 +1263,17 @@ struct DstResidentRewriter {
         internal.insert(c);
       }
     }
+    // CBs a matmul reads (unpacked from L1 to SrcA/SrcB): what is packed
+    // into them stays packed, each pack a section boundary (values stay in
+    // DST across it); the matmul accumulates into zeroed DST slots.
+    llvm::DenseSet<Value> fpuInputs;
+    funcOp.walk([&](ttkernel::ExperimentalMatmulBlockOp mm) {
+      fpuInputs.insert(mm.getIn0CbId());
+      fpuInputs.insert(mm.getIn1CbId());
+    });
+    for (Value cb : fpuInputs) {
+      internal.erase(cb);
+    }
     // Without compute-internal CBs, only small kernels (they lose the
     // pack/math overlap of half-sync DST).
     if (internal.empty()) {
@@ -1372,6 +1384,12 @@ struct DstResidentRewriter {
       bool undefined = false;
       // A row (not column) broadcast of an internal value.
       bool bcastRow = false;
+      // A matmul (its output tiles: outs) and a pack for one (a section
+      // boundary).
+      bool matmul = false, midPack = false;
+      SmallVector<int, 2> outs;
+      // A matmul accumulating into an earlier one's tiles (its info).
+      int accumulateInto = -1;
     };
     std::vector<OpInfo> infos;
     auto use = [&](int v, int at) {
@@ -1407,6 +1425,21 @@ struct DstResidentRewriter {
               ttkernel::UnaryBcastInitOp, ttkernel::UnaryBcastUninitOp>(op) &&
           internal.contains(op->getOperand(0))) {
         info.erase = true;
+        infos.push_back(info);
+        continue;
+      }
+      if (auto mm = dyn_cast<ttkernel::ExperimentalMatmulBlockOp>(op)) {
+        auto dst = ci(mm.getDstTileIdx()), ct = ci(mm.getCtDim()),
+             rt = ci(mm.getRtDim());
+        if (!dst || !ct || !rt || *dst + *ct * *rt > 16) {
+          return false;
+        }
+        info.matmul = true;
+        for (int64_t t = 0; t < *ct * *rt; ++t) {
+          vals.push_back(Val{op, -1, -1});
+          info.outs.push_back(static_cast<int>(vals.size() - 1));
+          slotVal[static_cast<int>(*dst + t)] = info.outs.back();
+        }
         infos.push_back(info);
         continue;
       }
@@ -1587,6 +1620,10 @@ struct DstResidentRewriter {
           }
           regionByCb[{cbKey(pack.getOutCb()), *tile}] = v;
           info.erase = true;
+        } else if (fpuInputs.contains(pack.getOutCb())) {
+          info.in0 = v;
+          info.midPack = true;
+          use(v, at);
         } else {
           info.in0 = v;
           info.finalPack = true;
@@ -1608,6 +1645,88 @@ struct DstResidentRewriter {
         slotVal[acc->writeSlot] = info.out;
       }
       infos.push_back(info);
+    }
+
+    // A sum of two matmuls' outputs, each read only by it: the later matmul
+    // accumulates into the earlier one's tiles and the adds go (a contraction
+    // over two segments of K: [a | b] D = a D_0 + b D_1).
+    {
+      // Matmul output value -> (its info, tile).
+      std::map<int, std::pair<int, int>> matmulOut;
+      for (size_t i = 0; i < infos.size(); ++i) {
+        for (auto [t, v] : llvm::enumerate(infos[i].outs)) {
+          matmulOut[v] = {static_cast<int>(i), static_cast<int>(t)};
+        }
+      }
+      std::vector<int> uses(vals.size(), 0);
+      for (OpInfo &info : infos) {
+        for (int v : {info.in0, info.in1}) {
+          if (v >= 0) {
+            ++uses[v];
+          }
+        }
+      }
+      // Per later matmul: its adds (one per tile) and the earlier matmul.
+      std::map<int, std::pair<int, SmallVector<int>>> pairs;
+      std::set<int> bad;
+      for (size_t j = 0; j < infos.size(); ++j) {
+        OpInfo &info = infos[j];
+        if (!isa<ttkernel::AddBinaryTilesOp>(info.op) || info.in0 < 0 ||
+            info.in1 < 0 || info.out < 0) {
+          continue;
+        }
+        auto a = matmulOut.find(info.in0), c = matmulOut.find(info.in1);
+        if (a == matmulOut.end() || c == matmulOut.end() ||
+            a->second.second != c->second.second ||
+            a->second.first == c->second.first || uses[info.in0] != 1 ||
+            uses[info.in1] != 1) {
+          continue;
+        }
+        auto [first, later] = std::minmax(a->second.first, c->second.first);
+        auto &entry = pairs[later];
+        if (!entry.second.empty() && entry.first != first) {
+          bad.insert(later);
+        }
+        entry.first = first;
+        entry.second.push_back(static_cast<int>(j));
+      }
+      std::vector<int> alias(vals.size());
+      for (size_t v = 0; v < vals.size(); ++v) {
+        alias[v] = static_cast<int>(v);
+      }
+      bool merged = false;
+      for (auto &[later, entry] : pairs) {
+        auto &[first, adds] = entry;
+        if (bad.count(later) ||
+            adds.size() != infos[later].outs.size() ||
+            infos[first].outs.size() != infos[later].outs.size()) {
+          continue;
+        }
+        for (int j : adds) {
+          OpInfo &add = infos[j];
+          auto a = matmulOut[add.in0];
+          int base = a.first == first ? add.in0 : add.in1;
+          alias[add.out] = base;
+          add.erase = true;
+          add.in0 = add.in1 = add.out = -1;
+        }
+        infos[later].accumulateInto = first;
+        infos[later].outs = infos[first].outs;
+        merged = true;
+      }
+      if (merged) {
+        for (OpInfo &info : infos) {
+          info.in0 = info.in0 < 0 ? info.in0 : alias[info.in0];
+          info.in1 = info.in1 < 0 ? info.in1 : alias[info.in1];
+        }
+        for (Val &v : vals) {
+          v.lastUse = -1;
+        }
+        for (size_t i = 0; i < infos.size(); ++i) {
+          use(infos[i].in0, infos[i].finalPack ? end : static_cast<int>(i));
+          use(infos[i].in1, static_cast<int>(i));
+        }
+      }
     }
 
     // Hoisting moves loads after their values are identified (the slots D2M
@@ -1694,7 +1813,7 @@ struct DstResidentRewriter {
       }
       for (int i = static_cast<int>(infos.size()) - 1; i >= 0; --i) {
         OpInfo &info = infos[i];
-        if (info.finalPack || info.exchange) {
+        if (info.finalPack || info.exchange || info.midPack) {
           need(info.in0, kFull);
         } else if (info.bcastInternal) {
           need(info.in0, info.out >= 0 && demand[info.out] == kNone ? kNone
@@ -1803,6 +1922,28 @@ struct DstResidentRewriter {
           if (out.slot < 0) {
             return false;
           }
+        }
+      }
+      // A matmul's output tiles: consecutive free slots (one accumulating
+      // into another's has them).
+      if (info.matmul && info.accumulateInto < 0) {
+        const int n = static_cast<int>(info.outs.size());
+        int run = -1;
+        for (int s0 = 0; s0 + n <= kCapacity && run < 0; ++s0) {
+          bool free = true;
+          for (int t = 0; t < n; ++t) {
+            free &= !busy[s0 + t];
+          }
+          if (free) {
+            run = s0;
+          }
+        }
+        if (run < 0) {
+          return false;
+        }
+        for (int t = 0; t < n; ++t) {
+          vals[info.outs[t]].slot = run + t;
+          busy[run + t] = vals[info.outs[t]].lastUse >= 0;
         }
       }
       // Free values whose last use is this op (unless the slot passed on).
@@ -1931,6 +2072,37 @@ struct DstResidentRewriter {
         b.setInsertionPoint(op);
         b.create<ttkernel::ReconfigDataFormatSrcAOp>(op->getLoc(), cbOf(op));
         b.create<ttkernel::CopyTileInitOp>(op->getLoc(), cbOf(op));
+      }
+      // A matmul's operand: packed at the end of a section whose release
+      // keeps DST (the packer thread hands the tiles to the unpacker).
+      if (info.midPack) {
+        auto pack = cast<ttkernel::PackTileOp>(op);
+        Location loc = op->getLoc();
+        b.setInsertionPoint(op);
+        b.create<ttkernel::TileRegsCommitOp>(loc);
+        b.create<ttkernel::TileRegsWaitOp>(loc);
+        pack->setOperand(0, idxConst(op, vals[info.in0].slot));
+        b.setInsertionPointAfter(op);
+        b.create<emitc::CallOpaqueOp>(loc, TypeRange{},
+                                      "libtt_tile_regs_release_keep",
+                                      ValueRange{});
+        b.create<ttkernel::TileRegsAcquireOp>(loc);
+        continue;
+      }
+      // A matmul accumulates into its (zeroed) slots.
+      if (info.matmul) {
+        auto mm = cast<ttkernel::ExperimentalMatmulBlockOp>(op);
+        Location loc = op->getLoc();
+        for (int v : info.accumulateInto < 0 ? info.outs : SmallVector<int, 2>{}) {
+          b.setInsertionPoint(op);
+          b.create<ttkernel::FillTileInitOp>(loc);
+          b.create<ttkernel::FillTileOp>(loc, idxConst(op, vals[v].slot),
+                                         b.create<arith::ConstantOp>(
+                                             loc, b.getF32FloatAttr(0.0f)));
+        }
+        mm.getDstTileIdxMutable().assign(
+            idxConst(op, vals[info.outs.front()].slot));
+        continue;
       }
       if (!isDstOp(op)) {
         continue;
@@ -2061,6 +2233,54 @@ struct DstResidentRewriter {
   }
 };
 } // namespace
+
+void zeroPaddedOutputRows(func::FuncOp kernel) {
+  auto tileRows = kernel->getAttrOfType<IntegerAttr>("libtt.tile_rows");
+  if (!tileRows || tileRows.getInt() >= 32) {
+    return;
+  }
+  // CBs compute reads (unpacks, broadcasts, matmul operands): not outputs.
+  llvm::DenseSet<Value> read;
+  kernel.walk([&](Operation *op) {
+    if (isa<ttkernel::CopyTileOp, ttkernel::UnaryBcastTileOp>(op)) {
+      read.insert(op->getOperand(0));
+    } else if (auto mm = dyn_cast<ttkernel::ExperimentalMatmulBlockOp>(op)) {
+      read.insert(mm.getIn0CbId());
+      read.insert(mm.getIn1CbId());
+    }
+  });
+  // Per section commit: the output slots packed after it.
+  llvm::MapVector<Operation *, llvm::SmallSetVector<int64_t, 4>> slots;
+  kernel.walk([&](ttkernel::PackTileOp pack) {
+    if (read.contains(pack.getOutCb())) {
+      return;
+    }
+    auto slot = getConstantIntValue(pack.getDstIndex());
+    Operation *commit = pack->getPrevNode();
+    while (commit && !isa<ttkernel::TileRegsCommitOp>(commit)) {
+      commit = commit->getPrevNode();
+    }
+    if (slot && commit) {
+      slots[commit].insert(*slot);
+    }
+  });
+  OpBuilder b(kernel.getContext());
+  for (auto &[commit, list] : slots) {
+    b.setInsertionPoint(commit);
+    for (int64_t slot : list) {
+      OperationState state(commit->getLoc(),
+                           emitc::VerbatimOp::getOperationName());
+      state.addAttribute(
+          "value",
+          b.getStringAttr(llvm::formatv("MATH((libtt_sfpu::zero_rows<{0}, {1}>()));",
+                                        slot, tileRows.getInt())
+                              .str()));
+      state.addAttribute("libtt.sfpu_def",
+                         b.getStringAttr("// libtt in-DST tile helpers"));
+      b.create(state);
+    }
+  }
+}
 
 bool keepKernelInDst(func::FuncOp funcOp) {
   return DstResidentRewriter::apply(funcOp);

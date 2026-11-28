@@ -74,10 +74,10 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -159,6 +159,7 @@ union OpType {
+@@ -158,6 +158,7 @@ union OpType {
+   RMSNormGatedOp,
    AttnResOp,
    L2ClipOp,
-   LoopMixOp,
 +  WindowBiasOp,
    MoeRouteOp,
    ReshapeOp,
@@ -113,10 +113,10 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class MoeRouteOpConversionPattern : public OpConversionPattern<ttir::MoeRouteOp> {
  public:
    using OpConversionPattern<ttir::MoeRouteOp>::OpConversionPattern;
-@@ -4442,6 +4463,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4421,6 +4442,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            RMSNormGatedOpConversionPattern,
             AttnResOpConversionPattern,
             L2ClipOpConversionPattern,
-            LoopMixOpConversionPattern,
 +           WindowBiasOpConversionPattern,
             MoeRouteOpConversionPattern,
             DistributedRMSNormOpConversionPattern,
@@ -151,7 +151,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::MoeRouteOp>
  createOp(FlatbufferObjectCache &cache, MoeRouteOp op) {
    auto tensor = [&](Value value) {
-@@ -5880,6 +5900,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5862,6 +5882,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
                             locInfo);
    }
@@ -165,15 +165,15 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -99,6 +99,7 @@
+@@ -98,6 +98,7 @@
+ #include "operations/normalization/attn_res.h"
  #include "operations/normalization/l2_clip.h"
- #include "operations/normalization/loop_mix.h"
  #include "operations/normalization/moe_route.h"
 +#include "operations/normalization/window_bias.h"
  #include "operations/normalization/rms_norm_gated.h"
  #include "operations/normalization/rms_norm_residual.h"
  #include "operations/normalization/rms_norm_pre_all_gather.h"
-@@ -543,6 +544,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+@@ -542,6 +543,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
    case ::tt::target::ttnn::OpType::MoeRouteOp: {
      return operations::moe_route::run(op->type_as_MoeRouteOp(), getContext());
    }
@@ -181,6 +181,6 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
 +    return operations::window_bias::run(op->type_as_WindowBiasOp(),
 +                                        getContext());
 +  }
-   case ::tt::target::ttnn::OpType::LoopMixOp: {
-     return operations::loop_mix::run(op->type_as_LoopMixOp(), getContext());
+   case ::tt::target::ttnn::OpType::L2ClipOp: {
+     return operations::l2_clip::run(op->type_as_L2ClipOp(), getContext());
    }

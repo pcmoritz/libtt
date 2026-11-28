@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <utility>
 
 namespace mlir::tt::d2m_fusion {
 
@@ -47,15 +48,23 @@ int64_t tileCount(RankedTensorType t) {
 // the group-major one (16: two heads per tile).
 bool headDimSupported(int64_t d) { return d % 32 == 0 || d == 16; }
 
+// The product of a tensor's leading dims (all but the last two).
+static int64_t batchOf(RankedTensorType t) {
+  int64_t b = 1;
+  for (int64_t d = 0; d + 2 < t.getRank(); ++d) {
+    b *= t.getDimSize(d);
+  }
+  return b;
+}
+
 std::optional<int64_t> wideNormChunks(Operation *op, RankedTensorType t) {
   int64_t rank = t.getRank();
   if (rank < 2 || t.getDimSize(rank - 2) > 32 || t.getDimSize(rank - 1) % 32) {
     return std::nullopt;
   }
-  for (int64_t d = 0; d + 2 < rank; ++d) {
-    if (t.getDimSize(d) != 1) {
-      return std::nullopt;
-    }
+  // Up to 8 rows of rows (splitWideRows unrolls the batch).
+  if (batchOf(t) > 8) {
+    return std::nullopt;
   }
   const int64_t tiles = t.getDimSize(rank - 1) / 32;
   if (tiles <= 32) {
@@ -103,6 +112,77 @@ std::optional<int64_t> attnResChunks(Operation *op) {
     return std::nullopt;
   }
   return wideNormChunks(op, source);
+}
+
+bool isSplitRowType(RankedTensorType t) {
+  return t.getRank() >= 2 && batchOf(t) <= 8 &&
+         t.getDimSize(t.getRank() - 2) <= 32 && t.getShape().back() % 32 == 0 &&
+         t.getShape().back() / 32 > 32;
+}
+
+bool isSplitRowOp(Operation *op) {
+  // A decode value [B.., T, X]: T <= 32, B <= 8, X whole tiles, FP32 or BF16.
+  auto tiled = [](Type type) {
+    auto t = dyn_cast<RankedTensorType>(type);
+    return t && t.getRank() >= 2 && t.getShape().back() % 32 == 0 &&
+           batchOf(t) <= 8 &&
+           (t.getElementType().isF32() || t.getElementType().isBF16());
+  };
+  auto rows = [&](Type type) {
+    auto t = dyn_cast<RankedTensorType>(type);
+    return tiled(type) && t.getDimSize(t.getRank() - 2) <= 32;
+  };
+  auto wide = [](int64_t n) { return n / 32 > 32; };
+  if (auto mm = dyn_cast<ttnn::MatmulOp>(op)) {
+    // Low-rank decode projections: one of K, N a wide row, the other at most
+    // 4 tiles, the weight's batch the activation's (or 1).
+    auto a = mm.getA().getType(), b = mm.getB().getType();
+    if (mm.getTransposeA() || mm.getTransposeB() || a.getRank() != b.getRank() ||
+        !rows(a) || !tiled(b) || b.getDimSize(b.getRank() - 2) % 32 != 0 ||
+        !rows(mm.getResult().getType()) ||
+        (batchOf(a) != batchOf(b) && batchOf(a) != 1)) {
+      return false;
+    }
+    int64_t k = a.getShape().back(), n = b.getShape().back();
+    return (wide(k) && n <= 128) || (wide(n) && k <= 128);
+  }
+  if (auto concat = dyn_cast<ttnn::ConcatOp>(op)) {
+    auto out = concat.getResult().getType();
+    int64_t dim = concat.getDim();
+    return (dim == -1 || dim == out.getRank() - 1) &&
+           llvm::all_of(concat.getInputs(),
+                        [&](Value v) { return rows(v.getType()); });
+  }
+  // Leading dims only: repeats, slices (steps 1) and reshapes keeping the
+  // rows and columns.
+  auto lastTwo = [](RankedTensorType a, RankedTensorType b) {
+    return a.getRank() >= 2 && b.getRank() >= 2 &&
+           a.getShape().take_back(2) == b.getShape().take_back(2);
+  };
+  if (auto repeat = dyn_cast<ttnn::RepeatOp>(op)) {
+    auto dims = repeat.getRepeatDims().getShape();
+    return rows(repeat.getResult().getType()) && dims.size() >= 2 &&
+           dims.take_back(2) == ArrayRef<int64_t>{1, 1};
+  }
+  if (auto slice = dyn_cast<ttnn::SliceStaticOp>(op)) {
+    auto st = extractFromIntegerArrayAttr<int32_t>(slice.getStep());
+    return rows(slice.getInput().getType()) &&
+           lastTwo(slice.getInput().getType(), slice.getResult().getType()) &&
+           llvm::all_of(st, [](int32_t s) { return s == 1; });
+  }
+  // (And one row [1.., 1, N] as the vector [N].)
+  if (auto reshape = dyn_cast<ttnn::ReshapeOp>(op)) {
+    auto in = reshape.getInput().getType(), out = reshape.getResult().getType();
+    if (isPromotionReshape(reshape) || !rows(in)) {
+      return false;
+    }
+    if (out.getRank() == 1) {
+      return in.getNumElements() == out.getNumElements() &&
+             in.getShape().back() == out.getDimSize(0) && in.getShape().back() % 32 == 0;
+    }
+    return rows(out) && lastTwo(in, out) && in.getRank() != out.getRank();
+  }
+  return false;
 }
 
 // A slice of whole rows of x [T, N] (T <= 32) at tile-aligned columns:
@@ -418,6 +498,84 @@ static void keepEscapingSlicesOnTTNN(SmallVector<Operation *> &group) {
   }
 }
 
+static bool isSplitAnchor(Operation *op);
+
+// A split group's escaping value escaping reshaped too (a norm's [T, N]
+// output and its [1, T, N]): the reshape stays on TTNN (a view there), as
+// the split would return one buffer twice under two types.
+static void dropReshapedOutputs(SmallVector<Operation *> &group) {
+  if (llvm::none_of(group, isSplitAnchor)) {
+    return;
+  }
+  llvm::DenseSet<Operation *> members(group.begin(), group.end());
+  llvm::erase_if(group, [&](Operation *op) {
+    auto r = dyn_cast<ReshapeOp>(op);
+    if (!r || !members.contains(r.getInput().getDefiningOp()) ||
+        r->use_empty()) {
+      return false;
+    }
+    Operation *first = nullptr;
+    for (Operation *u : r->getUsers()) {
+      if (members.contains(u) || u->getBlock() != r->getBlock()) {
+        return false;
+      }
+      if (!first || u->isBeforeInBlock(first)) {
+        first = u;
+      }
+    }
+    if (llvm::none_of(r.getInput().getUsers(), [&](Operation *u) {
+          return u != op && !members.contains(u);
+        })) {
+      return false;
+    }
+    // After the outlined group (it precedes the reshape's readers).
+    members.erase(op);
+    op->moveBefore(first);
+    return true;
+  });
+}
+
+// A split group's repeat read outside too (Inkling 2's normed loop
+// destination, shared across passes): a copy on TTNN for those readers, so
+// the group returns the repeated value, not the repeat (rows of rows the
+// split packs, not B tile rows).
+static void cloneEscapingRepeats(SmallVector<Operation *> &group) {
+  if (llvm::none_of(group, isSplitAnchor)) {
+    return;
+  }
+  llvm::DenseSet<Operation *> members(group.begin(), group.end());
+  for (Operation *op : group) {
+    auto repeat = dyn_cast<RepeatOp>(op);
+    if (!repeat) {
+      continue;
+    }
+    SmallVector<OpOperand *> outside;
+    Operation *first = nullptr;
+    for (OpOperand &use : repeat->getUses()) {
+      Operation *u = use.getOwner();
+      if (members.contains(u)) {
+        continue;
+      }
+      if (u->getBlock() != repeat->getBlock()) {
+        outside.clear();
+        break;
+      }
+      outside.push_back(&use);
+      if (!first || u->isBeforeInBlock(first)) {
+        first = u;
+      }
+    }
+    if (outside.empty()) {
+      continue;
+    }
+    OpBuilder b(first);
+    Operation *copy = b.clone(*repeat);
+    for (OpOperand *use : outside) {
+      use->set(copy->getResult(0));
+    }
+  }
+}
+
 // A group with a head split whose one [T, H, D] result is joined
 // by other escaping values (Inkling 2's first global layer computes the
 // per-token tau that later layers use too) cannot be head-major. Those
@@ -625,6 +783,138 @@ static void rewriteHeadSlices(ModuleOp moduleOp) {
   }
 }
 
+// One rows of rows sliced out of their flattening (x [B.., T, N] reshaped to
+// [B.. T N] or [B.. T, N], the slice exactly x[b], as torch's unbind of
+// Inkling 2's loop-controller outputs lowers): the leading-dim slice of x
+// and a reshape, which D2M's row splits take as one pick of the packed rows.
+static void rewriteRowsOfRowsSlices(ModuleOp moduleOp) {
+  IRRewriter rw(moduleOp.getContext());
+  SmallVector<std::pair<SliceStaticOp, SmallVector<int64_t>>> slices;
+  moduleOp.walk([&](SliceStaticOp s) {
+    auto r = s.getInput().getDefiningOp<ReshapeOp>();
+    if (!r) {
+      return;
+    }
+    auto x = cast<RankedTensorType>(r.getInput().getType());
+    auto flat = r.getResult().getType();
+    const int64_t n = x.getRank();
+    if (n < 3 || !isa_and_nonnull<TTNNLayoutAttr>(x.getEncoding())) {
+      return;
+    }
+    const int64_t T = x.getDimSize(n - 2), N = x.getDimSize(n - 1);
+    // Decode rows only (what the row splits take; prefill keeps its form).
+    if (T > 32) {
+      return;
+    }
+    auto b = extractFromIntegerArrayAttr<int32_t>(s.getBegins());
+    auto e = extractFromIntegerArrayAttr<int32_t>(s.getEnds());
+    auto st = extractFromIntegerArrayAttr<int32_t>(s.getStep());
+    if (llvm::any_of(st, [](int32_t v) { return v != 1; })) {
+      return;
+    }
+    int64_t index;
+    if (flat.getRank() == 1) {
+      if (b[0] % (T * N) != 0 || e[0] - b[0] != T * N) {
+        return;
+      }
+      index = b[0] / (T * N);
+    } else if (flat.getRank() == 2 && flat.getDimSize(1) == N) {
+      if (b[0] % T != 0 || e[0] - b[0] != T || b[1] != 0 || e[1] != N) {
+        return;
+      }
+      index = b[0] / T;
+    } else {
+      return;
+    }
+    SmallVector<int64_t> coords(n - 2);
+    for (int64_t d = n - 3; d >= 0; --d) {
+      coords[d] = index % x.getDimSize(d);
+      index /= x.getDimSize(d);
+    }
+    slices.push_back({s, coords});
+  });
+  for (auto &[s, coords] : slices) {
+    auto r = s.getInput().getDefiningOp<ReshapeOp>();
+    Value x = r.getInput();
+    auto xType = cast<RankedTensorType>(x.getType());
+    const int64_t n = xType.getRank();
+    SmallVector<int64_t> shape(n - 2, 1);
+    shape.append({xType.getDimSize(n - 2), xType.getDimSize(n - 1)});
+    auto pickType = RankedTensorType::get(
+        shape, xType.getElementType(),
+        TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(xType.getEncoding()),
+                                shape)
+            .build());
+    SmallVector<int32_t> begins, ends;
+    for (int64_t c : coords) {
+      begins.push_back(static_cast<int32_t>(c));
+      ends.push_back(static_cast<int32_t>(c + 1));
+    }
+    begins.append({0, 0});
+    ends.append({static_cast<int32_t>(shape[n - 2]),
+                 static_cast<int32_t>(shape[n - 1])});
+    rw.setInsertionPoint(s);
+    auto pick = rw.create<SliceStaticOp>(
+        s.getLoc(), pickType, x, rw.getI32ArrayAttr(begins),
+        rw.getI32ArrayAttr(ends),
+        rw.getI32ArrayAttr(SmallVector<int32_t>(n, 1)));
+    rw.replaceOpWithNewOp<ReshapeOp>(
+        s, s.getType(), pick.getResult(),
+        rw.getI32ArrayAttr(llvm::to_vector_of<int32_t>(s.getType().getShape())));
+    if (r->use_empty()) {
+      rw.eraseOp(r);
+    }
+  }
+}
+
+// An RMS norm over a vector [N] (Inkling 2's bs1 unbind flattens each
+// query's mix): over the row [1, N] instead, read from the vector's row source
+// when it is a reshape of one ([1.., 1, N]), and reshaped back. D2M takes
+// norms over rows, so the row splits take it; a vector norm stayed one TTNN
+// program per query.
+static void rowNormsOfVectors(ModuleOp moduleOp) {
+  IRRewriter rw(moduleOp.getContext());
+  SmallVector<RMSNormOp> norms;
+  moduleOp.walk([&](RMSNormOp n) {
+    auto in = n.getInput().getType();
+    if (in.getRank() == 1 && n.getResult().getType().getRank() == 1 &&
+        !n.getBias() && isa_and_nonnull<TTNNLayoutAttr>(in.getEncoding())) {
+      norms.push_back(n);
+    }
+  });
+  auto withShape = [](RankedTensorType t, ArrayRef<int64_t> shape) {
+    return RankedTensorType::get(
+        shape, t.getElementType(),
+        TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(t.getEncoding()), shape)
+            .build());
+  };
+  for (RMSNormOp n : norms) {
+    const int64_t N = n.getInput().getType().getDimSize(0);
+    rw.setInsertionPoint(n);
+    Value x = n.getInput();
+    if (auto r = x.getDefiningOp<ReshapeOp>()) {
+      auto src = r.getInput().getType();
+      if (src.getRank() >= 2 && src.getShape().back() == N &&
+          src.getNumElements() == N) {
+        x = r.getInput();
+      }
+    }
+    auto xType = cast<RankedTensorType>(x.getType());
+    if (xType.getRank() != 2) {
+      auto rowType = withShape(xType, {1, N});
+      x = rw.create<ReshapeOp>(n.getLoc(), rowType, x,
+                               rw.getI32ArrayAttr({1, static_cast<int32_t>(N)}));
+    }
+    auto rowOut = withShape(n.getResult().getType(), {1, N});
+    auto row = cast<RMSNormOp>(rw.clone(*n));
+    row->setOperand(0, x);
+    row.getResult().setType(rowOut);
+    rw.replaceOpWithNewOp<ReshapeOp>(
+        n, n.getResult().getType(), row.getResult(),
+        rw.getI32ArrayAttr({static_cast<int32_t>(N)}));
+  }
+}
+
 // A widening typecast whose only use is a reshape (Inkling 2's
 // attention output before its gate) widens after the reshape instead, next
 // to its consumer, where D2M takes it.
@@ -742,9 +1032,206 @@ static void foldNarrowingCasts(ModuleOp moduleOp) {
 // op's whole row-merged kernel. (Inkling 2 chains three 2304-wide norms
 // in one group: split into programs, the exchange met a partial from DRAM.)
 // The rest of the group stays a group.
+// The ops that make a group one split over cores whole (splitWideRows): a
+// low-rank matmul or a wide norm over several rows of rows.
+static bool isSplitAnchor(Operation *op) {
+  if (isa<MatmulOp>(op)) {
+    return true;
+  }
+  if (isa<RMSNormOp, RMSNormGatedOp>(op)) {
+    auto t = cast<RankedTensorType>(op->getOperand(0).getType());
+    return d2m_fusion::wideNormChunks(op, t) && d2m_fusion::batchOf(t) > 1;
+  }
+  return false;
+}
+
+// Ops admitted only for splitting: the split-row ops and ops on batched wide
+// rows past the outliner's L1 limit (d2m_fusion::isSplitRowType values; whole
+// rows per core would not fit).
+static bool splitOnly(Operation *op) {
+  if (d2m_fusion::isSplitRowOp(op)) {
+    return true;
+  }
+  return llvm::any_of(
+      llvm::concat<Value>(op->getOperands(), op->getResults()), [](Value v) {
+        auto t = dyn_cast<RankedTensorType>(v.getType());
+        return t && t.getRank() > 2 && d2m_fusion::isSplitRowType(t) &&
+               t.getDimSize(t.getRank() - 2) % 32 != 0 &&
+               d2m_fusion::tileCount(t) > 128;
+      });
+}
+
+// Without an anchor, the ops admitted only for splitting (splitOnly) leave a
+// group at its boundary; a group with one inside is not outlined.
+static void trimSplitOps(SmallVectorImpl<SmallVector<Operation *>> &groups) {
+  for (auto &group : groups) {
+    if (llvm::any_of(group, isSplitAnchor)) {
+      continue;
+    }
+    llvm::SetVector<Operation *> members(group.begin(), group.end());
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (Operation *op : members.getArrayRef()) {
+        if (!splitOnly(op)) {
+          continue;
+        }
+        bool source = llvm::none_of(op->getOperands(), [&](Value v) {
+          return members.contains(v.getDefiningOp());
+        });
+        bool sink = llvm::none_of(op->getUsers(), [&](Operation *u) {
+          return members.contains(u);
+        });
+        if (source || sink) {
+          members.remove(op);
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (llvm::any_of(members, splitOnly)) {
+      members.clear();
+    }
+    group = members.takeVector();
+  }
+}
+
+// A group with an anchor splits its values over cores but returns only whole
+// rows (batch 1): it takes in the consumers of its batched results (their
+// groups, or ops admitted for splitting), if it stays schedulable (every
+// input before every outside use of a result).
+static void
+absorbBatchedConsumers(SmallVectorImpl<SmallVector<Operation *>> &groups) {
+  auto batched = [](Value v) {
+    auto t = dyn_cast<RankedTensorType>(v.getType());
+    return t && d2m_fusion::batchOf(t) > 1;
+  };
+  for (size_t g = 0; g < groups.size(); ++g) {
+    if (!llvm::any_of(groups[g], isSplitAnchor)) {
+      continue;
+    }
+    llvm::SetVector<Operation *> members(groups[g].begin(), groups[g].end());
+    llvm::DenseSet<size_t> absorbed;
+    bool stuck = false;
+    for (bool changed = true; changed && !stuck;) {
+      changed = false;
+      for (Operation *op : members.getArrayRef()) {
+        for (Value r : op->getResults()) {
+          if (!batched(r)) {
+            continue;
+          }
+          for (Operation *user : r.getUsers()) {
+            if (members.contains(user)) {
+              continue;
+            }
+            size_t other = groups.size();
+            for (size_t h = 0; h < groups.size(); ++h) {
+              if (h != g && !absorbed.contains(h) &&
+                  llvm::is_contained(groups[h], user)) {
+                other = h;
+                break;
+              }
+            }
+            if (other < groups.size()) {
+              absorbed.insert(other);
+              members.insert(groups[other].begin(), groups[other].end());
+            } else if (d2m_fusion::isSplitRowOp(user)) {
+              members.insert(user);
+            } else {
+              stuck = true;
+              break;
+            }
+            changed = true;
+            break;
+          }
+          if (changed || stuck) {
+            break;
+          }
+        }
+        if (changed || stuck) {
+          break;
+        }
+      }
+    }
+    if (stuck || (absorbed.empty() && members.size() == groups[g].size())) {
+      continue;
+    }
+    // Schedulable: the last input's def precedes every outside use.
+    Block *block = groups[g].front()->getBlock();
+    Operation *lastInput = nullptr;
+    for (Operation *op : members) {
+      for (Value v : op->getOperands()) {
+        Operation *def = v.getDefiningOp();
+        if (def && def->getBlock() == block && !members.contains(def) &&
+            (!lastInput || lastInput->isBeforeInBlock(def))) {
+          lastInput = def;
+        }
+      }
+    }
+    bool ok = llvm::all_of(members, [&](Operation *op) {
+      return llvm::all_of(op->getUsers(), [&](Operation *user) {
+        Operation *anc = block->findAncestorOpInBlock(*user);
+        return !anc || members.contains(anc) || !lastInput ||
+               lastInput->isBeforeInBlock(anc);
+      });
+    });
+    if (!ok) {
+      continue;
+    }
+    groups[g] = members.takeVector();
+    for (size_t h : absorbed) {
+      groups[h].clear();
+    }
+  }
+  llvm::erase_if(groups, [](auto &group) { return group.empty(); });
+}
+
 static void isolateWideNorms(SmallVectorImpl<SmallVector<Operation *>> &groups) {
   SmallVector<SmallVector<Operation *>> out;
   for (auto &group : groups) {
+    // A group split whole keeps its norms (one kernel, several exchanges)
+    // but not its attention residuals (their own chunked kernels): cut at
+    // each, in block order (the ops before one, it with its weight reshape,
+    // the ops after; parts of a convex group in block order stay convex).
+    if (llvm::any_of(group, isSplitAnchor)) {
+      SmallVector<Operation *> sorted(group.begin(), group.end());
+      llvm::sort(sorted, [](Operation *a, Operation *b) {
+        return a->isBeforeInBlock(b);
+      });
+      llvm::SmallPtrSet<Operation *, 4> weights;
+      for (Operation *op : sorted) {
+        if (d2m_fusion::attnResChunks(op) && op->getNumOperands() > 1) {
+          auto weight = op->getOperand(1).getDefiningOp<ReshapeOp>();
+          if (weight && llvm::is_contained(group, weight) &&
+              weight->hasOneUse()) {
+            weights.insert(weight);
+          }
+        }
+      }
+      SmallVector<Operation *> part;
+      for (Operation *op : sorted) {
+        if (weights.contains(op)) {
+          continue;
+        }
+        if (!d2m_fusion::attnResChunks(op)) {
+          part.push_back(op);
+          continue;
+        }
+        if (!part.empty()) {
+          out.push_back(std::exchange(part, {}));
+        }
+        SmallVector<Operation *> alone;
+        if (auto weight = op->getOperand(1).getDefiningOp<ReshapeOp>();
+            weight && weights.contains(weight)) {
+          alone.push_back(weight);
+        }
+        alone.push_back(op);
+        out.push_back(std::move(alone));
+      }
+      if (!part.empty()) {
+        out.push_back(std::move(part));
+      }
+      continue;
+    }
     llvm::SetVector<Operation *> rest(group.begin(), group.end());
     for (Operation *op : group) {
       bool wideNorm =
@@ -780,6 +1267,8 @@ namespace mlir::tt::d2m_fusion {
 
 void prepareForOutlining(ModuleOp moduleOp) {
   ttnn::rewriteHeadSlices(moduleOp);
+  ttnn::rewriteRowsOfRowsSlices(moduleOp);
+  ttnn::rowNormsOfVectors(moduleOp);
   ttnn::sinkWideningCasts(moduleOp);
   ttnn::narrowBeforeHeadSplits(moduleOp);
   ttnn::foldNarrowingCasts(moduleOp);
@@ -787,7 +1276,11 @@ void prepareForOutlining(ModuleOp moduleOp) {
 
 void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &fusionGroups) {
   using namespace ttnn;
+  absorbBatchedConsumers(fusionGroups);
+  trimSplitOps(fusionGroups);
   isolateWideNorms(fusionGroups);
+  // (Parts cut off a split group: split ops only at their boundaries.)
+  trimSplitOps(fusionGroups);
   SmallVector<SmallVector<Operation *>> split;
   for (auto &group : fusionGroups) {
     for (auto &part : splitHeadGroup(group)) {
@@ -807,6 +1300,8 @@ void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &fusionGroups) {
   for (auto &group : fusionGroups) {
     keepEscapingSlicesOnTTNN(group);
     dropSideOutputs(group);
+    dropReshapedOutputs(group);
+    cloneEscapingRepeats(group);
     auto copies = pullInScaleReshapes(group);
     addHeadMerge(group);
     settleScaleReshapes(group, copies);
@@ -814,6 +1309,10 @@ void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &fusionGroups) {
     llvm::sort(group, [](Operation *a, Operation *b) {
       return a->isBeforeInBlock(b);
     });
+    // Its reshapes are of the rows of rows (splitWideRows), not heads.
+    if (llvm::any_of(group, isSplitAnchor)) {
+      continue;
+    }
     llvm::DenseSet<Operation *> members(group.begin(), group.end());
     bool hasHeadReshape = llvm::any_of(group, [](Operation *op) {
       auto r = dyn_cast<ReshapeOp>(op);

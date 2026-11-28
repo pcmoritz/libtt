@@ -154,6 +154,37 @@ inline void bcast_col0() {
   }
   _llk_math_eltwise_sfpu_done_();
 }
+// Rows [from, 32) of DST tile t set to zero (raw bits): a kernel of fewer
+// tile rows (libtt.tile_rows) leaves them as DST held them, and an output's
+// padding rows are read by later ops (NaN there hung Inkling 2's decode).
+template <uint32_t t, uint32_t from>
+inline void zero_rows() {
+  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
+  _llk_math_eltwise_sfpu_start_(0);
+#pragma GCC unroll 8
+  for (uint32_t band = from / 4; band < 8; ++band) {
+#pragma GCC unroll 2
+    for (uint32_t h = 0; h < 2; ++h) {
+#pragma GCC unroll 2
+      for (uint32_t p = 0; p < 2; ++p) {
+        const uint32_t a = t * 32 + (2 * (band / 4) + h) * 8 + 2 * (band % 4) + p;
+        if (band * 4 >= from) {
+          sfpi::dst_reg[a] = sfpi::vInt(0);
+        } else {
+          sfpi::vInt v = sfpi::dst_reg[a];
+          v_if((sfpi::as<sfpi::vInt>(sfpi::as<sfpi::vUInt>(
+                    sfpi::vInt(sfpi::vConstTileId)) >> 4) & 3) >=
+               static_cast<int>(from - band * 4)) {
+            v = 0;
+          }
+          v_endif;
+          sfpi::dst_reg[a] = v;
+        }
+      }
+    }
+  }
+  _llk_math_eltwise_sfpu_done_();
+}
 // dst = row 0 of src spread down each column (in place allowed): a
 // subvector transpose of four copies of a row-0 vector repeats its first
 // subvector (row 0) in every subvector.
@@ -458,6 +489,45 @@ sfpi_inline void add_gather(uint32_t dst, uint32_t src, uint32_t rows) {
   }
   _llk_math_eltwise_sfpu_done_();
 }
+// A whole-tile chunk all-reduce's combine (libtt_dm_chunk_allreduce_tiles)
+// on the sum of a partial tile's gather tiles in t: the cores' slots of slot
+// rows folded, rows of equal index mod slot summed onto rows [0, slot)
+// (vector adds: 16 rows apart = 16 vectors, 8 = 4, 4 = 2); slot 1: each
+// column's sum over all 32 rows, in every row.
+sfpi_inline void gather_fold(uint32_t t, uint32_t slot) {
+  if (slot == 1) {
+    column_reduce(t, t, false, 32);
+    return;
+  }
+  llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>();
+  _llk_math_eltwise_sfpu_start_(0);
+  auto fold = [&](uint32_t v, uint32_t dv) __attribute__((always_inline)) {
+    sfpi::vFloat a = sfpi::dst_reg[t * 32 + v];
+    sfpi::vFloat b = sfpi::dst_reg[t * 32 + v + dv];
+    sfpi::dst_reg[t * 32 + v] = a + b;
+  };
+  if (slot <= 16) {
+#pragma GCC unroll 16
+    for (uint32_t v = 0; v < 16; ++v) {
+      fold(v, 16);
+    }
+  }
+  if (slot <= 8) {
+#pragma GCC unroll 4
+    for (uint32_t v = 0; v < 4; ++v) {
+      fold(v, 4);
+      fold(8 + v, 4);
+    }
+  }
+  if (slot <= 4) {
+#pragma GCC unroll 2
+    for (uint32_t v = 0; v < 2; ++v) {
+      fold(v, 2);
+      fold(8 + v, 2);
+    }
+  }
+  _llk_math_eltwise_sfpu_done_();
+}
 // The exchanged partial from the gather tiles' sum in t: partial row c (the
 // sum of column c of every slot, over the 32 gather rows) in every column of
 // row c, rows c < rows. Per column half (one with slots of <= 16 columns:
@@ -634,6 +704,134 @@ inline uint32_t libtt_gather_slot(uint32_t rows) {
   }
   return w;
 }
+// Each NoC-contiguous rectangle of the logical rectangle (x0, y0)-(x1, y1)
+// (harvested columns and rows split it): f(multicast address with offset 0,
+// number of its cores other than (mx, my)).
+template <typename F>
+inline void libtt_dm_for_rects(uint32_t x0, uint32_t y0, uint32_t x1,
+                               uint32_t y1, uint32_t mx, uint32_t my,
+                               uint32_t noc, F f) {
+  for (uint32_t xa = x0; xa <= x1;) {
+    uint32_t xb = xa;
+    while (xb < x1 && worker_logical_col_to_virtual_col[xb + 1] ==
+                          worker_logical_col_to_virtual_col[xb] + 1) {
+      ++xb;
+    }
+    for (uint32_t ya = y0; ya <= y1;) {
+      uint32_t yb = ya;
+      while (yb < y1 && worker_logical_row_to_virtual_row[yb + 1] ==
+                            worker_logical_row_to_virtual_row[yb] + 1) {
+        ++yb;
+      }
+      const uint32_t ax = worker_logical_col_to_virtual_col[xa];
+      const uint32_t bx = worker_logical_col_to_virtual_col[xb];
+      const uint32_t ay = worker_logical_row_to_virtual_row[ya];
+      const uint32_t by = worker_logical_row_to_virtual_row[yb];
+      const bool self = mx >= xa && mx <= xb && my >= ya && my <= yb;
+      const uint32_t n = (xb - xa + 1) * (yb - ya + 1) - (self ? 1 : 0);
+      if (n > 0) {
+        f(noc == 0 ? get_noc_multicast_addr(ax, ay, bx, by, 0, noc)
+                   : get_noc_multicast_addr(bx, by, ax, ay, 0, noc),
+          n);
+      }
+      ya = yb + 1;
+    }
+    xa = xb + 1;
+  }
+}
+
+// Program entry. tt-metal pipelines programs across cores: a core done with
+// the previous program starts this one while others still run theirs, and the
+// exchanges write into other cores' CBs, which a previous program there may
+// still use (an Inkling 2 decode step hung on it). So: every core but the
+// root bumps the root's entry semaphore when it starts (a semaphore is set up
+// before any core starts); before the first exchange's writes the root waits
+// for all k - 1 and multicasts the go-ahead, which the others wait for.
+inline void libtt_dm_entry_signal(uint32_t sem_id, uint32_t x0, uint32_t y0,
+                                  uint32_t x1, uint32_t y1, uint32_t noc) {
+  const uint32_t w = x1 - x0 + 1;
+  const uint32_t me = ((uint32_t)get_absolute_logical_y() - y0) * w +
+                      ((uint32_t)get_absolute_logical_x() - x0);
+  if (me != 0) {
+    noc_semaphore_inc(
+        get_noc_addr(worker_logical_col_to_virtual_col[x0],
+                     worker_logical_row_to_virtual_row[y0],
+                     get_semaphore(sem_id), noc),
+        1, noc);
+  }
+}
+inline void libtt_dm_entry_wait(uint32_t sem_id, uint32_t x0, uint32_t y0,
+                                uint32_t x1, uint32_t y1, uint32_t noc) {
+  const uint32_t w = x1 - x0 + 1;
+  const uint32_t k = w * (y1 - y0 + 1);
+  const uint32_t mx = (uint32_t)get_absolute_logical_x();
+  const uint32_t my = (uint32_t)get_absolute_logical_y();
+  const uint32_t me = (my - y0) * w + (mx - x0);
+  const uint32_t sem = get_semaphore(sem_id);
+  volatile tt_l1_ptr uint32_t *s =
+      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(sem);
+  if (me == 0) {
+    noc_semaphore_wait_min(s, k - 1);
+    // The go-ahead's source: this semaphore (16-byte aligned, as the
+    // destination), set to 1 for the multicast.
+    noc_semaphore_set(s, 1);
+    libtt_dm_for_rects(x0, y0, x1, y1, mx, my, noc,
+                       [&](uint64_t mcast_base, uint32_t n) {
+      noc_semaphore_set_multicast(sem, mcast_base | sem, n, false, noc);
+    });
+    noc_async_write_barrier(noc);
+  } else {
+    noc_semaphore_wait_min(s, 1);
+  }
+  noc_semaphore_set(s, 0);
+}
+
+// The exchanges' end: every core but the root (x0, y0) bumps the root's
+// semaphore after its gather writes (the same NoC and VC, so the bump lands
+// after them) and waits for the flag; the root, once all k - 1 arrived,
+// multicasts its gather tiles to the others, each NoC-contiguous rectangle
+// once, with the flag on the same path (linked; its source is send's first
+// word, 16-byte aligned as the semaphore); then every core pushes recv.
+inline void libtt_dm_gather_done(CircularBuffer &send, CircularBuffer &recv,
+                                 uint32_t sem_id, uint32_t x0, uint32_t y0,
+                                 uint32_t x1, uint32_t y1, uint32_t mx,
+                                 uint32_t my, uint32_t me, uint32_t k,
+                                 uint32_t src, uint32_t base,
+                                 uint32_t recv_tiles, uint32_t send_tiles,
+                                 uint32_t noc) {
+  const uint32_t rx = worker_logical_col_to_virtual_col[x0];
+  const uint32_t ry = worker_logical_row_to_virtual_row[y0];
+  volatile tt_l1_ptr uint32_t *p =
+      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(src);
+  const uint32_t sem = get_semaphore(sem_id);
+  volatile tt_l1_ptr uint32_t *s =
+      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(sem);
+  if (me != 0) {
+    noc_async_writes_flushed(noc);
+    noc_semaphore_inc(get_noc_addr(rx, ry, sem, noc), 1, noc);
+    noc_async_write_barrier(noc);
+    send.pop_front(send_tiles);
+    noc_semaphore_wait_min(s, 1);
+  } else {
+    noc_async_write_barrier(noc);
+    // The flag's source: P's first word, done with (16-byte aligned, as the
+    // semaphore: the NoC needs equal source and destination alignment).
+    p[0] = 1;
+    noc_semaphore_wait_min(s, k - 1);
+    noc_async_read_barrier(noc);
+    libtt_dm_for_rects(x0, y0, x1, y1, mx, my, noc,
+                       [&](uint64_t mcast_base, uint32_t n) {
+      noc_async_write_multicast(base, mcast_base | base, recv_tiles * 4096, n,
+                                true, noc);
+      noc_semaphore_set_multicast(src, mcast_base | sem, n, false, noc);
+    });
+    noc_async_write_barrier(noc);
+    send.pop_front(send_tiles);
+  }
+  noc_semaphore_set(s, 0);
+  recv.push_back(recv_tiles);
+}
+
 // The chunk all-reduce's exchange (d2m_fusion::insertChunkAllReduce) on the k
 // cores of the logical rectangle (x0, y0)-(x1, y1). Each core's row sums
 // (column 0 of the FP32 tile in send_cb, rows 0..rows-1) go, as row t's in
@@ -719,60 +917,186 @@ inline void libtt_dm_chunk_allreduce(uint32_t send_cb, uint32_t recv_cb,
                     get_noc_addr(rx, ry, dst + h * 1024, noc),
                     (slot > 16 ? 16 : slot) * 4, noc);
   }
-  const uint32_t sem = get_semaphore(sem_id);
-  volatile tt_l1_ptr uint32_t *s =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(sem);
-  if (me != 0) {
-    noc_async_writes_flushed(noc);
-    noc_semaphore_inc(get_noc_addr(rx, ry, sem, noc), 1, noc);
-    noc_async_write_barrier(noc);
-    send.pop_front(1);
-    noc_semaphore_wait_min(s, 1);
-  } else {
-    noc_async_write_barrier(noc);
-    // The flag's source: P's first word, done with (16-byte aligned, as the
-    // semaphore: the NoC needs equal source and destination alignment).
-    p[0] = 1;
-    noc_semaphore_wait_min(s, k - 1);
-    noc_async_read_barrier(noc);
-    for (uint32_t xa = x0; xa <= x1;) {
-      uint32_t xb = xa;
-      while (xb < x1 && worker_logical_col_to_virtual_col[xb + 1] ==
-                            worker_logical_col_to_virtual_col[xb] + 1) {
-        ++xb;
+  libtt_dm_gather_done(send, recv, sem_id, x0, y0, x1, y1, mx, my, me, k, src,
+                       base, recv_tiles, 1, noc);
+}
+// Whole tiles (libtt.full_tile): rows [0, rows) of each of the ntiles FP32
+// tiles in send_cb (every column) go to recv_cb on the root, as rows
+// me % per * slot.. of gather tile n * g + me / per (slot:
+// libtt_full_slot(rows); per = 32 / slot cores per gather tile, g gather
+// tiles per partial tile); the root zeroes each last gather tile's rows past
+// the k-th slot; then as libtt_dm_chunk_allreduce. The compute adds a
+// partial tile's g gather tiles and folds their rows (libtt_sfpu::gather_fold).
+inline uint32_t libtt_full_slot(uint32_t rows) {
+  return rows == 1 ? 1 : rows <= 4 ? 4 : libtt_gather_slot(rows);
+}
+inline void libtt_dm_chunk_allreduce_tiles(uint32_t send_cb, uint32_t recv_cb,
+                                           uint32_t sem_id, uint32_t x0,
+                                           uint32_t y0, uint32_t x1,
+                                           uint32_t y1, uint32_t rows,
+                                           uint32_t ntiles, uint32_t g,
+                                           uint32_t noc) {
+  CircularBuffer send(send_cb), recv(recv_cb);
+  const uint32_t w = x1 - x0 + 1;
+  const uint32_t k = w * (y1 - y0 + 1);
+  const uint32_t mx = (uint32_t)get_absolute_logical_x();
+  const uint32_t my = (uint32_t)get_absolute_logical_y();
+  const uint32_t me = (my - y0) * w + (mx - x0);
+  const uint32_t slot = libtt_full_slot(rows);
+  const uint32_t per = 32 / slot;
+  recv.reserve_back(ntiles * g);
+  const uint32_t base = recv.get_write_ptr();
+  if (me == 0) {
+    const uint64_t zeros =
+        get_noc_addr(my_x[noc], my_y[noc], MEM_ZEROS_BASE, noc);
+    auto zero = [&](uint32_t at, uint32_t n) {
+      while (n > 0) {
+        const uint32_t m = n < MEM_ZEROS_SIZE - 16 ? n : MEM_ZEROS_SIZE - 16;
+        noc_async_read(zeros + (at & 15), at, m, noc);
+        at += m;
+        n -= m;
       }
-      for (uint32_t ya = y0; ya <= y1;) {
-        uint32_t yb = ya;
-        while (yb < y1 && worker_logical_row_to_virtual_row[yb + 1] ==
-                              worker_logical_row_to_virtual_row[yb] + 1) {
-          ++yb;
+    };
+    const uint32_t used = (k - (g - 1) * per) * slot;
+    for (uint32_t n = 0; n < ntiles; ++n) {
+      const uint32_t tile = base + (n * g + g - 1) * 4096;
+      for (uint32_t r = used; r < 32; r = (r / 16 + 1) * 16) {
+        for (uint32_t h = 0; h < 2; ++h) {
+          zero(tile + r / 16 * 2048 + h * 1024 + r % 16 * 64,
+               ((r / 16 + 1) * 16 - r) * 64);
         }
-        const uint32_t ax = worker_logical_col_to_virtual_col[xa];
-        const uint32_t bx = worker_logical_col_to_virtual_col[xb];
-        const uint32_t ay = worker_logical_row_to_virtual_row[ya];
-        const uint32_t by = worker_logical_row_to_virtual_row[yb];
-        const bool self = mx >= xa && mx <= xb && my >= ya && my <= yb;
-        const uint32_t n = (xb - xa + 1) * (yb - ya + 1) - (self ? 1 : 0);
-        if (n > 0) {
-          const uint64_t data =
-              noc == 0 ? get_noc_multicast_addr(ax, ay, bx, by, base, noc)
-                       : get_noc_multicast_addr(bx, by, ax, ay, base, noc);
-          const uint64_t flag =
-              noc == 0 ? get_noc_multicast_addr(ax, ay, bx, by, sem, noc)
-                       : get_noc_multicast_addr(bx, by, ax, ay, sem, noc);
-          noc_async_write_multicast(base, data, recv_tiles * 4096, n, true,
-                                    noc);
-          noc_semaphore_set_multicast(src, flag, n, false, noc);
-        }
-        ya = yb + 1;
       }
-      xa = xb + 1;
     }
-    noc_async_write_barrier(noc);
-    send.pop_front(1);
   }
-  noc_semaphore_set(s, 0);
-  recv.push_back(recv_tiles);
+  send.wait_front(ntiles);
+  const uint32_t src = send.get_read_ptr();
+  const uint32_t rx = worker_logical_col_to_virtual_col[x0];
+  const uint32_t ry = worker_logical_row_to_virtual_row[y0];
+  for (uint32_t n = 0; n < ntiles; ++n) {
+    const uint32_t tile = base + (n * g + me / per) * 4096;
+    // Rows [r, e) of one 16-row band (faces 0-1 or 2-3: two writes).
+    for (uint32_t r = 0; r < rows;) {
+      const uint32_t e = rows < (r / 16 + 1) * 16 ? rows : (r / 16 + 1) * 16;
+      const uint32_t d = me % per * slot + r;
+      for (uint32_t h = 0; h < 2; ++h) {
+        noc_async_write(src + n * 4096 + r / 16 * 2048 + h * 1024 + r % 16 * 64,
+                        get_noc_addr(rx, ry,
+                                     tile + d / 16 * 2048 + h * 1024 +
+                                         d % 16 * 64,
+                                     noc),
+                        (e - r) * 64, noc);
+      }
+      r = e;
+    }
+  }
+  libtt_dm_gather_done(send, recv, sem_id, x0, y0, x1, y1, mx, my, me, k, src,
+                       base, ntiles * g, ntiles, noc);
+}
+
+// The whole-tile exchange in two levels, for partials of several rows (as
+// libtt_dm_chunk_allreduce_tiles): row r of partial tile n is reduced on
+// core q = n * rows + r. Every core writes that row (two 64-byte face-row
+// halves) to q's inbox, tile me / 32, row me % 32, and bumps q's semaphore
+// a; q, once all k - 1 others did, pushes its inbox (the rows past k zeroed)
+// and the compute sums it to red (every row: the column sums). Core q writes
+// red's row 0 to row r of tile n of the root's recv, then libtt_dm_gather_done
+// on semaphore b: the root multicasts only the summed tiles (recv rows past
+// rows zeroed).
+inline void libtt_dm_chunk_allreduce_rows(uint32_t send_cb, uint32_t recv_cb,
+                                          uint32_t inbox_cb, uint32_t red_cb,
+                                          uint32_t sem_a, uint32_t sem_b,
+                                          uint32_t x0, uint32_t y0,
+                                          uint32_t x1, uint32_t y1,
+                                          uint32_t rows, uint32_t ntiles,
+                                          uint32_t noc) {
+  CircularBuffer send(send_cb), recv(recv_cb), inbox(inbox_cb), red(red_cb);
+  const uint32_t w = x1 - x0 + 1;
+  const uint32_t k = w * (y1 - y0 + 1);
+  const uint32_t mx = (uint32_t)get_absolute_logical_x();
+  const uint32_t my = (uint32_t)get_absolute_logical_y();
+  const uint32_t me = (my - y0) * w + (mx - x0);
+  const uint32_t g = (k + 31) / 32;
+  const uint32_t reducers = rows * ntiles;
+  inbox.reserve_back(g);
+  recv.reserve_back(ntiles);
+  const uint32_t ibase = inbox.get_write_ptr();
+  const uint32_t base = recv.get_write_ptr();
+  const uint64_t zeros =
+      get_noc_addr(my_x[noc], my_y[noc], MEM_ZEROS_BASE, noc);
+  auto zero = [&](uint32_t at, uint32_t n) {
+    while (n > 0) {
+      const uint32_t m = n < MEM_ZEROS_SIZE - 16 ? n : MEM_ZEROS_SIZE - 16;
+      noc_async_read(zeros + (at & 15), at, m, noc);
+      at += m;
+      n -= m;
+    }
+  };
+  // Rows [from, 32) of a tile (both 16-column halves of each 16-row band).
+  auto zeroRows = [&](uint32_t tile, uint32_t from) {
+    for (uint32_t r = from; r < 32; r = (r / 16 + 1) * 16) {
+      for (uint32_t h = 0; h < 2; ++h) {
+        zero(tile + r / 16 * 2048 + h * 1024 + r % 16 * 64,
+             ((r / 16 + 1) * 16 - r) * 64);
+      }
+    }
+  };
+  if (me < reducers) {
+    zeroRows(ibase + (g - 1) * 4096, k - (g - 1) * 32);
+  }
+  if (me == 0) {
+    for (uint32_t n = 0; n < ntiles; ++n) {
+      zeroRows(base + n * 4096, rows);
+    }
+  }
+  auto row = [](uint32_t r, uint32_t h) {
+    return r / 16 * 2048 + h * 1024 + r % 16 * 64;
+  };
+  send.wait_front(ntiles);
+  const uint32_t src = send.get_read_ptr();
+  const uint32_t sa = get_semaphore(sem_a);
+  const uint32_t at = ibase + me / 32 * 4096;
+  for (uint32_t q = 0; q < reducers; ++q) {
+    const uint32_t qx = worker_logical_col_to_virtual_col[x0 + q % w];
+    const uint32_t qy = worker_logical_row_to_virtual_row[y0 + q / w];
+    const uint32_t n = q / rows, r = q % rows;
+    for (uint32_t h = 0; h < 2; ++h) {
+      noc_async_write(src + n * 4096 + row(r, h),
+                      get_noc_addr(qx, qy, at + row(me % 32, h), noc), 64,
+                      noc);
+    }
+  }
+  noc_async_writes_flushed(noc);
+  for (uint32_t q = 0; q < reducers; ++q) {
+    if (q != me) {
+      const uint32_t qx = worker_logical_col_to_virtual_col[x0 + q % w];
+      const uint32_t qy = worker_logical_row_to_virtual_row[y0 + q / w];
+      noc_semaphore_inc(get_noc_addr(qx, qy, sa, noc), 1, noc);
+    }
+  }
+  noc_async_write_barrier(noc);
+  send.pop_front(ntiles);
+  if (me < reducers) {
+    volatile tt_l1_ptr uint32_t *s =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(sa);
+    noc_semaphore_wait_min(s, k - 1);
+    noc_semaphore_set(s, 0);
+    noc_async_read_barrier(noc);
+  }
+  inbox.push_back(g);
+  red.wait_front(1);
+  const uint32_t sum = red.get_read_ptr();
+  if (me < reducers) {
+    const uint32_t rx = worker_logical_col_to_virtual_col[x0];
+    const uint32_t ry = worker_logical_row_to_virtual_row[y0];
+    const uint32_t n = me / rows, r = me % rows;
+    for (uint32_t h = 0; h < 2; ++h) {
+      noc_async_write(sum + row(0, h),
+                      get_noc_addr(rx, ry, base + n * 4096 + row(r, h), noc),
+                      64, noc);
+    }
+  }
+  libtt_dm_gather_done(red, recv, sem_b, x0, y0, x1, y1, mx, my, me, k, sum,
+                       base, ntiles, 1, noc);
 }
 )libtt";
 

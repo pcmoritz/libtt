@@ -53,15 +53,23 @@ void fixHeadGroups(SmallVectorImpl<SmallVector<Operation *>> &groups);
 // and slices of whole rows at tile-aligned columns (read in place).
 int64_t tileCount(RankedTensorType type);
 bool headDimSupported(int64_t width);
-// RMS norms over one tile row ([..., T, N] with T <= 32, leading dims 1) of
-// more than 32 tiles: the number of chunks k the row is reduced in, one per
-// core of a rectangle of op's device ([k, T, N / k], the same tiles in the
-// same order).
+// RMS norms over one tile row ([..., T, N] with T <= 32, leading dims of at
+// most 8 indices) of more than 32 tiles: the number of chunks k the row is
+// reduced in, one per core of a rectangle of op's device ([k, T, N / k],
+// the same tiles in the same order).
 std::optional<int64_t> wideNormChunks(Operation *op, RankedTensorType type);
 // Inkling 2's attention residuals (ttnn.attn_res) D2M takes: one token, one
 // query row and up to 8 sources over one such wide row; the number of chunks.
 std::optional<int64_t> attnResChunks(Operation *op);
 bool isTileColumnSlice(ttnn::SliceStaticOp slice);
+// Ops D2M takes only as part of a group split over cores along its rows
+// (splitWideRows): low-rank decode matmuls (one of K, N a row of more than
+// 32 tiles, the other at most 4 tiles), last-dim concats, and repeats,
+// slices and reshapes of the leading dims.
+bool isSplitRowOp(Operation *op);
+// Values such groups split: up to 8 rows of rows [B.., T, N], T <= 32, of
+// more than 32 tiles (small per core, so past the outliner's L1 limits).
+bool isSplitRowType(RankedTensorType type);
 
 // A reshape the outliner drops: one element, the same shape once promoted to
 // rank 2 (in TTNNCreateD2MSubgraphs.cpp, next to that promotion).
@@ -148,6 +156,10 @@ bool usesFp32Dst(func::FuncOp kernel);
 bool keepKernelInDst(func::FuncOp kernel);
 // Fuses runs of elementwise SFPU tile ops into one SFPI function each.
 void fuseSFPUChains(func::FuncOp kernel);
+// A kernel of fewer tile rows (libtt.tile_rows): its outputs' other rows
+// zeroed before they are packed (later ops read padded tile rows; DST holds
+// leftovers there).
+void zeroPaddedOutputRows(func::FuncOp kernel);
 
 // After D2MToTTNN (lib/Conversion/D2MToTTKernel/ChunkAllReduce.cpp): each
 // program whose compute kernel has a libtt_chunk_allreduce_tile marker sums

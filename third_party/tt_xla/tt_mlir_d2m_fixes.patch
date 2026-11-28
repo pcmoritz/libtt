@@ -1007,7 +1007,7 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
  #include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
-@@ -302,7 +303,56 @@ static SmallVector<mlir::Attribute> createKernelDescriptors(
+@@ -302,7 +303,84 @@ static SmallVector<mlir::Attribute> createKernelDescriptors(
      const llvm::DenseMap<size_t, size_t> &semIndexMap,
      const DenseMap<uint32_t, uint32_t> &additionalArgMapping,
      const DenseMap<size_t, size_t> &cbOperandIndexToPortMapping,
@@ -1023,7 +1023,11 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
 +           dtype == ttcore::DataType::Int32 ||
 +           dtype == ttcore::DataType::UInt32;
 +  };
-+  bool hasSrcRegisterFPUOps = false;
++  // libtt: per CB: the ports FPU ops read (a Float32 CB that only SFPU ops
++  // read, copied to DST, needs the unpack to DST even in a kernel with
++  // matmuls); an FPU operand not traced to a port keeps the kernel-wide rule.
++  bool hasSrcRegisterFPUOps = false, untracedFPUOperand = false;
++  llvm::DenseSet<size_t> fpuPorts;
 +  for (Attribute thread : threads) {
 +    auto threadAttr = mlir::cast<d2m::ThreadAttr>(thread);
 +    if (threadAttr.getThreadType() != d2m::ThreadType::Compute) {
@@ -1031,10 +1035,32 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
 +    }
 +    auto kernelFunc = symbolTable.lookup<mlir::func::FuncOp>(
 +        threadAttr.getKernelSymbol().getRootReference());
++    auto spec = kernelFunc->getAttrOfType<ttkernel::ArgSpecAttr>(
++        ttkernel::ArgSpecAttr::name);
 +    kernelFunc.walk([&](Operation *op) {
-+      if (op->hasTrait<ttkernel::TTKernelFPUOpTrait>() &&
-+          !mlir::isa<ttkernel::UnaryBcastTileOp>(op)) {
-+        hasSrcRegisterFPUOps = true;
++      if (!op->hasTrait<ttkernel::TTKernelFPUOpTrait>() ||
++          mlir::isa<ttkernel::UnaryBcastTileOp>(op)) {
++        return;
++      }
++      hasSrcRegisterFPUOps = true;
++      for (Value v : op->getOperands()) {
++        if (!mlir::isa<ttkernel::CBType>(v.getType())) {
++          continue;
++        }
++        auto get = v.getDefiningOp<ttkernel::GetCommonArgValOp>();
++        auto index =
++            get ? get.getArgIndex().getDefiningOp<arith::ConstantIndexOp>()
++                : arith::ConstantIndexOp();
++        auto rtArgs = spec ? spec.getRtArgs() : ArrayRef<ttkernel::ArgAttr>{};
++        if (!index || static_cast<size_t>(index.value()) >= rtArgs.size() ||
++            rtArgs[index.value()].getArgType() != ttkernel::ArgType::CBPort ||
++            !cbOperandIndexToPortMapping.count(
++                rtArgs[index.value()].getOperandIndex())) {
++          untracedFPUOperand = true;
++          continue;
++        }
++        fpuPorts.insert(cbOperandIndexToPortMapping.at(
++            rtArgs[index.value()].getOperandIndex()));
 +      }
 +    });
 +  }
@@ -1047,10 +1073,12 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
 +        continue;
 +      }
 +      fp32DestAccum = true;
-+      if (dtype == ttcore::DataType::Float32 && hasSrcRegisterFPUOps) {
++      uint32_t port = format.getBufferIndex();
++      if (dtype == ttcore::DataType::Float32 &&
++          (untracedFPUOperand ? hasSrcRegisterFPUOps
++                              : fpuPorts.contains(port))) {
 +        continue;
 +      }
-+      uint32_t port = format.getBufferIndex();
 +      if (unpackToDestModes.size() <= port) {
 +        unpackToDestModes.resize(port + 1,
 +                                 ttnn::ComputeKernelUnpackToDestMode::Default);
@@ -1065,7 +1093,7 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
    SmallVector<mlir::Attribute> kernelConfigs(threads.size());
    for (const auto [i, thread] : llvm::enumerate(threads)) {
      const d2m::ThreadAttr threadAttr = mlir::cast<d2m::ThreadAttr>(thread);
-@@ -729,7 +779,8 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
+@@ -729,7 +807,8 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
    const auto arch = ttcore::getOpChipDescAttr(op).getArch().getValue();
    SmallVector<mlir::Attribute> kernelDescriptors = createKernelDescriptors(
        rewriter, op.getThreads(), coreRangeSet, opSymTable, mathFidelity,
@@ -1365,6 +1393,118 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                 [&](std::size_t index, bool dropped) { dims[index] = dropped; });
  
      bool reduceSecondToLast = dims[rank - 2]; // "C" in tile terminology
+@@ -4424,6 +4464,103 @@ public:
+ };
+ } // namespace
+ 
++namespace {
++// libtt: ttir.tile_view, a view whose device map takes each output tile's
++// logical tile coordinates through the op's map (the reinterpret branch above,
++// with any affine map).
++class D2MTileViewRewriter final : public OpConversionPattern<ttir::TileViewOp>,
++                                  D2MNamedRewriterCommon {
++public:
++  D2MTileViewRewriter(const TypeConverter &typeConverter, MLIRContext *ctx,
++                      ttcore::MemorySpace defaultInputMemSpace,
++                      ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
++                      bool /*collapseTensors*/, bool enableMulticastInference)
++      : OpConversionPattern<ttir::TileViewOp>(typeConverter, ctx),
++        D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
++                               ttnnMode, /*collapse*/ false,
++                               enableMulticastInference) {}
++
++  LogicalResult
++  matchAndRewrite(ttir::TileViewOp op, ttir::TileViewOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto origOutputs =
++        createDpsOutputs(op.getLoc(), rewriter, {op.getResult().getType()});
++    auto [inputs, outputs] = toLayoutOperandsAndResults(
++        rewriter, {adaptor.getOperands(), origOutputs}, /*tiled*/ true);
++    auto outTy = mlir::cast<RankedTensorType>(outputs[0].getType());
++    auto layout = mlir::cast<ttcore::MetalLayoutAttr>(outTy.getEncoding());
++    auto newLayout = ttcore::MetalLayoutAttr::get(
++        layout.getContext(), layout.getLogicalShape(), layout.getMemorySpace(),
++        layout.getMemoryLayout(), layout.getCollapsedIntervals(),
++        layout.getDimAlignments());
++    auto newOutTy = RankedTensorType::get(outTy.getShape(),
++                                          outTy.getElementType(), newLayout);
++    ArrayRef<int64_t> outShape = outTy.getShape();
++    ArrayRef<int64_t> inShape =
++        mlir::cast<RankedTensorType>(inputs[0].getType()).getShape();
++    const size_t outRank = outShape.size() / 2, inRank = inShape.size() / 2;
++    AffineMap map = op.getMap();
++    // Logical shapes in tiles (the last two dims).
++    auto tilesOf = [](RankedTensorType t) {
++      SmallVector<int64_t> s(t.getShape());
++      for (size_t d = s.size() >= 2 ? s.size() - 2 : 0; d < s.size(); ++d) {
++        s[d] = (s[d] + 31) / 32;
++      }
++      return s;
++    };
++    SmallVector<int64_t> outTiles = tilesOf(op.getResult().getType()),
++                         inTiles = tilesOf(op.getInput().getType());
++    if (map.getNumDims() != outTiles.size() ||
++        map.getNumResults() != inTiles.size()) {
++      return rewriter.notifyMatchFailure(op, "tile_view map rank mismatch");
++    }
++    MLIRContext *ctx = rewriter.getContext();
++    auto linearize = [&](ArrayRef<AffineExpr> coords, ArrayRef<int64_t> shape) {
++      AffineExpr l = getAffineConstantExpr(0, ctx);
++      for (auto [c, n] : llvm::zip_equal(coords, shape)) {
++        l = l * n + c;
++      }
++      return l;
++    };
++    auto delinearize = [&](AffineExpr l, ArrayRef<int64_t> shape) {
++      SmallVector<AffineExpr> coords(shape.size());
++      int64_t stride = 1;
++      for (int64_t i = static_cast<int64_t>(shape.size()) - 1; i >= 0; --i) {
++        coords[i] = l.floorDiv(stride) % shape[i];
++        stride *= shape[i];
++      }
++      return coords;
++    };
++    // Device shard coords (the device layouts may collapse dims; the tile
++    // order is row-major either way) -> logical tile coords -> the map ->
++    // the input's device shard coords.
++    SmallVector<AffineExpr> outShard;
++    for (size_t i = 0; i < outRank; ++i) {
++      outShard.push_back(getAffineDimExpr(outRank + i, ctx));
++    }
++    AffineExpr outLinear = linearize(outShard, outShape.drop_front(outRank));
++    SmallVector<AffineExpr> logical = delinearize(outLinear, outTiles);
++    SmallVector<AffineExpr> inLogical;
++    for (AffineExpr e : map.getResults()) {
++      inLogical.push_back(e.replaceDims(logical));
++    }
++    SmallVector<AffineExpr> results(inRank, getAffineConstantExpr(0, ctx));
++    llvm::append_range(results, delinearize(linearize(inLogical, inTiles),
++                                            inShape.drop_front(inRank)));
++    for (AffineExpr &e : results) {
++      e = simplifyAffineExpr(e, 2 * outRank, 0);
++    }
++    AffineMap deviceMap = AffineMap::get(2 * outRank, 0, results, ctx);
++    auto view = rewriter.create<d2m::ViewLayoutOp>(
++        op.getLoc(), newOutTy, inputs[0], deviceMap,
++        /*reinterpretLayout=*/false);
++    rewriter.replaceOp(op, unLayoutResult(rewriter, view->getResult(0),
++                                          op->getResult(0).getType()));
++    return success();
++  }
++};
++} // namespace
++
+ static TensorManipulationInfo rearrangeLogicalInfo(ttir::RearrangeOp op) {
+   mlir::FailureOr<AffineMap> maybeMap = op.getInvPatternMap();
+   assert(succeeded(maybeMap));
+@@ -5430,6 +5567,7 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+     D2MArgMaxRewriter,
+     // Tensor manipulation/View ops.
+     D2MConcatRewriter,
++    D2MTileViewRewriter,
+     D2MTensorManipulationOpRewriter<ttir::RearrangeOp,        rearrangeLogicalInfo>,
+     D2MTensorManipulationOpRewriter<ttir::ReshapeOp,          reshapeLogicalInfo>,
+     D2MTensorManipulationOpRewriter<ttir::SliceStaticOp,      sliceLogicalInfo>,
 diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
 --- a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
 +++ b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
@@ -2752,6 +2892,54 @@ diff --git a/lib/Dialect/D2M/Transforms/SFPUTileLoopFission.cpp b/lib/Dialect/D2
          // Use a worklist to process all loops (original and newly created).
          // Each fission creates a new loop that may also need fissioning.
          SmallVector<affine::AffineForOp> worklist;
+diff --git a/lib/Dialect/D2M/Utils/CBUtils.cpp b/lib/Dialect/D2M/Utils/CBUtils.cpp
+--- a/lib/Dialect/D2M/Utils/CBUtils.cpp
++++ b/lib/Dialect/D2M/Utils/CBUtils.cpp
+@@ -46,6 +46,9 @@ struct CBPortLifetime {
+   OpOperand *operand = nullptr;
+   Type type;
+   llvm::DenseMap<Block *, CBUseWindow> useWindows;
++  // Per thread block: whether it produces (reserve/push, bit 0) or consumes
++  // (wait/pop, bit 1) the CB, or uses it otherwise (bit 2: not shared).
++  llvm::DenseMap<Block *, unsigned> roles;
+   SmallVector<GetArgOp> getArgs;
+   SmallVector<GetCBOp> getCBs;
+ 
+@@ -115,6 +118,13 @@ static bool canShareCBPort(const CBPortLifetime &lhs,
+     if (it == rhs.useWindows.end()) {
+       return false;
+     }
++    // One FIFO keeps its order only with one producer and one consumer: a
++    // thread producing one CB and consuming the other (a reader that also
++    // writes an output) can consume its own earlier pages.
++    if (lhs.roles.lookup(block) != rhs.roles.lookup(block) ||
++        (lhs.roles.lookup(block) & 4u)) {
++      return false;
++    }
+ 
+     CBUseWindowOrder order = getRelativeOrder(lhsWindow, it->second);
+     if (order == CBUseWindowOrder::Overlap) {
+@@ -261,6 +271,7 @@ void reuseDisjointCBPorts(RewriterBase &rewriter, GenericOp generic,
+       }
+       lifetime->get().getArgs.push_back(getArgOp);
+       addResultUseWindow(getArgOp.getResult(), block, lifetime->get());
++      lifetime->get().roles[block] |= 4u;
+       return WalkResult::advance();
+     });
+ 
+@@ -278,6 +289,12 @@ void reuseDisjointCBPorts(RewriterBase &rewriter, GenericOp generic,
+       }
+       lifetime->get().getCBs.push_back(getCBOp);
+       addResultUseWindow(getCBOp.getResult(), block, lifetime->get());
++      unsigned &role = lifetime->get().roles[block];
++      for (Operation *user : getCBOp.getResult().getUsers()) {
++        role |= isa<ReserveOp, PushOp>(user) ? 1u
++                : isa<WaitOp, PopOp>(user)   ? 2u
++                                             : 4u;
++      }
+       return WalkResult::advance();
+     });
+   }
 diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 --- a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 +++ b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
@@ -3511,7 +3699,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      Block *funcBlock = funcOp.addEntryBlock();
      rewriter.setInsertionPointToStart(funcBlock);
  
-@@ -289,7 +396,22 @@ private:
+@@ -289,7 +396,28 @@ private:
      mapping.map(inputs.getArrayRef(), funcOp.getArguments());
  
      for (Operation *op : fusionGroup) {
@@ -3531,11 +3719,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 +          result.setType(
 +              normalizeSubgraphType(cast<RankedTensorType>(result.getType())));
 +        }
++        // libtt: a reshape to a vector (row splits: [1, 1, N] -> [N]) now
++        // makes the promoted [1, N]; its shape attribute follows.
++        if (auto r = dyn_cast<ReshapeOp>(clone)) {
++          r.setShapeAttr(rewriter.getI32ArrayAttr(
++              llvm::to_vector_of<int32_t>(r.getResult().getType().getShape())));
++        }
 +      }
      }
      llvm::SmallVector<Value> returnValues;
      llvm::transform(outputs, std::back_inserter(returnValues),
-@@ -306,12 +428,20 @@ private:
+@@ -306,12 +434,20 @@ private:
        rewriter.setInsertionPoint(firstOp);
      }
      auto dispatchOp = rewriter.create<D2MSubgraphOp>(

@@ -22,8 +22,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +  let results = (outs AnyRankedTensor:$weights, AnyRankedTensor:$ids);
 +}
 +
- def TTIR_LoopMixOp : TTIR_NamedOp<"loop_mix"> {
-   let summary = "Inkling 2's loop-message controller";
+ def TTIR_L2ClipOp : TTIR_NamedOp<"l2_clip", [AttrSizedOperandSegments]> {
+   let summary = "L2 clipping of each group of columns (a head)";
    let description = [{
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
@@ -45,8 +45,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +  let results = (outs AnyRankedTensor:$weights, AnyRankedTensor:$ids);
 +}
 +
- def TTNN_LoopMixOp : TTNN_Op<"loop_mix", [OpModelExempt]> {
-   let summary = "Inkling 2's loop-message controller";
+ def TTNN_L2ClipOp : TTNN_Op<"l2_clip", [AttrSizedOperandSegments, OpModelExempt]> {
+   let summary = "L2 clipping of each group of columns (a head)";
    let description = [{
 diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
 --- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
@@ -65,16 +65,16 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 +  ids: tt.target.ttnn.TensorRef;
 +}
 +
- table LoopMixOp {
-   dest: tt.target.ttnn.TensorRef;
-   messages: tt.target.ttnn.TensorRef;
+ table L2ClipOp {
+   input: tt.target.ttnn.TensorRef;
+   scale: tt.target.ttnn.TensorRef;
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -159,6 +159,7 @@ union OpType {
+@@ -158,6 +158,7 @@ union OpType {
+   RMSNormGatedOp,
    AttnResOp,
    L2ClipOp,
-   LoopMixOp,
 +  MoeRouteOp,
    ReshapeOp,
    SamplingOp,
@@ -105,13 +105,13 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +  }
 +};
 +
- class LoopMixOpConversionPattern : public OpConversionPattern<ttir::LoopMixOp> {
+ class L2ClipOpConversionPattern : public OpConversionPattern<ttir::L2ClipOp> {
  public:
-   using OpConversionPattern<ttir::LoopMixOp>::OpConversionPattern;
-@@ -4417,6 +4436,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+   using OpConversionPattern<ttir::L2ClipOp>::OpConversionPattern;
+@@ -4402,6 +4421,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            RMSNormGatedOpConversionPattern,
             AttnResOpConversionPattern,
             L2ClipOpConversionPattern,
-            LoopMixOpConversionPattern,
 +           MoeRouteOpConversionPattern,
             DistributedRMSNormOpConversionPattern,
             DistributedLayerNormOpConversionPattern,
@@ -143,10 +143,10 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      weights, ids);
 +}
 +
- ::flatbuffers::Offset<::tt::target::ttnn::LoopMixOp>
- createOp(FlatbufferObjectCache &cache, LoopMixOp op) {
+ ::flatbuffers::Offset<::tt::target::ttnn::L2ClipOp>
+ createOp(FlatbufferObjectCache &cache, L2ClipOp op) {
    auto tensor = [&](Value value) {
-@@ -5850,6 +5870,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5842,6 +5862,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
                             locInfo);
    }
@@ -154,27 +154,27 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +    return createOperation(cache, createOp(cache, moeRouteOp), debugString,
 +                           locInfo);
 +  }
-   if (auto loopMixOp = dyn_cast<LoopMixOp>(op)) {
-     return createOperation(cache, createOp(cache, loopMixOp), debugString,
+   if (auto l2ClipOp = dyn_cast<L2ClipOp>(op)) {
+     return createOperation(cache, createOp(cache, l2ClipOp), debugString,
                             locInfo);
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -98,6 +98,7 @@
+@@ -97,6 +97,7 @@
+ #include "operations/normalization/rms_norm.h"
  #include "operations/normalization/attn_res.h"
  #include "operations/normalization/l2_clip.h"
- #include "operations/normalization/loop_mix.h"
 +#include "operations/normalization/moe_route.h"
  #include "operations/normalization/rms_norm_gated.h"
  #include "operations/normalization/rms_norm_residual.h"
  #include "operations/normalization/rms_norm_pre_all_gather.h"
-@@ -539,6 +540,9 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+@@ -538,6 +539,9 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::rms_norm_gated::run(op->type_as_RMSNormGatedOp(),
                                             getContext());
    }
 +  case ::tt::target::ttnn::OpType::MoeRouteOp: {
 +    return operations::moe_route::run(op->type_as_MoeRouteOp(), getContext());
 +  }
-   case ::tt::target::ttnn::OpType::LoopMixOp: {
-     return operations::loop_mix::run(op->type_as_LoopMixOp(), getContext());
+   case ::tt::target::ttnn::OpType::L2ClipOp: {
+     return operations::l2_clip::run(op->type_as_L2ClipOp(), getContext());
    }

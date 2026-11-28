@@ -71,10 +71,10 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -159,6 +159,7 @@ union OpType {
+@@ -158,6 +158,7 @@ union OpType {
+   RMSNormGatedOp,
    AttnResOp,
    L2ClipOp,
-   LoopMixOp,
 +  MoeCombineOp,
    WindowBiasOp,
    MoeRouteOp,
@@ -104,10 +104,10 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class WindowBiasOpConversionPattern
      : public OpConversionPattern<ttir::WindowBiasOp> {
  public:
-@@ -4463,6 +4478,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4442,6 +4457,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            RMSNormGatedOpConversionPattern,
             AttnResOpConversionPattern,
             L2ClipOpConversionPattern,
-            LoopMixOpConversionPattern,
 +           MoeCombineOpConversionPattern,
             WindowBiasOpConversionPattern,
             MoeRouteOpConversionPattern,
@@ -134,7 +134,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::WindowBiasOp>
  createOp(FlatbufferObjectCache &cache, WindowBiasOp op) {
    auto tensor = [&](Value value) {
-@@ -5903,6 +5915,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5882,6 +5894,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
                             locInfo);
    }
@@ -148,15 +148,15 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -99,6 +99,7 @@
+@@ -98,6 +98,7 @@
+ #include "operations/normalization/attn_res.h"
  #include "operations/normalization/l2_clip.h"
- #include "operations/normalization/loop_mix.h"
  #include "operations/normalization/moe_route.h"
 +#include "operations/normalization/moe_combine.h"
  #include "operations/normalization/window_bias.h"
  #include "operations/normalization/rms_norm_gated.h"
  #include "operations/normalization/rms_norm_residual.h"
-@@ -544,6 +545,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+@@ -543,6 +544,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
    case ::tt::target::ttnn::OpType::MoeRouteOp: {
      return operations::moe_route::run(op->type_as_MoeRouteOp(), getContext());
    }

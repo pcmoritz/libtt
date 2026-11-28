@@ -3,9 +3,9 @@
 
 // tt.attn_res: Inkling 2's block attention residuals in one program
 // (ttir.attn_res, ttnn::experimental::attn_res), tt.l2_clip, its per-head
-// L2 clips (ttir.l2_clip), tt.loop_mix, its loop-message controller
-// (ttir.loop_mix), tt.moe_route, its router's selection (ttir.moe_route), and
-// tt.window_bias, its decode attention's window bias (ttir.window_bias).
+// L2 clips (ttir.l2_clip), tt.moe_route, its router's selection
+// (ttir.moe_route), and tt.window_bias, its decode attention's window bias
+// (ttir.window_bias).
 //
 //   out = tt.attn_res(s_0, .., s_{n-1}[, addend], queries[, weight])
 //
@@ -141,52 +141,6 @@ public:
   }
 };
 
-// tt.loop_mix(dest, messages, down, gain, forget[, norm_weight]) with
-// backend_config epsilon and optionally has_norm and eps_norm: ttir.loop_mix.
-class LoopMixConversionPattern
-    : public OpConversionPattern<stablehlo::CustomCallOp> {
-  using OpConversionPattern<stablehlo::CustomCallOp>::OpConversionPattern;
-
-public:
-  LogicalResult
-  matchAndRewrite(stablehlo::CustomCallOp op,
-                  stablehlo::CustomCallOp::Adaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (adaptor.getCallTargetName() != "tt.loop_mix") {
-      return failure();
-    }
-    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
-    if (!config) {
-      config = dyn_cast_or_null<DictionaryAttr>(
-          op->getDiscardableAttr("mhlo.backend_config"));
-    }
-    auto epsilon = config ? config.getAs<FloatAttr>("epsilon") : nullptr;
-    // Optional: the norms that follow (a sixth operand, the norm weight, and
-    // one result per destination).
-    auto hasNorm = config ? config.getAs<BoolAttr>("has_norm") : nullptr;
-    auto epsNorm = config ? config.getAs<FloatAttr>("eps_norm") : nullptr;
-    const bool normed = hasNorm && hasNorm.getValue();
-    ValueRange operands = adaptor.getOperands();
-    if (!epsilon || (normed && !epsNorm) ||
-        operands.size() != 5 + size_t{normed} ||
-        (!normed && op->getNumResults() != 1)) {
-      return rewriter.notifyMatchFailure(
-          op, "tt.loop_mix takes dest, messages, down, gain, forget (and the "
-              "norm weight) and an epsilon (and eps_norm)");
-    }
-    SmallVector<Type> types;
-    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), types))) {
-      return failure();
-    }
-    rewriter.replaceOpWithNewOp<ttir::LoopMixOp>(
-        op, types, operands[0], operands[1], operands[2], operands[3],
-        operands[4], rewriter.getF32FloatAttr(epsilon.getValueAsDouble()),
-        normed ? operands[5] : Value(),
-        rewriter.getF32FloatAttr(normed ? epsNorm.getValueAsDouble() : 0.0));
-    return success();
-  }
-};
-
 // tt.moe_route(logits, bias[, num_valid]) with backend_config k, scale and
 // has_num_valid: ttir.moe_route, two results (weights, ids).
 class MoeRouteConversionPattern
@@ -280,8 +234,7 @@ void populateAttnResToTTIRPatterns(MLIRContext *context,
                                    RewritePatternSet &patterns,
                                    TypeConverter &typeConverter) {
   patterns.add<AttnResConversionPattern, L2ClipConversionPattern,
-               LoopMixConversionPattern, MoeRouteConversionPattern,
-               WindowBiasConversionPattern>(
+               MoeRouteConversionPattern, WindowBiasConversionPattern>(
       typeConverter, context);
 }
 

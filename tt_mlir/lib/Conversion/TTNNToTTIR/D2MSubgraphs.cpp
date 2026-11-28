@@ -24,6 +24,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Transforms/CSE.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "ttmlir/Conversion/TTNNToTTIR/TTNNToTTIR.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
@@ -35,6 +37,7 @@
 #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <functional>
 #include <limits>
 #include <type_traits>
 
@@ -163,6 +166,7 @@ namespace {
 // RMS norms inside D2M subgraphs become their FP32
 // primitives: x * rsqrt(sum(x * x) / D + eps) * weight [* silu(gate)], the
 // result narrowed by the last multiply (as TTNN's own kernels compute it).
+// Rows wider than a core's share split over cores later (splitWideRows).
 template <typename SrcOp>
 class TTNNNormDecompositionPattern : public mlir::OpConversionPattern<SrcOp> {
   using mlir::OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -210,59 +214,6 @@ public:
       }
       return w;
     };
-    // One tile row of more than 32 tiles: reduced in k chunks, one per core.
-    // x as [k, T, N / k] (the same tiles in the same order), each chunk's sum
-    // of squares [k, T, 1], summed over the chunks by an exchange between the
-    // cores inside the kernel (ttir.chunk_allreduce), and the normalized
-    // chunks viewed back: the whole norm is one row-merged kernel.
-    if (auto chunks = wideNormChunks(op, mlir::cast<mlir::RankedTensorType>(
-                                             op->getOperand(0).getType()))) {
-      const int64_t k = *chunks;
-      const int64_t T = inT.getDimSize(rank - 2);
-      auto split = retype(inT, {k, T, width / k}, f32);
-      auto sums = retype(inT, {k, T, 1}, f32);
-      // Views of the arguments (in DRAM), cast after: a view of an
-      // intermediate (sharded in L1 by its producer) addresses it wrongly.
-      auto view = [&](mlir::Value v, int64_t rows) {
-        auto t = mlir::cast<mlir::RankedTensorType>(v.getType());
-        return asF32(
-            reinterpret(rw, loc, v, withShape(t, {k, rows, width / k})));
-      };
-      mlir::Value x = view(adaptor.getInput(), T);
-      mlir::Value squares = rw.create<ttir::MultiplyOp>(loc, split, x, x);
-      mlir::Value part = rw.create<ttir::SumOp>(
-          loc, sums, squares, /*keep_dim=*/true, rw.getI32ArrayAttr({2}));
-      mlir::Value total = rw.create<ttir::ChunkAllReduceOp>(loc, sums, part);
-      mlir::Value mean = rw.create<ttir::MultiplyOp>(
-          loc, sums, total, scalar(1.0f / static_cast<float>(width), 3));
-      mlir::Value var = rw.create<ttir::AddOp>(loc, sums, mean, scalar(eps, 3));
-      // The factors of each element, multiplied in order; the last multiply
-      // is FP32 with the result's encoding, so D2M folds the narrowing into
-      // the pack (a separate typecast would narrow twice).
-      llvm::SmallVector<mlir::Value> factors{
-          x, rw.create<ttir::RsqrtOp>(loc, sums, var)};
-      if (adaptor.getWeight()) {
-        factors.push_back(view(weightArg(), 1));
-      }
-      if constexpr (std::is_same_v<SrcOp, mlir::tt::ttnn::RMSNormGatedOp>) {
-        factors.push_back(
-            rw.create<ttir::SiluOp>(loc, split, view(adaptor.getGate(), T)));
-      }
-      auto outSplit = withShape(outType, {k, T, width / k});
-      auto lastType = mlir::RankedTensorType::get(outSplit.getShape(), f32,
-                                                  outSplit.getEncoding());
-      mlir::Value y = factors.front();
-      for (size_t i = 1; i < factors.size(); ++i) {
-        bool last = i + 1 == factors.size();
-        y = rw.create<ttir::MultiplyOp>(loc, last ? lastType : split, y,
-                                        factors[i]);
-      }
-      if (!outType.getElementType().isF32()) {
-        y = rw.create<ttir::TypecastOp>(loc, outSplit, y);
-      }
-      rw.replaceOp(op, reinterpret(rw, loc, y, outType).getResult());
-      return mlir::success();
-    }
     mlir::Value x = asF32(adaptor.getInput());
     auto xt = mlir::cast<mlir::RankedTensorType>(x.getType());
     llvm::SmallVector<int64_t> rowShape(xt.getShape());
@@ -496,10 +447,46 @@ public:
                   mlir::ConversionPatternRewriter &rewriter) const override {
     auto type = mlir::cast<mlir::RankedTensorType>(
         getTypeConverter()->convertType(op.getResult().getType()));
+    bool columns = isTileColumnSlice(op);
     auto slice = rewriter.replaceOpWithNewOp<mlir::tt::ttir::SliceStaticOp>(
         op, type, adaptor.getInput(), op.getBeginsAttr(), op.getEndsAttr(),
         op.getStepAttr());
-    slice->setAttr("libtt.tile_slice", rewriter.getUnitAttr());
+    if (columns) {
+      slice->setAttr("libtt.tile_slice", rewriter.getUnitAttr());
+    }
+    return mlir::success();
+  }
+};
+// Last-dim concats and leading-dim repeats inside D2M subgraphs (split over
+// cores: splitWideRows).
+class TTNNToTTIRConcatPattern
+    : public mlir::OpConversionPattern<mlir::tt::ttnn::ConcatOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+public:
+  mlir::LogicalResult
+  matchAndRewrite(mlir::tt::ttnn::ConcatOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto type = mlir::cast<mlir::RankedTensorType>(
+        getTypeConverter()->convertType(op.getResult().getType()));
+    rewriter.replaceOpWithNewOp<mlir::tt::ttir::ConcatOp>(
+        op, type, adaptor.getInputs(), op.getDim());
+    return mlir::success();
+  }
+};
+class TTNNToTTIRRepeatPattern
+    : public mlir::OpConversionPattern<mlir::tt::ttnn::RepeatOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+public:
+  mlir::LogicalResult
+  matchAndRewrite(mlir::tt::ttnn::RepeatOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto type = mlir::cast<mlir::RankedTensorType>(
+        getTypeConverter()->convertType(op.getResult().getType()));
+    rewriter.replaceOpWithNewOp<mlir::tt::ttir::RepeatOp>(
+        op, type, adaptor.getInput(),
+        rewriter.getDenseI64ArrayAttr(op.getRepeatDims().getShape()));
     return mlir::success();
   }
 };
@@ -508,6 +495,7 @@ public:
 void populateD2MSubgraphPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
                                  TypeConverter &typeConverter) {
   patterns.add<TTNNToTTIRReshapePattern, TTNNToTTIRSlicePattern,
+               TTNNToTTIRConcatPattern, TTNNToTTIRRepeatPattern,
                TTNNNormDecompositionPattern<mlir::tt::ttnn::RMSNormOp>,
                TTNNNormDecompositionPattern<mlir::tt::ttnn::RMSNormGatedOp>,
                TTNNAttnResDecompositionPattern>(typeConverter, ctx);
@@ -713,103 +701,709 @@ static bool rewriteGroupMajor(
   return true;
 }
 
-// An elementwise subgraph over one tile row [T, N] (T <= 32) wider
-// than a core row (more than 8 tiles; Inkling 2's attention output gate,
-// [1, 768]) gets one core row. Computed as [k, T, N / k] (the same tiles in
-// the same order, k tile rows: tile reinterpretations), it spreads over k.
-static bool rewriteWideRowSubgraph(func::FuncOp func) {
+// Wide rows split over cores (intra-chip SPMD along the last dim).
+//
+// A subgraph of decode rows [B.., T, X] (T <= 32 rows, B <= 8 rows of rows)
+// whose width W (the widest row) is more than a core's share computes as k
+// chunks of c = W / k columns, chunk i on core i: each row of rows b is a
+// value [k, T, c] (the same tiles, chunk-major; the batch unrolled), a row
+// value [.., T, 1] or a narrow one [.., T, X] (X a few tiles) is computed on
+// every core ([k, T, X]; arguments' and constants' broadcast: [1, T, X]).
+// Elementwise ops apply per chunk; a sum or mean over W is the chunk's sum
+// and ttir.chunk_allreduce (the cores sum their partials inside the kernel);
+// a matmul with a weight argument contracts its chunk of K = W (or of each
+// segment of a concat of width rows: [a | b] x D = a D_0 + b D_1) into an
+// FP32 partial summed the same way, or (a narrow A, N = W) makes its chunk
+// of the columns; leading-dim slices, repeats and reshapes pick parts.
+// Without reductions (an elementwise row of more than 8 tiles: Inkling 2's
+// attention output gate) k <= 8 spreads the row over one core row; with
+// them (more than 32 tiles: Inkling 2's 2304-wide norms, its loop-message
+// controller) k is wideNormChunks's, one chunk per core.
+static bool splitWideRows(func::FuncOp func) {
   namespace ttir = mlir::tt::ttir;
   if (func.getBody().getBlocks().size() != 1) {
     return false;
   }
   Block &body = func.getBody().front();
-  int64_t T = -1, N = -1;
-  auto row = [&](Type type) {
+  if (llvm::any_of(body, [](Operation &op) {
+        return mlir::isa<ttir::ChunkAllReduceOp>(op);
+      })) {
+    return false;
+  }
+  // [B.., T, X] as (B, T, X): the leading dims' product, rows, columns.
+  struct Form {
+    int64_t batch = 1, rows = 1, cols = 1;
+  };
+  auto formOf = [](Type type) -> std::optional<Form> {
     auto t = mlir::dyn_cast<RankedTensorType>(type);
-    if (!t || t.getNumElements() == 1) {
-      return t != nullptr;
+    if (!t) {
+      return std::nullopt;
     }
-    if (t.getRank() != 2) {
-      return false;
+    Form f;
+    if (t.getRank() == 0) {
+      return f;
     }
-    if (T < 0) {
-      T = t.getDimSize(0);
-      N = t.getDimSize(1);
+    f.cols = t.getShape().back();
+    if (t.getRank() >= 2) {
+      f.rows = t.getDimSize(t.getRank() - 2);
     }
-    return t.getDimSize(0) == T && t.getDimSize(1) == N;
+    for (int64_t d = 0; d + 2 < t.getRank(); ++d) {
+      f.batch *= t.getDimSize(d);
+    }
+    return f;
   };
+  auto sliceSource = [](BlockArgument arg) {
+    return !arg.use_empty() && llvm::all_of(arg.getUsers(), [](Operation *u) {
+      auto s = mlir::dyn_cast<ttir::SliceStaticOp>(u);
+      return s && s->hasAttr("libtt.tile_slice");
+    });
+  };
+  // A matmul's weight, viewed per chunk at the matmul.
+  auto weight = [](Value v) {
+    return mlir::isa<BlockArgument>(v) && !v.use_empty() &&
+           llvm::all_of(v.getUses(), [](OpOperand &use) {
+             return mlir::isa<ttir::MatmulOp>(use.getOwner()) &&
+                    use.getOperandNumber() == 1;
+           });
+  };
+  int64_t T = 1, W = 1;
+  auto visit = [&](Type type) {
+    if (auto f = formOf(type)) {
+      T = std::max(T, f->rows);
+      W = std::max(W, f->cols);
+    }
+  };
+  for (BlockArgument arg : body.getArguments()) {
+    if (!sliceSource(arg) && !weight(arg)) {
+      visit(arg.getType());
+    }
+  }
+  bool exchanges = false;
+  // Concats of rows (and their reshapes) are as wide as their segments.
+  llvm::DenseSet<Value> segmented;
   for (Operation &op : body) {
-    auto slice = mlir::dyn_cast<ttir::SliceStaticOp>(op);
-    if (slice && !slice->hasAttr("libtt.tile_slice")) {
-      return false;
+    if (mlir::isa<ttir::ConcatOp>(op) ||
+        (mlir::isa<ttir::ReshapeOp>(op) &&
+         segmented.contains(op.getOperand(0)))) {
+      segmented.insert(op.getResult(0));
+    } else {
+      for (Type t : op.getResultTypes()) {
+        visit(t);
+      }
     }
-    if (!slice &&
-        !mlir::isa<ttir::ElementwiseUnary, ttir::ElementwiseBinary,
-                   ttir::TypecastOp, ttir::FullOp, func::ReturnOp>(op)) {
-      return false;
-    }
-    if (!slice && !llvm::all_of(op.getOperandTypes(), row)) {
-      return false;
-    }
-    if (!llvm::all_of(op.getResultTypes(), row)) {
-      return false;
+    if (mlir::isa<ttir::SumOp, ttir::MeanOp, ttir::MatmulOp>(op)) {
+      exchanges = true;
     }
   }
-  if (T < 1 || T > 32 || N % 32 != 0) {
+  if (T > 32 || W % 32 != 0 || W / 32 <= 8) {
     return false;
   }
-  const int64_t tiles = N / 32;
+  const int64_t tiles = W / 32;
   int64_t k = 0;
-  for (int64_t d = 2; d <= 8 && !k; ++d) {
-    if (tiles % d == 0 && tiles / d <= 8) {
-      k = d;
+  if (exchanges) {
+    if (auto chunks = wideNormChunks(
+            func.getOperation(),
+            RankedTensorType::get({T, W}, Float32Type::get(func.getContext())))) {
+      k = *chunks;
+    }
+  } else {
+    for (int64_t d = 2; d <= 8 && !k; ++d) {
+      if (tiles % d == 0 && tiles / d <= 8) {
+        k = d;
+      }
     }
   }
-  if (tiles <= 8 || !k) {
+  if (!k) {
     return false;
   }
-  SmallVector<int64_t> wide{k, T, N / k};
-  auto widen = [&](RankedTensorType t) {
-    return t.getNumElements() == 1 ? withShape(t, {1, 1, 1})
-                                   : withShape(t, wide);
+  const int64_t c = W / k;
+  MLIRContext *ctx = func.getContext();
+  mlir::OpBuilder b(ctx);
+  SmallVector<Operation *> created;
+  auto rollBack = [&]() {
+    for (Operation *op : llvm::reverse(created)) {
+      op->erase();
+    }
+    return false;
   };
-  mlir::OpBuilder b(func.getContext());
-  // Arguments (other than slice sources) and slice results: views.
+  auto record = [&](Operation *op) {
+    created.push_back(op);
+    return op;
+  };
+  // Rows of rows (a batch B > 1, B T <= 32) pack into the tile rows: rows of
+  // rows b in rows [b T, b T + T) of every value (R = B T rows). A value is
+  // Packed (each b in its rows), Every (one value for all b: computed from
+  // batchless ones; with T = 1 a single row that broadcasts) or Picked (rows
+  // of rows `index` of a packed value: row-wise ops apply to the packed value
+  // and the pick happens at the results, so per-b ops of one packed value
+  // become one, CSE'd: Inkling 2's per-query norms, one exchange).
+  int64_t B = 1;
+  for (BlockArgument arg : body.getArguments()) {
+    if (!sliceSource(arg) && !weight(arg)) {
+      B = std::max(B, formOf(arg.getType())->batch);
+    }
+  }
+  for (Operation &op : body) {
+    for (Value r : op.getResults()) {
+      if (!segmented.contains(r)) {
+        B = std::max(B, formOf(r.getType())->batch);
+      }
+    }
+  }
+  const int64_t R = B * T;
+  if (R > 32 || B > 8) {
+    return false;
+  }
+  enum class Kind { Packed, Every, Picked };
+  struct Val {
+    Value v;
+    Kind kind = Kind::Every;
+    SmallVector<Value> segments;
+    int64_t index = 0;
+  };
+  llvm::DenseMap<Value, Val> vals;
+  auto rowsOf = [](Value v) {
+    return mlir::cast<RankedTensorType>(v.getType()).getShape()[1];
+  };
+  auto place = [&](Location loc, Value dst, Value src, int64_t to,
+                   int64_t from, int64_t count) -> Value {
+    return record(b.create<ttir::PlaceRowsOp>(
+                      loc, dst.getType(), dst, src, b.getI64IntegerAttr(to),
+                      b.getI64IntegerAttr(from), b.getI64IntegerAttr(count)))
+        ->getResult(0);
+  };
+  // R rows of zeros of v's columns.
+  auto zeros = [&](Location loc, Value v) -> Value {
+    auto t = mlir::cast<RankedTensorType>(v.getType());
+    auto to = withShape(t, {t.getShape()[0], R, t.getShape()[2]});
+    SmallVector<int32_t> shape(to.getShape().begin(), to.getShape().end());
+    return record(b.create<ttir::FullOp>(loc, to, shape,
+                                         b.getZeroAttr(t.getElementType())))
+        ->getResult(0);
+  };
+  // Rows of rows b (from rows [from_b, from_b + T) of parts[b]) packed.
+  auto pack = [&](Location loc, ArrayRef<std::pair<Value, int64_t>> parts) {
+    Value acc = rowsOf(parts[0].first) == R ? parts[0].first
+                                             : zeros(loc, parts[0].first);
+    for (auto [i, part] : llvm::enumerate(parts)) {
+      int64_t to = static_cast<int64_t>(i) * T;
+      if (acc != part.first || part.second != to) {
+        acc = place(loc, acc, part.first, to, part.second, T);
+      }
+    }
+    return acc;
+  };
+  // Where rows of rows i's data sits in x (Every: rows [0, T)).
+  auto from = [&](const Val &x, int64_t i) {
+    return x.kind == Kind::Packed   ? i * T
+           : x.kind == Kind::Picked ? x.index * T
+                                    : 0;
+  };
+  // A Picked value in every rows of rows (Every); one row broadcasts.
+  auto spread = [&](Location loc, const Val &x) -> Value {
+    if (x.kind != Kind::Picked || rowsOf(x.v) == 1) {
+      return x.v;
+    }
+    SmallVector<std::pair<Value, int64_t>> parts(B, {x.v, x.index * T});
+    return pack(loc, parts);
+  };
+  // The tile view of an argument's rows of rows `index` (chunk-major for the
+  // width) as R rows (or its own rows): output tile (j, r, x) <- input tile
+  // (index.., r, j c/32 + x).
+  auto argView = [&](Value arg, int64_t index, RankedTensorType to,
+                     bool chunked) -> Value {
+    auto t = mlir::cast<RankedTensorType>(arg.getType());
+    SmallVector<AffineExpr> results;
+    SmallVector<int64_t> lead(t.getShape().begin(),
+                              t.getShape().end() - std::min<int64_t>(2, t.getRank()));
+    SmallVector<int64_t> coords(lead.size(), 0);
+    for (int64_t d = static_cast<int64_t>(lead.size()) - 1, rest = index;
+         d >= 0; --d) {
+      coords[d] = rest % lead[d];
+      rest /= lead[d];
+    }
+    for (int64_t x : coords) {
+      results.push_back(getAffineConstantExpr(x, ctx));
+    }
+    AffineExpr j = getAffineDimExpr(0, ctx), r = getAffineDimExpr(1, ctx),
+               col = getAffineDimExpr(2, ctx);
+    if (t.getRank() >= 2) {
+      results.push_back(r);
+    }
+    results.push_back(chunked ? j * (c / 32) + col : col);
+    return record(b.create<ttir::TileViewOp>(
+                      arg.getLoc(), to, arg,
+                      AffineMapAttr::get(AffineMap::get(3, 0, results, ctx))))
+        ->getResult(0);
+  };
+  // Arguments (not slice sources or weights): views. One row (a norm
+  // weight; with T = 1 any row) broadcasts; T rows of a batchless argument
+  // repeat in every rows of rows; a batched one packs.
   b.setInsertionPointToStart(&body);
   for (BlockArgument arg : body.getArguments()) {
-    if (llvm::all_of(arg.getUsers(), [](Operation *u) {
-          return mlir::isa<ttir::SliceStaticOp>(u);
-        })) {
+    if (arg.use_empty() || sliceSource(arg) || weight(arg)) {
       continue;
     }
     auto t = mlir::cast<RankedTensorType>(arg.getType());
-    auto view = reinterpret(b, arg.getLoc(), arg, widen(t));
-    arg.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
-      return use.getOwner() != view &&
-             !mlir::isa<ttir::SliceStaticOp>(use.getOwner());
-    });
+    Form f = *formOf(t);
+    if ((f.cols != W && f.cols != 1) || (f.rows != 1 && f.rows != T) ||
+        (f.batch != 1 && f.batch != B) || (f.batch > 1 && f.rows != T)) {
+      return rollBack();
+    }
+    const bool wide = f.cols == W;
+    const int64_t rows = f.rows == 1 && f.batch == 1 ? 1 : R;
+    auto to = withShape(t, {wide ? k : 1, rows, wide ? c : 1});
+    Location loc = arg.getLoc();
+    Val x;
+    if (rows == f.rows) {
+      x.v = record(reinterpret(b, loc, arg, to))->getResult(0);
+    } else if (f.batch == 1) {
+      x.v = spread(loc, {argView(arg, 0, to, wide), Kind::Picked, {}, 0});
+    } else {
+      SmallVector<std::pair<Value, int64_t>> parts;
+      for (int64_t i = 0; i < f.batch; ++i) {
+        parts.push_back({argView(arg, i, to, wide), 0});
+      }
+      x.v = pack(loc, parts);
+      x.kind = Kind::Packed;
+    }
+    vals[arg] = x;
   }
-  for (Operation &op : llvm::make_early_inc_range(body.without_terminator())) {
-    if (auto slice = mlir::dyn_cast<ttir::SliceStaticOp>(op)) {
-      b.setInsertionPointAfter(slice);
-      auto view = reinterpret(b, slice.getLoc(), slice.getResult(),
-                              widen(slice.getType()));
-      slice.getResult().replaceAllUsesExcept(view.getResult(), view);
+  auto chunkedValue = [&](Value v) {
+    return mlir::cast<RankedTensorType>(v.getType()).getShape()[0] == k &&
+           k > 1;
+  };
+  SmallVector<Operation *> originals;
+  llvm::SmallPtrSet<Operation *, 4> kept;
+  for (Operation &op : body.without_terminator()) {
+    if (llvm::is_contained(created, &op)) {
       continue;
     }
-    if (!mlir::isa<ttir::ReshapeOp>(op)) {
-      retypeResults(op, widen);
+    originals.push_back(&op);
+    b.setInsertionPoint(&op);
+    Location loc = op.getLoc();
+    auto lookup = [&](Value v) -> std::optional<Val> {
+      auto it = vals.find(v);
+      if (it == vals.end()) {
+        return std::nullopt;
+      }
+      return it->second;
+    };
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult(0).getType());
+    std::optional<Form> rf = formOf(resultType);
+    if (!rf) {
+      return rollBack();
     }
+    if (mlir::isa<ttir::FullOp>(op)) {
+      if (resultType.getNumElements() != 1) {
+        return rollBack();
+      }
+      Operation *n = record(b.clone(op));
+      n->getResult(0).setType(withShape(resultType, {1, 1, 1}));
+      retypeResults(*n, [](RankedTensorType t) { return t; });
+      vals[op.getResult(0)] = {n->getResult(0), Kind::Every, {}};
+      continue;
+    }
+    if (auto slice = mlir::dyn_cast<ttir::SliceStaticOp>(op)) {
+      if (slice->hasAttr("libtt.tile_slice")) {
+        // A column slice of an argument, read in place.
+        if (!mlir::isa<BlockArgument>(slice.getInput()) || rf->cols != W ||
+            B != 1) {
+          return rollBack();
+        }
+        kept.insert(&op);
+        b.setInsertionPointAfter(slice);
+        vals[slice.getResult()] = {
+            record(reinterpret(b, loc, slice.getResult(),
+                               withShape(resultType, {k, rf->rows, c})))
+                ->getResult(0),
+            Kind::Every,
+            {}};
+        continue;
+      }
+      // Leading dims only: one rows of rows picked.
+      std::optional<Val> in = lookup(slice.getInput());
+      auto inType = slice.getInput().getType();
+      auto begins = extractFromIntegerArrayAttr<int32_t>(slice.getBegins());
+      auto steps = extractFromIntegerArrayAttr<int32_t>(slice.getStep());
+      const int64_t rank = inType.getRank();
+      if (!in || !in->segments.empty() || rank < 3 || rf->batch != 1 ||
+          rf->rows != inType.getDimSize(rank - 2) ||
+          rf->cols != inType.getDimSize(rank - 1) ||
+          llvm::any_of(steps, [](int32_t x) { return x != 1; })) {
+        return rollBack();
+      }
+      int64_t index = 0;
+      for (int64_t d = 0; d < rank - 2; ++d) {
+        index = index * inType.getDimSize(d) + begins[d];
+      }
+      Val x = *in;
+      if (in->kind == Kind::Packed) {
+        x.kind = Kind::Picked;
+        x.index = index;
+      } else if (in->kind == Kind::Picked) {
+        return rollBack();
+      }
+      vals[slice.getResult()] = x;
+      continue;
+    }
+    if (auto repeat = mlir::dyn_cast<ttir::RepeatOp>(op)) {
+      std::optional<Val> in = lookup(repeat.getInput());
+      ArrayRef<int64_t> dims = repeat.getRepeatDimensions();
+      if (!in || !in->segments.empty() || in->kind == Kind::Packed ||
+          dims.size() < 2 || dims.take_back(2) != ArrayRef<int64_t>{1, 1}) {
+        return rollBack();
+      }
+      vals[repeat.getResult()] = {spread(loc, *in), Kind::Every, {}};
+      continue;
+    }
+    if (auto reshape = mlir::dyn_cast<ttir::ReshapeOp>(op)) {
+      std::optional<Val> in = lookup(reshape.getInput());
+      std::optional<Form> f = formOf(reshape.getInput().getType());
+      if (!in || f->rows != rf->rows || f->cols != rf->cols ||
+          (in->kind == Kind::Packed && f->batch != rf->batch)) {
+        return rollBack();
+      }
+      vals[reshape.getResult()] = *in;
+      continue;
+    }
+    if (auto concat = mlir::dyn_cast<ttir::ConcatOp>(op)) {
+      const int64_t rank = resultType.getRank();
+      int64_t dim =
+          concat.getDim() < 0 ? concat.getDim() + rank : concat.getDim();
+      if (dim + 2 < rank &&
+          llvm::all_of(resultType.getShape().take_front(dim),
+                       [](int64_t x) { return x == 1; })) {
+        // Rows of rows stacked (a repeat, decomposed).
+        SmallVector<std::pair<Value, int64_t>> parts;
+        bool same = true;
+        std::optional<Val> first = lookup(concat.getInputs().front());
+        for (Value v : concat.getInputs()) {
+          std::optional<Val> in = lookup(v);
+          if (!in || !in->segments.empty() || in->kind == Kind::Packed) {
+            return rollBack();
+          }
+          same &= in->v == first->v;
+          for (int64_t i = 0, n = formOf(v.getType())->batch; i < n; ++i) {
+            parts.push_back({spread(loc, *in), 0});
+          }
+        }
+        vals[concat.getResult()] =
+            same ? Val{spread(loc, *first), Kind::Every, {}}
+                 : Val{pack(loc, parts), Kind::Packed, {}};
+        continue;
+      }
+      if (dim != rank - 1) {
+        return rollBack();
+      }
+      Val x;
+      x.kind = Kind::Every;
+      for (Value v : concat.getInputs()) {
+        std::optional<Val> in = lookup(v);
+        if (!in || !in->segments.empty() || formOf(v.getType())->cols != W) {
+          return rollBack();
+        }
+        if (in->kind == Kind::Packed) {
+          x.kind = Kind::Packed;
+        }
+      }
+      for (Value v : concat.getInputs()) {
+        x.segments.push_back(spread(loc, *lookup(v)));
+      }
+      vals[concat.getResult()] = x;
+      continue;
+    }
+    if (mlir::isa<ttir::SumOp, ttir::MeanOp>(op)) {
+      std::optional<Val> in = lookup(op.getOperand(0));
+      auto dims = op.getAttrOfType<ArrayAttr>("dim_arg");
+      auto keep = op.getAttrOfType<BoolAttr>("keep_dim");
+      auto inType = mlir::cast<RankedTensorType>(op.getOperand(0).getType());
+      if (!in || !in->segments.empty() || !dims || dims.size() != 1 || !keep ||
+          !keep.getValue()) {
+        return rollBack();
+      }
+      int64_t d = mlir::cast<IntegerAttr>(dims[0]).getInt();
+      if (d != -1 && d != inType.getRank() - 1) {
+        return rollBack();
+      }
+      auto shape = mlir::cast<RankedTensorType>(in->v.getType()).getShape();
+      auto rowType = withShape(resultType, {shape[0], shape[1], 1});
+      Value r;
+      if (inType.getShape().back() == W) {
+        // The chunk's sum, summed over the chunks (a mean divides by W).
+        Value s = record(b.create<ttir::SumOp>(loc, rowType, in->v,
+                                               /*keep_dim=*/true,
+                                               b.getI32ArrayAttr({2})))
+                      ->getResult(0);
+        r = record(b.create<ttir::ChunkAllReduceOp>(loc, rowType, s))
+                ->getResult(0);
+        if (mlir::isa<ttir::MeanOp>(op)) {
+          auto f32 = RankedTensorType::get({1, 1, 1}, b.getF32Type());
+          Value inv =
+              record(b.create<ttir::FullOp>(
+                         loc, f32, SmallVector<int32_t>{1, 1, 1},
+                         b.getF32FloatAttr(1.0f / static_cast<float>(W))))
+                  ->getResult(0);
+          r = record(b.create<ttir::MultiplyOp>(loc, rowType, r, inv))
+                  ->getResult(0);
+        }
+      } else {
+        IRMapping m;
+        m.map(op.getOperand(0), in->v);
+        Operation *n = record(b.clone(op, m));
+        n->getResult(0).setType(rowType);
+        n->setAttr("dim_arg", b.getI32ArrayAttr({2}));
+        r = n->getResult(0);
+      }
+      vals[op.getResult(0)] = {r, in->kind, {}, in->index};
+      continue;
+    }
+    if (auto mm = mlir::dyn_cast<ttir::MatmulOp>(op)) {
+      std::optional<Val> a = lookup(mm.getA());
+      Value w = mm.getB();
+      if (!a || !weight(w) || mm.getTransposeA() || mm.getTransposeB()) {
+        return rollBack();
+      }
+      auto wt = mlir::cast<RankedTensorType>(w.getType());
+      Form wf = *formOf(wt);
+      const int64_t K = wt.getDimSize(wt.getRank() - 2), N = wf.cols;
+      if ((wf.batch != 1 && wf.batch != B) || K % 32 != 0 || N % 32 != 0) {
+        return rollBack();
+      }
+      SmallVector<Value> segments =
+          !a->segments.empty() ? a->segments : SmallVector<Value>{a->v};
+      auto aShape =
+          mlir::cast<RankedTensorType>(segments.front().getType()).getShape();
+      const bool contractsWidth =
+          aShape[2] == c && K == static_cast<int64_t>(segments.size()) * W;
+      const bool makesWidth = a->segments.empty() && aShape[2] == K &&
+                              K != W && N == W && chunkedValue(a->v);
+      if (!contractsWidth && !makesWidth) {
+        return rollBack();
+      }
+      AffineExpr j = getAffineDimExpr(0, ctx), r = getAffineDimExpr(1, ctx),
+                 x = getAffineDimExpr(2, ctx);
+      // Rows of rows i's matmul (weight i, or the one weight).
+      auto product = [&](int64_t i) -> Value {
+        SmallVector<int64_t> lead(wt.getShape().drop_back(2));
+        SmallVector<AffineExpr> coords;
+        for (int64_t d = static_cast<int64_t>(lead.size()) - 1, rest = i;
+             d >= 0; --d) {
+          coords.insert(coords.begin(),
+                        getAffineConstantExpr(rest % lead[d], ctx));
+          rest /= lead[d];
+        }
+        auto view = [&](SmallVector<int64_t> shape, AffineExpr row,
+                        AffineExpr col) {
+          SmallVector<AffineExpr> results(coords);
+          results.append({row, col});
+          return record(b.create<ttir::TileViewOp>(
+                            loc, withShape(wt, shape), w,
+                            AffineMapAttr::get(
+                                AffineMap::get(3, 0, results, ctx))))
+              ->getResult(0);
+        };
+        if (makesWidth) {
+          // Narrow rows times the width: this chunk's columns of D.
+          Value d = view({k, K, c}, r, j * (c / 32) + x);
+          Operation *m = record(b.create<ttir::MatmulOp>(
+              loc, withShape(resultType, {k, rowsOf(a->v), c}), a->v, d,
+              /*transpose_a=*/false, /*transpose_b=*/false));
+          m->setAttr("libtt.chunk_matmul", b.getUnitAttr());
+          return m->getResult(0);
+        }
+        // Contracting the width: per segment, this chunk's rows of D, FP32.
+        // A one-row segment among packed ones broadcasts down the rows first
+        // (the same tile matmul; the products then add tile for tile, so the
+        // second matmul can accumulate into the first's tiles).
+        int64_t most = 1;
+        for (Value seg : segments) {
+          most = std::max(most, rowsOf(seg));
+        }
+        Value sum;
+        for (auto [s, segment] : llvm::enumerate(segments)) {
+          Value seg = segment;
+          if (rowsOf(seg) == 1 && most > 1) {
+            auto st = mlir::cast<RankedTensorType>(seg.getType());
+            seg = record(b.create<ttir::BroadcastOp>(
+                             loc, withShape(st, {k, most, c}), seg,
+                             b.getDenseI64ArrayAttr({1, most, 1})))
+                      ->getResult(0);
+          }
+          Value d = view({k, c, N},
+                         j * (c / 32) + r + static_cast<int64_t>(s) * (W / 32),
+                         x);
+          auto partial = retypeTensor(resultType, {k, rowsOf(seg), N},
+                                      b.getF32Type());
+          Operation *m = record(b.create<ttir::MatmulOp>(
+              loc, partial, seg, d, /*transpose_a=*/false,
+              /*transpose_b=*/false));
+          m->setAttr("libtt.chunk_matmul", b.getUnitAttr());
+          if (sum) {
+            auto both = retypeTensor(
+                resultType, {k, std::max(rowsOf(sum), rowsOf(seg)), N},
+                b.getF32Type());
+            sum = record(b.create<ttir::AddOp>(loc, both, sum,
+                                               m->getResult(0)))
+                      ->getResult(0);
+          } else {
+            sum = m->getResult(0);
+          }
+        }
+        return sum;
+      };
+      Val out{Value(), a->kind, {}, a->index};
+      if (wf.batch == 1) {
+        out.v = product(0);
+      } else {
+        // Batch i's rows from its product: where A holds batch i's rows
+        // (a packed A), or A's own rows.
+        SmallVector<std::pair<Value, int64_t>> parts;
+        for (int64_t i = 0; i < B; ++i) {
+          parts.push_back({product(i), from(*a, i)});
+        }
+        out.v = pack(loc, parts);
+        out.kind = Kind::Packed;
+      }
+      if (contractsWidth) {
+        // The sum over the chunks, narrowed (if the result is) by its pack:
+        // FP32 values in the result's layout, then a typecast D2M folds (an
+        // SFPU narrowing typecast garbled the values).
+        auto shape = mlir::cast<RankedTensorType>(out.v.getType()).getShape();
+        auto narrow = withShape(resultType, shape);
+        auto total = RankedTensorType::get(shape, b.getF32Type(),
+                                           narrow.getEncoding());
+        Operation *exchange =
+            record(b.create<ttir::ChunkAllReduceOp>(loc, total, out.v));
+        // Whole tiles (every column), not row sums.
+        exchange->setAttr("libtt.full_tile", b.getUnitAttr());
+        out.v = exchange->getResult(0);
+        if (!resultType.getElementType().isF32()) {
+          out.v = record(b.create<ttir::TypecastOp>(loc, narrow, out.v))
+                      ->getResult(0);
+        }
+      }
+      vals[mm.getResult()] = out;
+      continue;
+    }
+    if (!mlir::isa<ttir::ElementwiseUnary, ttir::ElementwiseBinary,
+                   ttir::TypecastOp, ttir::WhereOp>(op) ||
+        op.getNumResults() != 1 || op.getNumRegions() != 0) {
+      return rollBack();
+    }
+    // Elementwise: Packed if any operand is (Picked ones spread), else
+    // Picked if all picked operands pick the same rows of rows (spread
+    // otherwise), else Every; the broadcast of the operands' shapes.
+    Kind kind = Kind::Every;
+    std::optional<int64_t> picked;
+    bool mixedPicks = false;
+    for (Value v : op.getOperands()) {
+      std::optional<Val> in = lookup(v);
+      if (!in || !in->segments.empty()) {
+        return rollBack();
+      }
+      if (in->kind == Kind::Packed) {
+        kind = Kind::Packed;
+      } else if (in->kind == Kind::Picked) {
+        mixedPicks |= picked && *picked != in->index;
+        picked = in->index;
+      }
+    }
+    if (kind != Kind::Packed && picked && !mixedPicks) {
+      kind = Kind::Picked;
+    }
+    if (formOf(resultType)->cols != W && formOf(resultType)->cols != 1 &&
+        !llvm::any_of(op.getOperands(),
+                      [&](Value v) { return chunkedValue(lookup(v)->v); })) {
+      return rollBack();
+    }
+    IRMapping m;
+    SmallVector<int64_t> shape{1, 1, 1};
+    for (Value v : op.getOperands()) {
+      Val in = *lookup(v);
+      Value part = kind == Kind::Picked ? in.v : spread(loc, in);
+      m.map(v, part);
+      for (auto [d, n] : llvm::enumerate(
+               mlir::cast<RankedTensorType>(part.getType()).getShape())) {
+        shape[d] = std::max(shape[d], n);
+      }
+    }
+    Operation *clone = record(b.clone(op, m));
+    clone->getResult(0).setType(withShape(resultType, shape));
+    vals[op.getResult(0)] = {clone->getResult(0), kind, {},
+                             picked.value_or(0)};
   }
+  // The results: width rows, one rows of rows (its rows [0, T)), back to
+  // the result's layout.
   auto ret = mlir::cast<func::ReturnOp>(body.getTerminator());
   b.setInsertionPoint(ret);
+  SmallVector<Value> results;
   for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
+    auto it = vals.find(v);
     auto to = mlir::cast<RankedTensorType>(func.getResultTypes()[i]);
-    if (v.getType() != to) {
-      ret.setOperand(i, reinterpret(b, ret.getLoc(), v, to).getResult());
+    auto shape = it == vals.end()
+                     ? ArrayRef<int64_t>{}
+                     : mlir::cast<RankedTensorType>(it->second.v.getType())
+                           .getShape();
+    if (it == vals.end() || it->second.kind == Kind::Packed ||
+        !it->second.segments.empty() || shape[2] != c || shape[0] != k ||
+        formOf(to)->batch != 1) {
+      return rollBack();
+    }
+    Value out = it->second.v;
+    if (it->second.kind == Kind::Picked && it->second.index != 0) {
+      out = place(ret.getLoc(), out, out, 0, it->second.index * T, T);
+    }
+    if (shape[1] == formOf(to)->rows) {
+      out = record(reinterpret(b, ret.getLoc(), out, to))->getResult(0);
+    } else {
+      // Rows [0, T) of R: the chunks' tiles back in row order.
+      const int64_t rank = to.getRank();
+      AffineExpr col = getAffineDimExpr(rank - 1, ctx);
+      SmallVector<AffineExpr> map{col.floorDiv(c / 32),
+                                  getAffineConstantExpr(0, ctx),
+                                  col % (c / 32)};
+      out = record(b.create<ttir::TileViewOp>(
+                       ret.getLoc(), to, out,
+                       AffineMapAttr::get(AffineMap::get(rank, 0, map, ctx))))
+                ->getResult(0);
+    }
+    results.push_back(out);
+  }
+  ret->setOperands(results);
+  for (Operation *op : llvm::reverse(originals)) {
+    if (!kept.contains(op)) {
+      op->erase();
     }
   }
-  func->setAttr("libtt.wide_rows", b.getUnitAttr());
+  // Picked values' ops on one packed value, repeated per pick: once.
+  {
+    IRRewriter rewriter(ctx);
+    DominanceInfo dom(func);
+    mlir::eliminateCommonSubExpressions(rewriter, dom, func);
+  }
+  // Then each result's value its own: a value the kernel also reads, or
+  // another result returns (per-query norms with one weight are one value
+  // after the CSE), goes out as a copy. One output CB is not also read in
+  // compute: DstResident dropped such an output's pack, and an FPU
+  // operand's CB read by the writer too hung (Inkling 2's local layers).
+  for (OpOperand &operand : body.getTerminator()->getOpOperands()) {
+    Operation *view = operand.get().getDefiningOp();
+    if (!view || view->getNumOperands() != 1 ||
+        !mlir::isa<ttir::TileViewOp, ttir::ReshapeOp>(view)) {
+      continue;
+    }
+    Value x = view->getOperand(0);
+    if (x.hasOneUse()) {
+      continue;
+    }
+    b.setInsertionPoint(view);
+    view->setOperand(0, place(view->getLoc(), x, x, 0, 0, T));
+  }
+  // The chunk count (one chunk per core: D2M's d2m.chunk_rows grid).
+  if (exchanges) {
+    func->setAttr("libtt.chunks", b.getI64IntegerAttr(k));
+  }
   return true;
 }
 
@@ -961,18 +1555,33 @@ namespace {
 // padding rows of the results are left unspecified.
 static void annotateTileRows(func::FuncOp f) {
   int64_t rows = 1;
-  auto visit = [&](Type t) {
-    auto r = mlir::dyn_cast<RankedTensorType>(t);
+  auto visit = [&](Value v) {
+    auto r = mlir::dyn_cast<RankedTensorType>(v.getType());
     if (r && r.getRank() >= 2) {
       rows = std::max(rows, r.getDimSize(r.getRank() - 2));
     }
   };
-  for (Type t : f.getArgumentTypes()) {
-    visit(t);
+  // A matmul's weight (and its views) has rows of its own.
+  std::function<bool(Value)> weight = [&](Value v) {
+    return !v.use_empty() && llvm::all_of(v.getUses(), [&](OpOperand &use) {
+      Operation *o = use.getOwner();
+      if (mlir::isa<ttir::MatmulOp>(o)) {
+        return use.getOperandNumber() == 1;
+      }
+      return mlir::isa<ttir::TileViewOp, ttir::ReshapeOp>(o) &&
+             weight(o->getResult(0));
+    });
+  };
+  for (Value arg : f.getArguments()) {
+    if (!weight(arg)) {
+      visit(arg);
+    }
   }
   f.walk([&](Operation *op) {
-    for (Type t : op->getResultTypes()) {
-      visit(t);
+    for (Value r : op->getResults()) {
+      if (!weight(r)) {
+        visit(r);
+      }
     }
   });
   if (rows <= 16) {
@@ -1088,7 +1697,7 @@ LogicalResult finishD2MSubgraphs(ModuleOp module,
   inlineScalarConstants(module);
   // Head-major / group-major per-head subgraphs.
   for (func::FuncOp f : d2mSubgraphs) {
-    if (rewriteHeadMajorSubgraph(f) || rewriteWideRowSubgraph(f)) {
+    if (rewriteHeadMajorSubgraph(f) || splitWideRows(f)) {
       continue;
     }
     // D2M's general reshape views are wrong across tiles: a head reshape the
